@@ -18,7 +18,8 @@ from string import Template
 
 from camel.messages import BaseMessage
 
-os.makedirs("./log", exist_ok=True)
+_log_dir = os.environ.get("CAMEL_LOG_DIR", "./log")
+os.makedirs(_log_dir, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # 1. Patch SocialAgent.__init__ to support single_iteration

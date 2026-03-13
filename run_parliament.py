@@ -247,6 +247,9 @@ def parse_args():
 
 
 async def main():
+    from datetime import datetime as dt
+    import shutil
+
     args = parse_args()
 
     api_key = API_KEY
@@ -265,6 +268,15 @@ async def main():
     if question is None:
         question = input("Enter the scientific question:\n> ")
 
+    timestamp = dt.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = os.path.join(OUTPUT_DIR, timestamp)
+    log_dir = os.path.join(run_dir, "log")
+    os.makedirs(log_dir, exist_ok=True)
+
+    shutil.copy2("config.py", os.path.join(run_dir, "config.py"))
+
+    os.environ["CAMEL_LOG_DIR"] = log_dir
+
     model = ModelFactory.create(
         model_platform=ModelPlatformType.OPENAI,
         model_type=MODEL_NAME,
@@ -273,7 +285,10 @@ async def main():
     await run_parliament(
         question=question,
         model=model,
+        output_dir=run_dir,
     )
+
+    print(f"\nAll outputs saved to: {run_dir}")
 
 
 if __name__ == "__main__":
