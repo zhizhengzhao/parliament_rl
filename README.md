@@ -2,7 +2,16 @@
 
 使用本地模型（Qwen3.5-9B + vLLM）运行的科学议会系统。
 
-与 API 版本 (`science_parliament/`) 代码完全一致，仅 `config.py` 中的模型配置不同。
+基于 [CAMEL](https://github.com/camel-ai/camel)（多智能体框架）和 [OASIS](https://github.com/camel-ai/oasis)（社交媒体模拟平台）构建。
+
+## 依赖版本
+
+| 依赖 | 版本 | 说明 |
+|------|------|------|
+| `camel-ai` | 0.2.89 | PyPI 稳定版 |
+| `camel-oasis` | 0.2.5 | PyPI 稳定版（`--no-deps` 安装） |
+| `Qwen3.5-9B` | 2026.02 | 本地 vLLM 部署 |
+| Python | 3.10 / 3.11 | OASIS 要求 `<3.12` |
 
 ## 环境要求
 
@@ -28,13 +37,13 @@ pip install vllm
 ### 3. 安装 CAMEL + OASIS + 依赖
 
 ```bash
-# CAMEL（多智能体框架）
+# CAMEL 多智能体框架（v0.2.89）
 pip install camel-ai
 
 # SymPy（数学计算工具）
 pip install "sympy>=1.13"
 
-# OASIS（社交模拟平台，跳过依赖以避免 camel 版本冲突）
+# OASIS 社交模拟平台（v0.2.5，跳过依赖以避免 camel 版本冲突）
 pip install camel-oasis --no-deps
 
 # OASIS 的运行时依赖
@@ -113,10 +122,21 @@ python run_batch.py --data_path questions.csv --max_examples 10
 
 ## 输出
 
-运行后在 `output/` 目录生成：
+每次运行自动创建带时间戳的目录，所有输出集中在内：
 
-- `parliament.db` — SQLite 数据库，包含帖子、评论、投票记录
-- `session.json` — 结构化讨论记录
+```
+output/
+└── 2026-03-13_17-06-49/
+    ├── parliament.db       ← SQLite 数据库（帖子、评论、投票、trace）
+    ├── session.json        ← 结构化讨论记录
+    ├── config.py           ← 该次运行的配置快照
+    └── log/
+        ├── social.agent-xxx.log
+        ├── social.twitter-xxx.log
+        └── oasis-xxx.log
+```
+
+每次运行互不覆盖，便于对比不同配置的结果。
 
 ## 答案提取
 
@@ -138,3 +158,7 @@ vllm serve Qwen/Qwen3.5-9B --max-model-len 8192 ...
 **Q: 运行很慢**
 
 9B 模型在单卡上推理速度有限，多 agent 并发会排队。建议先用 `DEFAULT_NUM_AGENTS = 3` 测试。
+
+**Q: 报错 "System message must be at the beginning"**
+
+确认使用的是最新代码。旧版本中 OASIS 的 `perform_action_by_data` 会以 system 角色写入 agent 记忆，已在 `patches.py` 中修复。
