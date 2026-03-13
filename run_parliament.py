@@ -19,16 +19,28 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Import OUTPUT_DIR early (config.py has no OASIS dependencies, safe to import first)
+from config import OUTPUT_DIR as _output_base
+
 # Create timestamped run directory BEFORE importing OASIS (which sets up loggers)
 _timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-_run_dir = os.path.join(
-    os.environ.get("PARLIAMENT_OUTPUT_DIR", "output"), _timestamp
-)
+_run_dir = os.path.join(_output_base, _timestamp)
 _log_dir = os.path.join(_run_dir, "log")
 os.makedirs(_log_dir, exist_ok=True)
 os.environ["PARLIAMENT_LOG_DIR"] = _log_dir
 
 import patches  # noqa: F401 — applies all monkey-patches at import time
+
+# Clean up the empty ./log/ directory that OASIS creates at import time
+if os.path.isdir("./log") and _log_dir != os.path.abspath("./log"):
+    for f in os.listdir("./log"):
+        fp = os.path.join("./log", f)
+        if os.path.isfile(fp) and os.path.getsize(fp) == 0:
+            os.remove(fp)
+    try:
+        os.rmdir("./log")
+    except OSError:
+        pass
 
 from camel.models import ModelFactory
 from camel.prompts import TextPrompt
