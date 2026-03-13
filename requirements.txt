@@ -1,0 +1,4 @@
+oasis-ai
+camel-ai[all]
+pandas
+python-dotenv
