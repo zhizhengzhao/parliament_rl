@@ -38,6 +38,27 @@ def _patched_init(self, *args, single_iteration=True, **kwargs):
 SocialAgent.__init__ = _patched_init
 
 # ---------------------------------------------------------------------------
+# 1b. Patch SocialAgent.perform_action_by_data — skip memory write
+#     ManualActions are platform-level events (e.g. opening post), not agent
+#     decisions. The agent doesn't need to "remember" them — the results are
+#     visible via forum refresh. The original writes with SYSTEM role, which
+#     breaks models with strict system-message ordering (e.g. Qwen3.5).
+# ---------------------------------------------------------------------------
+async def _patched_perform_action_by_data(self, func_name, *args, **kwargs):
+    func_name = func_name.value if isinstance(func_name,
+                                              ActionType) else func_name
+    function_list = self.env.action.get_openai_function_list()
+    for i in range(len(function_list)):
+        if function_list[i].func.__name__ == func_name:
+            func = function_list[i].func
+            result = await func(*args, **kwargs)
+            return result
+    raise ValueError(f"Function {func_name} not found in the list.")
+
+
+SocialAgent.perform_action_by_data = _patched_perform_action_by_data
+
+# ---------------------------------------------------------------------------
 # 2. Patch SocialAgent.perform_action_by_llm — parliament user message
 # ---------------------------------------------------------------------------
 import logging

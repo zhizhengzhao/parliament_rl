@@ -15,7 +15,7 @@ Local model setup:
 # =============================================================================
 # LLM 模型配置（本地 vLLM 服务）
 # =============================================================================
-MODEL_NAME = "Qwen/Qwen3.5-9B"
+MODEL_NAME = "/root/zhizheng/models/qwen/Qwen3___5-9B"
 MODEL_BASE_URL = "http://localhost:8000/v1"
 API_KEY = "EMPTY"
 
