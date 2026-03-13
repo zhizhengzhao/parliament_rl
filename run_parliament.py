@@ -11,11 +11,22 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import sqlite3
+from datetime import datetime
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Create timestamped run directory BEFORE importing OASIS (which sets up loggers)
+_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+_run_dir = os.path.join(
+    os.environ.get("PARLIAMENT_OUTPUT_DIR", "output"), _timestamp
+)
+_log_dir = os.path.join(_run_dir, "log")
+os.makedirs(_log_dir, exist_ok=True)
+os.environ["PARLIAMENT_LOG_DIR"] = _log_dir
 
 import patches  # noqa: F401 — applies all monkey-patches at import time
 
@@ -247,9 +258,6 @@ def parse_args():
 
 
 async def main():
-    from datetime import datetime as dt
-    import shutil
-
     args = parse_args()
 
     api_key = API_KEY
@@ -268,14 +276,7 @@ async def main():
     if question is None:
         question = input("Enter the scientific question:\n> ")
 
-    timestamp = dt.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = os.path.join(OUTPUT_DIR, timestamp)
-    log_dir = os.path.join(run_dir, "log")
-    os.makedirs(log_dir, exist_ok=True)
-
-    shutil.copy2("config.py", os.path.join(run_dir, "config.py"))
-
-    os.environ["CAMEL_LOG_DIR"] = log_dir
+    shutil.copy2("config.py", os.path.join(_run_dir, "config.py"))
 
     model = ModelFactory.create(
         model_platform=ModelPlatformType.OPENAI,
@@ -285,10 +286,10 @@ async def main():
     await run_parliament(
         question=question,
         model=model,
-        output_dir=run_dir,
+        output_dir=_run_dir,
     )
 
-    print(f"\nAll outputs saved to: {run_dir}")
+    print(f"\nAll outputs saved to: {_run_dir}")
 
 
 if __name__ == "__main__":

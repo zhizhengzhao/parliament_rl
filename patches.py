@@ -11,6 +11,7 @@ What we patch:
 6. SocialAgent.perform_interview — remove "You are a twitter user" leftover
 """
 
+import logging
 import os
 import random
 from datetime import datetime
@@ -18,7 +19,7 @@ from string import Template
 
 from camel.messages import BaseMessage
 
-_log_dir = os.environ.get("CAMEL_LOG_DIR", "./log")
+_log_dir = os.environ.get("PARLIAMENT_LOG_DIR", "./log")
 os.makedirs(_log_dir, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -62,8 +63,6 @@ SocialAgent.perform_action_by_data = _patched_perform_action_by_data
 # ---------------------------------------------------------------------------
 # 2. Patch SocialAgent.perform_action_by_llm — parliament user message
 # ---------------------------------------------------------------------------
-import logging
-
 _agent_log = logging.getLogger("social.agent")
 
 from oasis.social_platform.typing import ActionType
@@ -356,3 +355,34 @@ async def _patched_perform_interview(self, interview_prompt: str):
 
 
 SocialAgent.perform_interview = _patched_perform_interview
+
+# ---------------------------------------------------------------------------
+# 7. Redirect all OASIS loggers to the run's log directory
+#    OASIS creates FileHandlers at import time pointing to ./log/.
+#    We replace them to keep all logs inside the run directory.
+# ---------------------------------------------------------------------------
+def _redirect_loggers_to_run_dir():
+    now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    fmt = logging.Formatter(
+        "%(levelname)s - %(asctime)s - %(name)s - %(message)s"
+    )
+    logger_files = {
+        "social.agent": f"social.agent-{now}.log",
+        "social.twitter": f"social.twitter-{now}.log",
+        "oasis.env": f"oasis-{now}.log",
+    }
+    for logger_name, filename in logger_files.items():
+        logger = logging.getLogger(logger_name)
+        for h in logger.handlers[:]:
+            if isinstance(h, logging.FileHandler):
+                h.close()
+                logger.removeHandler(h)
+        fh = logging.FileHandler(
+            os.path.join(_log_dir, filename), encoding="utf-8"
+        )
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+
+
+_redirect_loggers_to_run_dir()
