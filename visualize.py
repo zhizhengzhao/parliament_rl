@@ -215,8 +215,8 @@ def _profile_data(data):
         uid = u["user_id"]
         profiles[uid] = dict(
             name=u["name"], color=_AVATAR_COLORS[uid % len(_AVATAR_COLORS)],
-            posts=[dict(id=p["post_id"], text=(p["content"] or "")[:500], sc=p.get("score",0) or 0) for p in posts_by_user.get(uid,[])],
-            comments=[dict(pid=c["post_id"], text=(c["content"] or "")[:300], sc=c.get("score",0) or 0) for c in comments_by_user.get(uid,[])],
+            posts=[dict(id=p["post_id"], text=p["content"] or "", sc=p.get("score",0) or 0) for p in posts_by_user.get(uid,[])],
+            comments=[dict(pid=c["post_id"], text=c["content"] or "", sc=c.get("score",0) or 0) for c in comments_by_user.get(uid,[])],
             following=following_map.get(uid,[]), followers=followers_map.get(uid,[]),
         )
     return profiles
@@ -238,7 +238,7 @@ def _build_html(data, question, current_round, num_rounds):
 
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
-<meta charset="UTF-8"><meta http-equiv="refresh" content="8">
+<meta charset="UTF-8"><meta http-equiv="refresh" content="15">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Science Parliament</title>
 <style>
@@ -292,10 +292,7 @@ a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}
 .pid{{color:var(--muted);font-size:.75rem}}
 .post-head-right{{margin-left:auto;display:flex;align-items:center;gap:8px}}
 .post-body{{padding:4px 18px 14px}}
-.post-text{{font-size:.88rem;white-space:pre-wrap;word-break:break-word;
-  max-height:300px;overflow:hidden;position:relative}}
-.post-text.tall::after{{content:'';position:absolute;bottom:0;left:0;right:0;height:60px;
-  background:linear-gradient(transparent,var(--card))}}
+.post-text{{font-size:.88rem;white-space:pre-wrap;word-break:break-word}}
 
 /* comments */
 .cmt-section{{border-top:1px solid var(--border)}}
@@ -382,7 +379,7 @@ a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}
   <div class="modal"><button class="modal-x" onclick="cl()">&times;</button>
     <div id="mc"></div></div></div>
 
-<div class="foot"><span class="dot"></span>Auto-refreshes · {now}</div>
+<div class="foot"><span class="dot"></span>Auto-refreshes every 15s · {now}</div>
 
 <script>
 const P={pjson};
@@ -407,7 +404,6 @@ function showProfile(uid){{const p=P[uid];if(!p)return;
   document.getElementById('mc').innerHTML=h;document.getElementById('ov').classList.add('open')}}
 function cl(){{document.getElementById('ov').classList.remove('open')}}
 document.addEventListener('keydown',ev=>{{if(ev.key==='Escape')cl()}});
-document.querySelectorAll('.post-text').forEach(el=>{{if(el.scrollHeight>300)el.classList.add('tall')}});
 </script></body></html>"""
 
 

@@ -227,11 +227,11 @@ async def _patched_perform_action_by_llm(self):
     user_msg = BaseMessage.make_user_message(
         role_name="User",
         content=(
-            "A new round has begun. Read the forum below, then act.\n\n"
-            "You can take multiple actions this round: for example, "
-            "search \u2192 comment \u2192 endorse \u2192 follow, all in one turn. "
-            "Look at the scores to see what the parliament values. "
-            "If you have nothing new to contribute, call do_nothing.\n\n"
+            "A new round has begun. Read the forum carefully.\n\n"
+            "Before posting anything new, consider: Is there a post "
+            "you should comment on? An error to challenge? Strong work "
+            "to endorse? A scientist to follow? You can do ALL of these "
+            "in one round. Use the full range of actions.\n\n"
             f"{env_prompt}"
         ),
     )
@@ -305,10 +305,9 @@ SocialEnvironment.posts_env_template = Template(
 SocialEnvironment.env_template = Template(
     "$posts_env\n\n"
     "$followers_env $follows_env\n\n"
-    "Remember: you can take multiple actions this round. Consider "
-    "endorsing strong posts, commenting to build on good work, "
-    "following promising scientists, and searching before posting. "
-    "What action(s) would best advance the problem right now?"
+    "Look at the scores. Which posts deserve endorsement? Which have "
+    "errors worth challenging? Who should you follow? Is there a "
+    "comment you should leave before writing a new post?"
 )
 
 
