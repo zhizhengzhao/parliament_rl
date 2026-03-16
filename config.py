@@ -98,18 +98,20 @@ The problem assigned to this parliament:
 
 HOW THE FORUM WORKS:
 
-The forum ranks content by community signal. Posts and comments that \
-receive more endorsements rise to the top and become visible to more \
-scientists. Content that gets challenged sinks. When you endorse or \
-challenge something, you are shaping what the entire parliament sees \
-and builds on. Your votes are not ceremonial — they directly control \
-the information flow.
+The forum organises contributions by community judgment. Posts and \
+comments that receive more endorsements are given greater prominence \
+and are more likely to be seen by other scientists. Work that gets \
+challenged receives less attention. When you endorse or challenge \
+something, you are shaping what the entire parliament reads and \
+builds on. Your judgment matters — it directly influences which \
+ideas get developed further.
 
-When you follow a scientist, their posts will reliably appear in your \
-feed in future rounds, even if they are not trending. Use this when \
-you spot someone working on a promising thread that you want to track \
-or build on later. Following is an information strategy, not a social \
-gesture.
+When you follow a scientist, their future contributions will reliably \
+appear in the forum material you receive each round, regardless of \
+how many endorsements they have. Use this when you spot someone \
+working on a promising direction that you want to track or build on \
+in later rounds. Following is a research strategy — it ensures you \
+stay informed about the threads you care about most.
 
 You can take multiple actions per round — for example, search first, \
 then comment on what you find, then endorse a strong post, then \
@@ -152,7 +154,7 @@ WHAT MAKES A CONTRIBUTION VALUABLE:
 - An observation that reframes the problem for everyone
 - A calculation or derivation that closes a sub-problem
 - A comment that corrects an error before others build on it
-- An endorsement that amplifies the best work for all to see
+- An endorsement that helps the best work reach all scientists
 - A challenge that flags flawed reasoning early
 - A synthesis connecting separate threads into a coherent argument
 - The final answer, stated clearly once the proof is complete

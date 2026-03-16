@@ -374,10 +374,10 @@ SocialAction.create_comment.__doc__ = (
 )
 
 SocialAction.like_post.__doc__ = (
-    "Endorse a post. This increases its score, which directly affects "
-    "its ranking \u2014 higher-scored posts are shown more prominently to "
-    "all scientists in the forum. Endorsing strong work amplifies it "
-    "so the entire parliament can build on it.\n\n"
+    "Endorse a post. This increases its score, which affects how "
+    "prominently it appears in the forum \u2014 higher-scored contributions "
+    "are seen by more scientists. Endorsing strong work helps the "
+    "entire parliament find and build on the best ideas.\n\n"
     "Use this when a post contains sound reasoning, a correct calculation, "
     "or a valuable insight that others should see and build upon.\n\n"
     "Args:\n"
@@ -387,10 +387,10 @@ SocialAction.like_post.__doc__ = (
 )
 
 SocialAction.dislike_post.__doc__ = (
-    "Challenge a post. This decreases its score, pushing it down in the "
-    "ranking so fewer scientists see it. Use this to flag posts with "
-    "errors, flawed logic, or misleading claims \u2014 before others waste "
-    "time building on a wrong foundation.\n\n"
+    "Challenge a post. This decreases its score, making it less "
+    "prominent in the forum so fewer scientists spend time on it. "
+    "Use this to flag posts with errors, flawed logic, or misleading "
+    "claims \u2014 before others waste effort building on a wrong foundation.\n\n"
     "When you challenge a post, consider also commenting to explain "
     "what the error is, so the author and others can learn from it.\n\n"
     "Args:\n"
@@ -432,14 +432,15 @@ SocialAction.search_posts.__doc__ = (
 )
 
 SocialAction.follow.__doc__ = (
-    "Follow a scientist. Once you follow someone, their future posts "
-    "will reliably appear in your feed every round, even if they are "
-    "not trending. This is useful when you spot a scientist exploring "
-    "a promising direction and you want to track their progress, "
-    "build on their work, or verify their claims in later rounds.\n\n"
-    "Following is a strategic information choice \u2014 it ensures you "
-    "don't miss contributions from the scientists you think are most "
-    "likely to advance the solution.\n\n"
+    "Follow a scientist. Once you follow someone, their future "
+    "contributions will reliably appear in the forum material you "
+    "receive each round, regardless of their score. This is useful "
+    "when you spot a scientist exploring a promising direction and "
+    "you want to track their progress, build on their work, or "
+    "verify their claims in later rounds.\n\n"
+    "Following is a research strategy \u2014 it ensures you stay "
+    "informed about the scientists whose work matters most to "
+    "the thread you are pursuing.\n\n"
     "Args:\n"
     "    followee_id (int): The scientist_id of the scientist to follow "
     "(see 'scientist_id' in each forum post or comment).\n\n"
