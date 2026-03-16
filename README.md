@@ -67,6 +67,13 @@ python run_parliament.py --question_file question.txt
 python serve.py --output_dir output/<timestamp>/ --token YOUR_NGROK_TOKEN
 ```
 
+可选 `--refresh N`（单位秒）控制页面自动刷新频率，`0` 或负数关闭刷新（默认 15s）：
+
+```bash
+python serve.py --output_dir output/<timestamp>/ --token YOUR_NGROK_TOKEN --refresh 60
+python serve.py --output_dir output/<timestamp>/ --token YOUR_NGROK_TOKEN --refresh 0
+```
+
 **本地查看（跑完后）：**
 
 直接双击 `index.html` 在浏览器打开即可。

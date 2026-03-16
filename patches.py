@@ -593,9 +593,17 @@ async def _patched_perform_interview(self, interview_prompt: str):
 SocialAgent.perform_interview = _patched_perform_interview
 
 # ---------------------------------------------------------------------------
-# 7. Redirect all OASIS loggers to the run's log directory
-#    OASIS creates FileHandlers at import time pointing to ./log/.
-#    We replace them to keep all logs inside the run directory.
+# 7. Redirect all OASIS loggers to the run's log directory.
+#
+#    OASIS creates FileHandlers pointing to ./log/ at module-import time
+#    (platform.py, agent.py).  Those modules are pulled in transitively when
+#    patches.py imports SocialAgent, so by the time we reach this point the
+#    social.agent and social.twitter loggers already have wrong handlers.
+#
+#    env.py is imported later (via `import oasis` in run_parliament.py), so
+#    its oasis.env handler is also wrong but not yet attached.  We call this
+#    function a second time from run_parliament.py AFTER all imports to catch
+#    that case as well.
 # ---------------------------------------------------------------------------
 def _redirect_loggers_to_run_dir():
     now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

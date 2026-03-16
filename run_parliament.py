@@ -31,14 +31,10 @@ os.environ["PARLIAMENT_LOG_DIR"] = _log_dir
 
 import patches  # noqa: F401 — applies all monkey-patches at import time
 
-# OASIS modules create ./log/ at import time before we can redirect them.
-# Force-remove it now that all handlers have been redirected to the run dir.
-if os.path.isdir("./log") and os.path.abspath("./log") != os.path.abspath(_log_dir):
-    try:
-        shutil.rmtree("./log")
-    except OSError:
-        pass
-
+# Import all camel/oasis modules NOW.
+# OASIS creates ./log/ at module level (platform.py, env.py) — this is
+# unavoidable without modifying installed source. We clean up after all
+# imports are done (see the redirect + rmtree block below).
 from camel.models import ModelFactory
 from camel.prompts import TextPrompt
 from camel.toolkits import SymPyToolkit
@@ -49,6 +45,17 @@ from oasis import LLMAction, ManualAction, SocialAgent, AgentGraph, UserInfo
 from oasis.social_platform.channel import Channel
 from oasis.social_platform.platform import Platform
 from oasis.social_platform.typing import ActionType
+
+# NOW that every OASIS module has been imported (and may have attached extra
+# FileHandlers to ./log/), redirect all loggers to the run directory and then
+# remove the stray ./log/ tree. Order matters: redirect first so that all open
+# file handles are closed before rmtree tries to delete the files.
+patches._redirect_loggers_to_run_dir()
+if os.path.isdir("./log") and os.path.abspath("./log") != os.path.abspath(_log_dir):
+    try:
+        shutil.rmtree("./log")
+    except OSError:
+        pass
 
 from config import (
     AVAILABLE_ACTIONS_LIST,
