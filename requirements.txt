@@ -1,4 +1,28 @@
-oasis-ai
-camel-ai[all]
-pandas
+# ============================================================
+# Science Parliament — pinned dependencies
+# WARNING: camel-ai and camel-oasis versions are critical.
+# patches.py monkey-patches their internal APIs.
+# Do NOT upgrade without re-validating patches.py.
+# ============================================================
+
+# Core: multi-agent framework (version-sensitive)
+camel-ai==0.2.89
+
+# Core: social simulation platform (version-sensitive, install with --no-deps)
+# pip install camel-oasis==0.2.5 --no-deps
+camel-oasis==0.2.5
+
+# Math tool used by scientist agents
+sympy>=1.13
+
+# OASIS runtime dependencies
+pandas>=2.2
+igraph>=0.11
+sentence-transformers>=3.0
+neo4j>=5.23
+
+# Misc
 python-dotenv
+
+# Optional: live visualization via ngrok tunnel
+# pip install pyngrok
