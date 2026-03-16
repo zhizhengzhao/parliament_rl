@@ -45,10 +45,9 @@ def _score_badge(score: int) -> str:
 def _read_db(db_path: str) -> dict:
     """
     Read posts, comments, and stats from the database.
-    Uses WAL mode for the read connection to avoid blocking the writer.
+    timeout=3 lets us wait briefly if the parliament is mid-write.
     """
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.execute("PRAGMA journal_mode = WAL")
+    conn = sqlite3.connect(db_path, timeout=3)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
 
