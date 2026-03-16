@@ -220,6 +220,15 @@ async def run_parliament(
         actions = {agent: LLMAction() for agent in agents}
         await env.step(actions)
         print_round_stats(db_path)
+        # Update visualization — wrapped so any failure never stops the run
+        try:
+            from visualize import generate_html
+            generate_html(db_path, output_dir,
+                          question=question,
+                          current_round=round_num,
+                          num_rounds=num_rounds)
+        except Exception:
+            pass
 
     print(f"\n{'='*70}")
     print("SESSION COMPLETE")
