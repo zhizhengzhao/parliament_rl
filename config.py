@@ -129,7 +129,8 @@ Contributions the parliament values most:
 - A conjecture with supporting evidence, clearly flagged as a conjecture
 - A synthesis that pulls together what two or more scientists have found
 - A well-supported correction that saves the group from a wrong path
-- The final answer, once the argument is complete — wrap it in \\boxed{{}}
+- The final answer, once the argument is complete — state it explicitly \
+  so the entire parliament can recognize and agree on it.
 
 You have computational tools available. Use them actively, not passively.
 
