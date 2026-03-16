@@ -1,29 +1,31 @@
 """
 Science Parliament — visualization module.
 
-Reads the SQLite database and writes a self-contained index.html to the
-run output directory.  Auto-refreshes every 8 seconds in the browser.
+Reads the SQLite database and writes a self-contained index.html with:
+  - Forum view: posts sorted by score, with nested comments
+  - Scientists view: ranked profiles with activity indicators
+  - Network view: follow relationship graph
 
-Usage (standalone):
-    python visualize.py <db_path> <output_dir>
-
-Usage (from run_parliament.py, already integrated):
-    from visualize import generate_html
-    generate_html(db_path, output_dir, question=question,
-                  current_round=round_num, num_rounds=num_rounds)
+Auto-refreshes every 8 seconds in the browser.
 """
 
+import json
 import os
 import sqlite3
 from datetime import datetime
 
+# Distinct muted colours for scientist avatars (up to 26)
+_AVATAR_COLORS = [
+    "#6366f1", "#8b5cf6", "#a855f7", "#d946ef", "#ec4899",
+    "#f43f5e", "#ef4444", "#f97316", "#eab308", "#84cc16",
+    "#22c55e", "#14b8a6", "#06b6d4", "#0ea5e9", "#3b82f6",
+    "#6366f1", "#8b5cf6", "#a855f7", "#d946ef", "#ec4899",
+    "#f43f5e", "#ef4444", "#f97316", "#eab308", "#84cc16",
+    "#22c55e",
+]
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
-def _esc(text: str) -> str:
-    """Minimal HTML escaping."""
+def _esc(text):
     if text is None:
         return ""
     return (
@@ -35,50 +37,43 @@ def _esc(text: str) -> str:
     )
 
 
-def _score_badge(score: int) -> str:
-    score = score or 0
-    css = "score-pos" if score > 0 else ("score-neg" if score < 0 else "score-zero")
-    label = f"+{score}" if score > 0 else str(score)
-    return f'<span class="score {css}">{label}</span>'
-
-
-def _read_db(db_path: str) -> dict:
-    """
-    Read posts, comments, and stats from the database.
-    timeout=3 lets us wait briefly if the parliament is mid-write.
-    """
+def _read_db(db_path):
     conn = sqlite3.connect(db_path, timeout=3)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
 
-    # Posts with author names, sorted by score desc then post_id asc
+    c.execute("SELECT user_id, name, bio FROM user ORDER BY user_id")
+    users = [dict(r) for r in c.fetchall()]
+    user_map = {u["user_id"]: u["name"] for u in users}
+
     c.execute("""
-        SELECT p.post_id,
-               u.name       AS author,
-               p.content,
+        SELECT p.post_id, p.user_id, u.name AS author, p.content,
                (p.num_likes - p.num_dislikes) AS score
-        FROM post p
-        JOIN user u ON p.user_id = u.user_id
+        FROM post p JOIN user u ON p.user_id = u.user_id
         ORDER BY score DESC, p.post_id ASC
     """)
     posts = [dict(r) for r in c.fetchall()]
 
-    # Comments with author names
     c.execute("""
-        SELECT cm.comment_id, cm.post_id,
-               u.name AS author,
-               cm.content,
-               (cm.num_likes - cm.num_dislikes) AS score
-        FROM comment cm
-        JOIN user u ON cm.user_id = u.user_id
+        SELECT cm.comment_id, cm.post_id, cm.user_id, u.name AS author,
+               cm.content, (cm.num_likes - cm.num_dislikes) AS score
+        FROM comment cm JOIN user u ON cm.user_id = u.user_id
         ORDER BY cm.comment_id ASC
     """)
-    comments_by_post: dict = {}
-    for row in c.fetchall():
-        row = dict(row)
-        comments_by_post.setdefault(row["post_id"], []).append(row)
+    comments = [dict(r) for r in c.fetchall()]
+    comments_by_post = {}
+    for cm in comments:
+        comments_by_post.setdefault(cm["post_id"], []).append(cm)
 
-    # Summary stats
+    c.execute("""
+        SELECT f.follower_id, u1.name AS follower_name,
+               f.followee_id, u2.name AS followee_name
+        FROM follow f
+        JOIN user u1 ON f.follower_id = u1.user_id
+        JOIN user u2 ON f.followee_id = u2.user_id
+    """)
+    follows = [dict(r) for r in c.fetchall()]
+
     c.execute("SELECT COUNT(*) FROM post")
     n_posts = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM comment")
@@ -88,233 +83,347 @@ def _read_db(db_path: str) -> dict:
         WHERE action IN ('like_post','dislike_post','like_comment','dislike_comment')
     """)
     n_votes = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM follow")
+    n_follows = c.fetchone()[0]
 
     conn.close()
-    return {
-        "posts": posts,
-        "comments_by_post": comments_by_post,
-        "n_posts": n_posts,
-        "n_comments": n_comments,
-        "n_votes": n_votes,
-    }
-
-
-def _build_html(data: dict, question: str, current_round: int, num_rounds: int) -> str:
-    """Assemble the complete HTML page."""
-
-    # ── Question banner ────────────────────────────────────────────────────
-    q_html = ""
-    if question:
-        q_html = f"""
-<div class="question-banner">
-  <span class="q-label">Q</span>
-  <span class="q-text">{_esc(question)}</span>
-</div>"""
-
-    # ── Round progress ─────────────────────────────────────────────────────
-    round_label = (
-        f"Round {current_round} / {num_rounds}"
-        if num_rounds > 0
-        else ("Session opening..." if current_round == 0 else f"Round {current_round}")
+    return dict(
+        users=users, user_map=user_map, posts=posts, comments=comments,
+        comments_by_post=comments_by_post, follows=follows,
+        n_posts=n_posts, n_comments=n_comments, n_votes=n_votes,
+        n_follows=n_follows,
     )
-    pct = int(current_round / num_rounds * 100) if num_rounds > 0 else 0
 
-    # ── Post cards ─────────────────────────────────────────────────────────
-    cards_html = ""
+
+def _avatar(name, uid):
+    c = _AVATAR_COLORS[uid % len(_AVATAR_COLORS)]
+    letter = (name or "?")[0].upper()
+    return f'<span class="av" style="background:{c}">{letter}</span>'
+
+
+def _score_badge(score):
+    score = score or 0
+    if score > 0:
+        return f'<span class="badge pos">+{score}</span>'
+    elif score < 0:
+        return f'<span class="badge neg">{score}</span>'
+    return f'<span class="badge zero">0</span>'
+
+
+def _forum_html(data):
+    h = ""
     for post in data["posts"]:
-        pid = post["post_id"]
+        pid, uid = post["post_id"], post["user_id"]
         author = _esc(post["author"] or "?")
-        avatar = author[0].upper()
         content = _esc(post["content"] or "")
+        cmts = data["comments_by_post"].get(pid, [])
+        n_cmts = len(cmts)
 
-        # Comments for this post
         cmts_html = ""
-        for cm in data["comments_by_post"].get(pid, []):
+        for cm in cmts:
             ca = _esc(cm["author"] or "?")
             cc = _esc(cm["content"] or "")
-            cmts_html += f"""
-    <div class="comment">
-      <div class="comment-meta">
-        <span class="comment-author">{ca}</span>
-        {_score_badge(cm['score'])}
-      </div>
-      <div class="comment-body">{cc}</div>
-    </div>"""
+            cmts_html += f"""<div class="cmt">
+  <div class="cmt-head">{_avatar(cm['author'], cm['user_id'])}
+    <a class="name" href="#" onclick="showProfile({cm['user_id']});return false">{ca}</a>
+    {_score_badge(cm['score'])}</div>
+  <div class="cmt-body">{cc}</div></div>"""
 
-        cmts_section = (
-            f'<div class="comments">{cmts_html}</div>' if cmts_html else ""
-        )
+        cmt_section = f'<div class="cmt-section"><div class="cmt-toggle" onclick="this.parentElement.classList.toggle(\'open\')">{n_cmts} comment{"s" if n_cmts!=1 else ""}</div><div class="cmt-list">{cmts_html}</div></div>' if cmts_html else ""
 
-        cards_html += f"""
-<div class="card">
-  <div class="card-header">
-    <div class="avatar">{avatar}</div>
-    <span class="card-author">{author}</span>
-    <span class="card-id">#{pid}</span>
-    {_score_badge(post['score'])}
+        h += f"""<article class="post">
+  <div class="post-head">
+    {_avatar(post['author'], uid)}
+    <a class="name" href="#" onclick="showProfile({uid});return false">{author}</a>
+    <span class="pid">#{pid}</span>
+    <div class="post-head-right">{_score_badge(post['score'])}</div>
   </div>
-  <div class="card-body">{content}</div>
-  {cmts_section}
-</div>"""
+  <div class="post-body"><div class="post-text">{content}</div></div>
+  {cmt_section}
+</article>"""
 
-    if not cards_html:
-        cards_html = '<div class="empty">The parliament is about to open… ✨</div>'
+    return h or '<div class="empty-msg">The parliament is about to begin...</div>'
 
+
+def _scientists_html(data):
+    posts_by_user = {}
+    for p in data["posts"]:
+        posts_by_user.setdefault(p["user_id"], []).append(p)
+    comments_by_user = {}
+    for cm in data["comments"]:
+        comments_by_user.setdefault(cm["user_id"], []).append(cm)
+    followers_map = {}
+    following_map = {}
+    for f in data["follows"]:
+        following_map.setdefault(f["follower_id"], []).append(f["followee_name"])
+        followers_map.setdefault(f["followee_id"], []).append(f["follower_name"])
+
+    entries = []
+    for u in data["users"]:
+        uid = u["user_id"]
+        u_posts = posts_by_user.get(uid, [])
+        total_score = sum(p.get("score", 0) or 0 for p in u_posts)
+        entries.append((total_score, uid, u, u_posts, comments_by_user.get(uid, []),
+                         following_map.get(uid, []), followers_map.get(uid, [])))
+    entries.sort(key=lambda x: -x[0])
+
+    h = ""
+    for total_score, uid, u, u_posts, u_cmts, u_following, u_followers in entries:
+        name = _esc(u["name"] or "?")
+        bar_w = min(max(total_score * 4, 0), 200)
+        h += f"""<div class="sci" onclick="showProfile({uid})">
+  <div class="sci-left">{_avatar(u['name'], uid)}
+    <div><div class="sci-name">{name}</div>
+      <div class="sci-nums">{len(u_posts)} posts · {len(u_cmts)} comments · {len(u_followers)} followers</div></div></div>
+  <div class="sci-right"><div class="sci-bar-wrap"><div class="sci-bar" style="width:{bar_w}px"></div></div>
+    {_score_badge(total_score)}</div></div>"""
+
+    return h or '<div class="empty-msg">No scientists yet.</div>'
+
+
+def _network_html(data):
+    if not data["follows"]:
+        return '<div class="empty-msg">No follow relationships yet.</div>'
+    following_map = {}
+    for f in data["follows"]:
+        following_map.setdefault(f["follower_name"], []).append(f["followee_name"])
+
+    h = '<div class="net-grid">'
+    for name in sorted(following_map):
+        targets = following_map[name]
+        tags = "".join(f'<span class="net-tag">{_esc(t)}</span>' for t in sorted(targets))
+        h += f'<div class="net-row"><div class="net-from">{_esc(name)}</div><div class="net-arrow">→</div><div class="net-to">{tags}</div></div>'
+    h += "</div>"
+    return h
+
+
+def _profile_data(data):
+    posts_by_user = {}
+    for p in data["posts"]:
+        posts_by_user.setdefault(p["user_id"], []).append(p)
+    comments_by_user = {}
+    for cm in data["comments"]:
+        comments_by_user.setdefault(cm["user_id"], []).append(cm)
+    following_map = {}
+    followers_map = {}
+    for f in data["follows"]:
+        following_map.setdefault(f["follower_id"], []).append(f["followee_name"])
+        followers_map.setdefault(f["followee_id"], []).append(f["follower_name"])
+
+    profiles = {}
+    for u in data["users"]:
+        uid = u["user_id"]
+        profiles[uid] = dict(
+            name=u["name"], color=_AVATAR_COLORS[uid % len(_AVATAR_COLORS)],
+            posts=[dict(id=p["post_id"], text=(p["content"] or "")[:500], sc=p.get("score",0) or 0) for p in posts_by_user.get(uid,[])],
+            comments=[dict(pid=c["post_id"], text=(c["content"] or "")[:300], sc=c.get("score",0) or 0) for c in comments_by_user.get(uid,[])],
+            following=following_map.get(uid,[]), followers=followers_map.get(uid,[]),
+        )
+    return profiles
+
+
+def _build_html(data, question, current_round, num_rounds):
+    q_html = ""
+    if question:
+        q_html = f'<div class="q-banner"><span class="q-chip">PROBLEM</span>{_esc(question)}</div>'
+
+    round_label = f"Round {current_round}/{num_rounds}" if num_rounds > 0 else "Opening..."
+    pct = int(current_round / num_rounds * 100) if num_rounds > 0 else 0
     now = datetime.now().strftime("%H:%M:%S")
 
-    # ── Full page ──────────────────────────────────────────────────────────
+    forum = _forum_html(data)
+    scientists = _scientists_html(data)
+    network = _network_html(data)
+    pjson = json.dumps(_profile_data(data), ensure_ascii=False)
+
     return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta http-equiv="refresh" content="8">
+<html lang="en"><head>
+<meta charset="UTF-8"><meta http-equiv="refresh" content="8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Science Parliament</title>
 <style>
-:root{{--blue:#4cc9f0;--dark:#1a1a2e;--card:#fff;--bg:#f0f2f7;
-      --pos:#2e7d32;--pos-bg:#e8f5e9;--neg:#c62828;--neg-bg:#fce4ec;
-      --zero:#666;--zero-bg:#f0f0f0}}
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-     background:var(--bg);color:var(--dark);line-height:1.65;font-size:15px}}
+:root{{--bg:#f4f5f9;--card:#fff;--border:#e8e9f0;--text:#1e1e2e;--muted:#8b8da0;
+  --accent:#6366f1;--accent2:#818cf8;--green:#16a34a;--green-bg:#dcfce7;
+  --red:#dc2626;--red-bg:#fee2e2;--gray-bg:#f1f2f6}}
+body{{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:var(--bg);color:var(--text);line-height:1.7;font-size:14px}}
+a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}}
 
-/* ── header ── */
-.header{{background:linear-gradient(135deg,var(--dark) 0%,#16213e 100%);
-         color:#fff;padding:22px 28px 18px}}
-.header h1{{font-size:1.45rem;font-weight:700;letter-spacing:-.3px}}
-.header h1 em{{color:var(--blue);font-style:normal}}
-.stats{{display:flex;gap:16px;margin-top:10px;flex-wrap:wrap}}
-.stat{{background:rgba(255,255,255,.1);border-radius:6px;
-       padding:4px 12px;font-size:.82rem}}
-.stat strong{{color:var(--blue)}}
+/* header */
+.hdr{{background:linear-gradient(135deg,#1e1b4b 0%,#312e81 100%);color:#fff;padding:24px 32px 20px}}
+.hdr h1{{font-size:1.35rem;font-weight:800;letter-spacing:-.5px}}
+.hdr h1 span{{color:var(--accent2);font-weight:400}}
+.hdr-stats{{display:flex;gap:18px;margin-top:10px;flex-wrap:wrap}}
+.hdr-s{{font-size:.8rem;opacity:.75}}
+.hdr-s b{{color:var(--accent2);opacity:1}}
+.prog{{height:3px;background:rgba(255,255,255,.1)}}
+.prog-fill{{height:100%;background:var(--accent2);transition:width .5s;width:{pct}%}}
+.round{{text-align:right;font-size:.72rem;color:rgba(255,255,255,.4);padding:3px 32px 0}}
 
-/* ── progress ── */
-.progress-bar{{height:4px;background:rgba(255,255,255,.15)}}
-.progress-fill{{height:100%;background:var(--blue);
-                transition:width .6s ease;width:{pct}%}}
-.round-label{{text-align:right;font-size:.78rem;color:rgba(255,255,255,.6);
-              padding:4px 28px 0}}
+/* question */
+.q-banner{{background:#eef2ff;border-left:4px solid var(--accent);margin:16px 28px 0;
+  padding:14px 18px;border-radius:0 10px 10px 0;font-size:.88rem;line-height:1.6}}
+.q-chip{{background:var(--accent);color:#fff;font-size:.65rem;font-weight:700;
+  padding:2px 8px;border-radius:4px;margin-right:10px;letter-spacing:.8px;vertical-align:middle}}
 
-/* ── question ── */
-.question-banner{{background:#e3f2fd;border-left:4px solid var(--blue);
-                  margin:20px 24px;padding:12px 16px;border-radius:0 8px 8px 0;
-                  font-size:.93rem}}
-.q-label{{background:var(--blue);color:#fff;font-weight:700;font-size:.73rem;
-          letter-spacing:1px;padding:2px 7px;border-radius:4px;
-          margin-right:10px;vertical-align:middle}}
-.q-text{{vertical-align:middle}}
+/* tabs */
+.tabs{{display:flex;gap:0;margin:18px 28px 0;border-bottom:2px solid var(--border)}}
+.tab{{padding:10px 24px;cursor:pointer;font-weight:600;font-size:.85rem;
+  color:var(--muted);border-bottom:2px solid transparent;margin-bottom:-2px;transition:.2s}}
+.tab:hover{{color:var(--text)}}.tab.on{{color:var(--accent);border-color:var(--accent)}}
+.pane{{display:none;max-width:880px;margin:0 auto;padding:14px 24px 60px}}.pane.on{{display:block}}
 
-/* ── forum ── */
-.forum{{max-width:780px;margin:0 auto;padding:12px 20px 48px}}
+/* avatar */
+.av{{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;
+  border-radius:50%;color:#fff;font-weight:700;font-size:.82rem;flex-shrink:0}}
 
-/* ── cards ── */
-.card{{background:var(--card);border-radius:12px;margin-bottom:14px;
-       box-shadow:0 2px 8px rgba(0,0,0,.07);overflow:hidden}}
-.card-header{{display:flex;align-items:center;gap:9px;
-              padding:13px 16px 10px;border-bottom:1px solid #f0f0f0}}
-.avatar{{width:30px;height:30px;border-radius:50%;flex-shrink:0;
-         background:linear-gradient(135deg,var(--blue),#7b2d8b);
-         color:#fff;font-weight:700;font-size:.88rem;
-         display:flex;align-items:center;justify-content:center}}
-.card-author{{font-weight:600;font-size:.93rem}}
-.card-id{{color:#bbb;font-size:.78rem;margin-left:2px}}
-.score{{margin-left:auto;font-weight:700;font-size:.88rem;
-        padding:2px 10px;border-radius:20px}}
-.score-pos{{background:var(--pos-bg);color:var(--pos)}}
-.score-neg{{background:var(--neg-bg);color:var(--neg)}}
-.score-zero{{background:var(--zero-bg);color:var(--zero)}}
-.card-body{{padding:12px 16px;font-size:.9rem;color:#333;
-            white-space:pre-wrap;word-break:break-word}}
+/* badge */
+.badge{{font-weight:700;font-size:.78rem;padding:2px 10px;border-radius:20px;white-space:nowrap}}
+.pos{{background:var(--green-bg);color:var(--green)}}.neg{{background:var(--red-bg);color:var(--red)}}
+.zero{{background:var(--gray-bg);color:var(--muted)}}
 
-/* ── comments ── */
-.comments{{background:#fafafa;border-top:1px solid #f0f0f0;
-           padding:8px 16px 12px}}
-.comment{{padding:7px 0 7px 14px;border-left:3px solid #e0e0e0;
-          margin:5px 0;font-size:.85rem}}
-.comment-meta{{display:flex;align-items:center;gap:7px;margin-bottom:3px}}
-.comment-author{{font-weight:600;color:#555}}
-.comment-body{{color:#444;white-space:pre-wrap;word-break:break-word}}
+/* posts */
+.post{{background:var(--card);border-radius:14px;margin-bottom:14px;
+  border:1px solid var(--border);overflow:hidden;transition:box-shadow .2s}}
+.post:hover{{box-shadow:0 4px 20px rgba(0,0,0,.06)}}
+.post-head{{display:flex;align-items:center;gap:10px;padding:14px 18px 10px}}
+.name{{font-weight:700;font-size:.9rem;color:var(--accent);cursor:pointer}}
+.pid{{color:var(--muted);font-size:.75rem}}
+.post-head-right{{margin-left:auto;display:flex;align-items:center;gap:8px}}
+.post-body{{padding:4px 18px 14px}}
+.post-text{{font-size:.88rem;white-space:pre-wrap;word-break:break-word;
+  max-height:300px;overflow:hidden;position:relative}}
+.post-text.tall::after{{content:'';position:absolute;bottom:0;left:0;right:0;height:60px;
+  background:linear-gradient(transparent,var(--card))}}
 
-/* ── misc ── */
-.empty{{text-align:center;color:#aaa;padding:60px 20px;font-size:1rem}}
-.footer{{text-align:center;padding:14px;font-size:.78rem;color:#aaa;
-         border-top:1px solid #e8e8e8;background:#fff}}
-.dot{{display:inline-block;width:7px;height:7px;border-radius:50%;
-      background:#4caf50;margin-right:5px;
-      animation:pulse 2s ease-in-out infinite}}
-@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
-</style>
-</head>
-<body>
+/* comments */
+.cmt-section{{border-top:1px solid var(--border)}}
+.cmt-toggle{{padding:8px 18px;font-size:.78rem;color:var(--muted);cursor:pointer;
+  font-weight:600;user-select:none}}.cmt-toggle:hover{{color:var(--accent)}}
+.cmt-list{{display:none;padding:0 18px 12px}}.cmt-section.open .cmt-list{{display:block}}
+.cmt{{padding:8px 0 8px 12px;border-left:3px solid var(--border);margin-bottom:6px}}
+.cmt-head{{display:flex;align-items:center;gap:8px;margin-bottom:2px}}
+.cmt-body{{font-size:.82rem;color:#444;white-space:pre-wrap;word-break:break-word;padding-left:40px}}
 
-<div class="header">
-  <h1>🔬 <em>Science Parliament</em></h1>
-  <div class="stats">
-    <div class="stat"><strong>{data['n_posts']}</strong> posts</div>
-    <div class="stat"><strong>{data['n_comments']}</strong> comments</div>
-    <div class="stat"><strong>{data['n_votes']}</strong> votes</div>
+/* scientists */
+.sci{{background:var(--card);border-radius:12px;margin-bottom:10px;padding:16px 20px;
+  border:1px solid var(--border);cursor:pointer;display:flex;align-items:center;
+  justify-content:space-between;transition:box-shadow .2s}}
+.sci:hover{{box-shadow:0 4px 16px rgba(0,0,0,.08)}}
+.sci-left{{display:flex;align-items:center;gap:12px}}
+.sci-name{{font-weight:700;font-size:.95rem}}
+.sci-nums{{font-size:.78rem;color:var(--muted);margin-top:2px}}
+.sci-right{{display:flex;align-items:center;gap:12px}}
+.sci-bar-wrap{{width:80px;height:6px;background:var(--gray-bg);border-radius:3px;overflow:hidden}}
+.sci-bar{{height:100%;background:var(--accent);border-radius:3px;transition:width .3s}}
+
+/* network */
+.net-grid{{display:flex;flex-direction:column;gap:8px}}
+.net-row{{background:var(--card);border-radius:10px;padding:12px 18px;
+  border:1px solid var(--border);display:flex;align-items:center;gap:12px}}
+.net-from{{font-weight:700;min-width:90px;font-size:.9rem}}
+.net-arrow{{color:var(--muted);font-size:1.1rem}}
+.net-to{{display:flex;flex-wrap:wrap;gap:6px}}
+.net-tag{{background:#eef2ff;color:var(--accent);padding:3px 12px;border-radius:20px;
+  font-size:.78rem;font-weight:600}}
+
+/* modal */
+.overlay{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:200;
+  justify-content:center;align-items:flex-start;padding-top:50px;overflow-y:auto}}
+.overlay.open{{display:flex}}
+.modal{{background:#fff;border-radius:18px;width:92%;max-width:680px;padding:32px;
+  position:relative;box-shadow:0 20px 60px rgba(0,0,0,.2);margin-bottom:60px}}
+.modal-x{{position:absolute;top:16px;right:20px;font-size:1.4rem;cursor:pointer;
+  color:var(--muted);background:none;border:none;line-height:1}}.modal-x:hover{{color:var(--text)}}
+.modal h2{{font-size:1.15rem;display:flex;align-items:center;gap:10px}}
+.sec{{font-weight:700;font-size:.72rem;color:var(--accent);margin-top:20px;margin-bottom:6px;
+  text-transform:uppercase;letter-spacing:.6px}}
+.chip{{display:inline-block;background:#eef2ff;color:var(--accent);padding:3px 12px;
+  border-radius:20px;font-size:.78rem;font-weight:600;margin:3px 4px 3px 0}}
+.mcard{{background:var(--bg);border-radius:10px;padding:12px 16px;margin-bottom:8px;font-size:.84rem}}
+.mcard-h{{display:flex;align-items:center;gap:8px;margin-bottom:4px;font-size:.78rem;color:var(--muted)}}
+.mcard-t{{white-space:pre-wrap;word-break:break-word}}
+.empty-msg{{text-align:center;color:var(--muted);padding:60px 20px;font-size:.95rem}}
+
+.foot{{text-align:center;padding:16px;font-size:.72rem;color:var(--muted);
+  border-top:1px solid var(--border);background:var(--card)}}
+.dot{{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);
+  margin-right:5px;animation:pulse 2s ease-in-out infinite}}
+@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.25}}}}
+</style></head><body>
+
+<div class="hdr">
+  <h1>🔬 Science <span>Parliament</span></h1>
+  <div class="hdr-stats">
+    <span class="hdr-s"><b>{data['n_posts']}</b> posts</span>
+    <span class="hdr-s"><b>{data['n_comments']}</b> comments</span>
+    <span class="hdr-s"><b>{data['n_votes']}</b> votes</span>
+    <span class="hdr-s"><b>{data['n_follows']}</b> follows</span>
+    <span class="hdr-s"><b>{len(data['users'])}</b> scientists</span>
   </div>
 </div>
-<div class="progress-bar"><div class="progress-fill"></div></div>
-<div class="round-label">{round_label}</div>
+<div class="prog"><div class="prog-fill"></div></div>
+<div class="round">{round_label}</div>
 
 {q_html}
 
-<div class="forum">
-{cards_html}
+<div class="tabs">
+  <div class="tab on" onclick="sw('forum',this)">Forum</div>
+  <div class="tab" onclick="sw('sci',this)">Scientists</div>
+  <div class="tab" onclick="sw('net',this)">Network</div>
 </div>
 
-<div class="footer">
-  <span class="dot"></span>Auto-refreshes every 8s&nbsp;·&nbsp;Last updated {now}
-</div>
+<div id="p-forum" class="pane on">{forum}</div>
+<div id="p-sci" class="pane">{scientists}</div>
+<div id="p-net" class="pane">{network}</div>
 
-</body>
-</html>"""
+<div class="overlay" id="ov" onclick="if(event.target===this)cl()">
+  <div class="modal"><button class="modal-x" onclick="cl()">&times;</button>
+    <div id="mc"></div></div></div>
+
+<div class="foot"><span class="dot"></span>Auto-refreshes · {now}</div>
+
+<script>
+const P={pjson};
+function sw(id,el){{document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
+  document.querySelectorAll('.pane').forEach(t=>t.classList.remove('on'));
+  el.classList.add('on');document.getElementById('p-'+id).classList.add('on')}}
+function e(s){{const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}}
+function b(sc){{if(sc>0)return'<span class="badge pos">+'+sc+'</span>';
+  if(sc<0)return'<span class="badge neg">'+sc+'</span>';return'<span class="badge zero">0</span>'}}
+function showProfile(uid){{const p=P[uid];if(!p)return;
+  let h='<h2><span class="av" style="background:'+p.color+'">'+e(p.name)[0]+'</span>'+e(p.name)+'</h2>';
+  h+='<div class="sec">Following ('+p.following.length+')</div>';
+  h+=p.following.length?p.following.map(n=>'<span class="chip">'+e(n)+'</span>').join(''):'<span style="color:var(--muted);font-size:.84rem">—</span>';
+  h+='<div class="sec">Followers ('+p.followers.length+')</div>';
+  h+=p.followers.length?p.followers.map(n=>'<span class="chip">'+e(n)+'</span>').join(''):'<span style="color:var(--muted);font-size:.84rem">—</span>';
+  h+='<div class="sec">Posts ('+p.posts.length+')</div>';
+  p.posts.forEach(x=>{{h+='<div class="mcard"><div class="mcard-h"><span>#'+x.id+'</span>'+b(x.sc)+'</div><div class="mcard-t">'+e(x.text)+'</div></div>'}});
+  if(!p.posts.length)h+='<span style="color:var(--muted);font-size:.84rem">No posts yet</span>';
+  h+='<div class="sec">Comments ('+p.comments.length+')</div>';
+  p.comments.forEach(x=>{{h+='<div class="mcard"><div class="mcard-h"><span>on #'+x.pid+'</span>'+b(x.sc)+'</div><div class="mcard-t">'+e(x.text)+'</div></div>'}});
+  if(!p.comments.length)h+='<span style="color:var(--muted);font-size:.84rem">No comments yet</span>';
+  document.getElementById('mc').innerHTML=h;document.getElementById('ov').classList.add('open')}}
+function cl(){{document.getElementById('ov').classList.remove('open')}}
+document.addEventListener('keydown',ev=>{{if(ev.key==='Escape')cl()}});
+document.querySelectorAll('.post-text').forEach(el=>{{if(el.scrollHeight>300)el.classList.add('tall')}});
+</script></body></html>"""
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def generate_html(
-    db_path: str,
-    output_dir: str,
-    question: str = None,
-    current_round: int = 0,
-    num_rounds: int = 0,
-) -> None:
-    """
-    Read the parliament database and write index.html to output_dir.
-
-    This function is designed to be called after each round from
-    run_parliament.py.  It is always wrapped in try/except by the caller
-    so any failure here is silent and never affects the parliament run.
-    """
+def generate_html(db_path, output_dir, question=None, current_round=0, num_rounds=0):
     if not os.path.exists(db_path):
         return
-
     data = _read_db(db_path)
     html = _build_html(data, question, current_round, num_rounds)
-
-    out_path = os.path.join(output_dir, "index.html")
-    with open(out_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(output_dir, "index.html"), "w", encoding="utf-8") as f:
         f.write(html)
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point (for manual use / testing)
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     import sys
-
     if len(sys.argv) < 3:
         print("Usage: python visualize.py <db_path> <output_dir> [question]")
         sys.exit(1)
-
-    _db = sys.argv[1]
-    _out = sys.argv[2]
-    _q = sys.argv[3] if len(sys.argv) > 3 else None
-
-    generate_html(_db, _out, question=_q)
-    print(f"Generated: {_out}/index.html")
+    generate_html(sys.argv[1], sys.argv[2], question=sys.argv[3] if len(sys.argv) > 3 else None)
+    print(f"Generated: {sys.argv[2]}/index.html")
