@@ -31,14 +31,11 @@ os.environ["PARLIAMENT_LOG_DIR"] = _log_dir
 
 import patches  # noqa: F401 — applies all monkey-patches at import time
 
-# Clean up the empty ./log/ directory that OASIS creates at import time
-if os.path.isdir("./log") and _log_dir != os.path.abspath("./log"):
-    for f in os.listdir("./log"):
-        fp = os.path.join("./log", f)
-        if os.path.isfile(fp) and os.path.getsize(fp) == 0:
-            os.remove(fp)
+# OASIS modules create ./log/ at import time before we can redirect them.
+# Force-remove it now that all handlers have been redirected to the run dir.
+if os.path.isdir("./log") and os.path.abspath("./log") != os.path.abspath(_log_dir):
     try:
-        os.rmdir("./log")
+        shutil.rmtree("./log")
     except OSError:
         pass
 
