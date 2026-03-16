@@ -421,13 +421,16 @@ SocialAction.follow.__doc__ = (
 )
 
 SocialAction.do_nothing.__doc__ = (
-    "Skip this round. Use this when you have nothing new to contribute "
-    "right now \u2014 the discussion is progressing well without your input, "
-    "or you need more time to think.\n\n"
-    "Note: if you have already finished your work for this round (e.g. "
-    "posted your analysis, commented, or used tools), simply stop "
-    "without calling any tool \u2014 do NOT call do_nothing at the end. "
-    "Only call do_nothing when you decide to take no action at all.\n\n"
+    "Explicitly end your turn with no action this round.\n\n"
+    "IMPORTANT: If you do not call any tool at all, your round ends "
+    "immediately anyway \u2014 you get no further opportunity to act. "
+    "Call do_nothing when you have considered the forum and made a "
+    "deliberate decision not to post, comment, endorse, or search "
+    "this round. This makes your choice explicit rather than silent.\n\n"
+    "Use this when:\n"
+    "- The problem is already resolved and you have nothing new to add.\n"
+    "- You need more time to think and are choosing to pause for now.\n"
+    "- Others have already covered what you would have said.\n\n"
     "Returns:\n"
     "    dict: {'success': True}"
 )
