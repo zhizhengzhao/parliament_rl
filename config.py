@@ -3,10 +3,11 @@
 All tunable parameters are here. Modify this file before each run.
 
 Local model setup:
-  vllm serve Qwen/Qwen3.5-9B \\
+  CUDA_VISIBLE_DEVICES=6 vllm serve /miaojiawei/zhizheng/models/qwen/Qwen3___5-9B \\
     --port 8000 \\
     --tensor-parallel-size 1 \\
-    --max-model-len 262144 \\
+    --max-model-len 65536 \\
+    --gpu-memory-utilization 0.90 \\
     --reasoning-parser qwen3 \\
     --enable-auto-tool-choice \\
     --tool-call-parser qwen3_coder
@@ -15,23 +16,23 @@ Local model setup:
 # =============================================================================
 # LLM 模型配置（本地 vLLM 服务）
 # =============================================================================
-MODEL_NAME = "/root/zhizheng/models/qwen/Qwen3___5-9B"
+MODEL_NAME = "/miaojiawei/zhizheng/models/qwen/Qwen3___5-9B"
 MODEL_BASE_URL = "http://localhost:8000/v1"
 API_KEY = "EMPTY"
 
 # =============================================================================
 # 议会参数
 # =============================================================================
-DEFAULT_NUM_AGENTS = 5         # 科学家数量
-NUM_ROUNDS = 3                 # 讨论轮数
-LLM_CONCURRENCY = 10          # LLM API 最大并发请求数
+DEFAULT_NUM_AGENTS = 10        # 科学家数量
+NUM_ROUNDS = 6                 # 讨论轮数
+LLM_CONCURRENCY = 10          # LLM API 最大并发请求数（受 semaphore 控制）
 MAX_ITERATION = 5              # 每个 agent 每轮最多执行几步工具调用
 
 # =============================================================================
 # 平台参数（控制 agent 每轮能看到多少内容）
 # =============================================================================
-REFRESH_REC_POST_COUNT = 50    # 每次 refresh 返回的帖子数上限（原值 5，太小会漏看）
-MAX_REC_POST_LEN = 200         # 推荐系统缓冲区中每用户最多存多少帖子
+REFRESH_REC_POST_COUNT = 100   # 每次 refresh 返回的帖子数上限
+MAX_REC_POST_LEN = 500         # 推荐系统缓冲区中每用户最多存多少帖子
 ALLOW_SELF_RATING = False      # 是否允许 agent 给自己的帖子点赞/踩
 
 # =============================================================================
@@ -82,40 +83,43 @@ AVAILABLE_ACTIONS_LIST = [
 # Prompt 模板（{name} 和 {question} 会被自动替换）
 # =============================================================================
 SCIENTIST_PROMPT_TEMPLATE = """\
-You are {name}, a scientist and member of the Science Parliament.
+You are {name}, a mathematician and member of the Science Parliament.
 
-The following question has been assigned to your parliament for \
+The following problem has been assigned to your parliament for \
 collaborative resolution:
 
---- QUESTION ---
+--- PROBLEM ---
 {question}
---- END QUESTION ---
+--- END PROBLEM ---
 
-You will work with other scientists on a shared forum to solve this. \
-You do NOT need to solve the entire problem alone. Focus on what you \
-can contribute right now:
+Your goal is to work with other mathematicians on a shared forum to \
+produce a complete, rigorous proof and a definitive answer. You do NOT \
+need to solve everything alone. Divide and conquer:
 
-- Identify and solve a key sub-problem that moves things forward.
-- Propose a sub-question or a related question worth investigating.
-- Point out a flaw or gap in someone else's reasoning.
-- Verify or refine a calculation posted by another scientist.
-- Synthesize insights from multiple posts into a clearer picture.
-- Or do your own deep analysis if you see a path to the answer.
+- Verify the statement numerically for small cases using SymPy.
+- Identify the key algebraic manipulation or structural insight.
+- Propose a proof strategy (e.g., algebraic identity, induction, \
+  factoring).
+- Check or critique a proof attempt posted by a colleague.
+- Generalize or extend a partial result toward the full proof.
+- Synthesize multiple contributions into a clean, complete argument.
+- State the final answer clearly inside \\boxed{{}} once proven.
 
-You have access to computational tools (e.g. SymPy for symbolic math). \
-Use them when you need to verify calculations, solve equations, or \
-check formulas.
+You have access to SymPy for symbolic computation. Use it to verify \
+identities, factor expressions, expand polynomials, or confirm results \
+before posting.
 
-After observing what others have posted, decide what action best pushes \
-the problem toward a solution. You may:
-- Create a post with your analysis, a sub-question, or a new angle.
-- Comment on someone's post to correct, refine, or extend their work.
-- Like a post with sound reasoning. Dislike a post with clear errors.
-- Follow a scientist whose work you find valuable.
-- Search for relevant posts.
-- Do nothing if you have nothing new to add right now.
+After observing what others have posted, decide what action best \
+advances the proof:
+- Create a post with your contribution — a calculation, an identity, \
+  a proof step, or a synthesis.
+- Comment on someone's post to verify, extend, or correct their work.
+- Endorse a post with sound reasoning. Challenge one with errors.
+- Follow a colleague whose contributions you find valuable.
+- Search for relevant posts if you want to build on earlier work.
+- Do nothing if the proof is progressing well without you this round.
 
-Remember: you are part of a team. The goal is collective progress. \
-Every contribution should add new value — do not repeat what others \
-have already said.
+Remember: rigor matters. Support every claim with calculation or \
+logical argument. The parliament succeeds when it produces a complete \
+proof that any mathematician would accept.
 """

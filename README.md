@@ -106,11 +106,11 @@ python -c "from camel.toolkits import SymPyToolkit; print('sympy toolkit OK')"
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `DEFAULT_NUM_AGENTS` | `5` | 科学家数量（建议 demo 用 3） |
-| `NUM_ROUNDS` | `3` | 讨论轮数 |
+| `DEFAULT_NUM_AGENTS` | `10` | 科学家数量 |
+| `NUM_ROUNDS` | `6` | 讨论轮数 |
 | `MAX_ITERATION` | `5` | 每 agent 每轮最多几步工具调用 |
-| `LLM_CONCURRENCY` | `10` | LLM API 最大并发请求数 |
-| `REFRESH_REC_POST_COUNT` | `50` | 每轮 refresh 最多看多少帖子 |
+| `LLM_CONCURRENCY` | `10` | LLM API 最大并发请求数（semaphore 控制） |
+| `REFRESH_REC_POST_COUNT` | `100` | 每轮 refresh 最多看多少帖子 |
 | `ALLOW_SELF_RATING` | `False` | 是否允许 agent 给自己的帖子点赞/踩 |
 
 ---
@@ -121,10 +121,11 @@ python -c "from camel.toolkits import SymPyToolkit; print('sympy toolkit OK')"
 
 ```bash
 tmux new -s vllm
-vllm serve /path/to/Qwen3.5-9B \
+CUDA_VISIBLE_DEVICES=6 vllm serve /miaojiawei/zhizheng/models/qwen/Qwen3___5-9B \
   --port 8000 \
   --tensor-parallel-size 1 \
   --max-model-len 65536 \
+  --gpu-memory-utilization 0.90 \
   --reasoning-parser qwen3 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder
@@ -136,7 +137,7 @@ vllm serve /path/to/Qwen3.5-9B \
 
 ```bash
 tmux new -s parliament
-python run_parliament.py --question "Find all positive integers n such that n^2 + n + 41 is a perfect square."
+python run_parliament.py --question "Prove that for any integer n >= 1, the product n(n+1)(n+2)(n+3) + 1 is always a perfect square. Find a closed-form expression for this square root."
 ```
 
 或从文件读题：
