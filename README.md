@@ -106,11 +106,11 @@ python -c "from camel.toolkits import SymPyToolkit; print('sympy toolkit OK')"
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `DEFAULT_NUM_AGENTS` | `10` | 科学家数量 |
-| `NUM_ROUNDS` | `6` | 讨论轮数 |
-| `MAX_ITERATION` | `5` | 每 agent 每轮最多几步工具调用 |
-| `LLM_CONCURRENCY` | `10` | LLM API 最大并发请求数（semaphore 控制） |
-| `REFRESH_REC_POST_COUNT` | `100` | 每轮 refresh 最多看多少帖子 |
+| `DEFAULT_NUM_AGENTS` | `20` | 科学家数量 |
+| `NUM_ROUNDS` | `20` | 讨论轮数 |
+| `MAX_ITERATION` | `10` | 每 agent 每轮最多几步工具调用 |
+| `LLM_CONCURRENCY` | `5` | LLM API 最大并发请求数（semaphore 控制，小于 agent 数可产生轮内接力效果） |
+| `REFRESH_REC_POST_COUNT` | `200` | 每轮 refresh 最多看多少帖子 |
 | `ALLOW_SELF_RATING` | `False` | 是否允许 agent 给自己的帖子点赞/踩 |
 
 ---
