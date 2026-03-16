@@ -227,11 +227,11 @@ async def _patched_perform_action_by_llm(self):
     user_msg = BaseMessage.make_user_message(
         role_name="User",
         content=(
-            "A new round of the parliament session has begun. "
-            "Review what your fellow scientists have posted, then "
-            "decide your next action \u2014 post an analysis, comment on "
-            "someone\u2019s work, endorse or challenge a post, or do "
-            "nothing if you have nothing new to add.\n\n"
+            "A new round has begun. Read the forum below, then act.\n\n"
+            "You can take multiple actions this round: for example, "
+            "search \u2192 comment \u2192 endorse \u2192 follow, all in one turn. "
+            "Look at the scores to see what the parliament values. "
+            "If you have nothing new to contribute, call do_nothing.\n\n"
             f"{env_prompt}"
         ),
     )
@@ -305,8 +305,10 @@ SocialEnvironment.posts_env_template = Template(
 SocialEnvironment.env_template = Template(
     "$posts_env\n\n"
     "$followers_env $follows_env\n\n"
-    "Based on the above, decide what action would best advance the "
-    "parliament\u2019s progress on the question."
+    "Remember: you can take multiple actions this round. Consider "
+    "endorsing strong posts, commenting to build on good work, "
+    "following promising scientists, and searching before posting. "
+    "What action(s) would best advance the problem right now?"
 )
 
 
@@ -344,66 +346,85 @@ SocialEnvironment.to_text_prompt = _patched_to_text_prompt
 from oasis.social_agent.agent_action import SocialAction
 
 SocialAction.create_post.__doc__ = (
-    "Publish your analysis, findings, a sub-question, or any contribution "
-    "to the parliament forum. Other scientists will be able to see, comment "
-    "on, and vote on your post.\n\n"
+    "Publish a new top-level contribution to the forum. Other scientists "
+    "will see it, can comment on it, and can endorse or challenge it. "
+    "Posts with higher scores (endorsements minus challenges) are shown "
+    "more prominently to other scientists.\n\n"
+    "Good posts contain: a derivation, a verified calculation, a conjecture "
+    "with evidence, a synthesis of multiple threads, or a well-reasoned "
+    "correction. Avoid repeating what someone else already posted.\n\n"
     "Args:\n"
-    "    content (str): Your scientific contribution.\n\n"
+    "    content (str): Your contribution.\n\n"
     "Returns:\n"
     "    dict: {'success': True, 'post_id': 50}"
 )
 
 SocialAction.create_comment.__doc__ = (
-    "Reply to a specific post \u2014 correct an error, refine a calculation, "
-    "ask a clarifying question, or extend the analysis.\n\n"
+    "Reply directly to a specific post. Comments create focused dialogue "
+    "under that post \u2014 use them to verify a claim, correct an error, "
+    "extend a derivation, ask a targeted question, or connect the post "
+    "to another thread.\n\n"
+    "Commenting is often more valuable than creating a new post, because "
+    "it builds on existing work rather than starting a separate thread.\n\n"
     "Args:\n"
-    "    post_id (int): The ID of the post to reply to (see 'post_id' in the forum).\n"
+    "    post_id (int): The post to reply to (see 'post_id' in the forum).\n"
     "    content (str): Your reply.\n\n"
     "Returns:\n"
     "    dict: {'success': True, 'comment_id': 123}"
 )
 
 SocialAction.like_post.__doc__ = (
-    "Endorse a post \u2014 signal that you find its reasoning sound and its "
-    "contribution valuable. Posts with more endorsements become more visible "
-    "to other scientists.\n\n"
+    "Endorse a post. This increases its score, which directly affects "
+    "its ranking \u2014 higher-scored posts are shown more prominently to "
+    "all scientists in the forum. Endorsing strong work amplifies it "
+    "so the entire parliament can build on it.\n\n"
+    "Use this when a post contains sound reasoning, a correct calculation, "
+    "or a valuable insight that others should see and build upon.\n\n"
     "Args:\n"
-    "    post_id (int): The ID of the post to endorse (see 'post_id' in the forum).\n\n"
+    "    post_id (int): The post to endorse (see 'post_id' in the forum).\n\n"
     "Returns:\n"
     "    dict: {'success': True, 'like_id': 123}"
 )
 
 SocialAction.dislike_post.__doc__ = (
-    "Challenge a post \u2014 signal that you believe it contains errors or "
-    "flawed reasoning. Posts with more challenges become less visible.\n\n"
+    "Challenge a post. This decreases its score, pushing it down in the "
+    "ranking so fewer scientists see it. Use this to flag posts with "
+    "errors, flawed logic, or misleading claims \u2014 before others waste "
+    "time building on a wrong foundation.\n\n"
+    "When you challenge a post, consider also commenting to explain "
+    "what the error is, so the author and others can learn from it.\n\n"
     "Args:\n"
-    "    post_id (int): The ID of the post to challenge (see 'post_id' in the forum).\n\n"
+    "    post_id (int): The post to challenge (see 'post_id' in the forum).\n\n"
     "Returns:\n"
     "    dict: {'success': True, 'dislike_id': 123}"
 )
 
 SocialAction.like_comment.__doc__ = (
-    "Endorse a comment \u2014 signal agreement with its content.\n\n"
+    "Endorse a comment. This increases its score, signaling to others "
+    "that the comment is accurate and valuable.\n\n"
     "Args:\n"
-    "    comment_id (int): The ID of the comment to endorse "
+    "    comment_id (int): The comment to endorse "
     "(see 'comment_id' in the forum).\n\n"
     "Returns:\n"
     "    dict: {'success': True, 'comment_like_id': 456}"
 )
 
 SocialAction.dislike_comment.__doc__ = (
-    "Challenge a comment \u2014 signal disagreement with its content.\n\n"
+    "Challenge a comment. This decreases its score, signaling to others "
+    "that the comment may contain errors.\n\n"
     "Args:\n"
-    "    comment_id (int): The ID of the comment to challenge "
+    "    comment_id (int): The comment to challenge "
     "(see 'comment_id' in the forum).\n\n"
     "Returns:\n"
     "    dict: {'success': True, 'comment_dislike_id': 456}"
 )
 
 SocialAction.search_posts.__doc__ = (
-    "Search the parliament forum for posts matching a keyword or topic. "
-    "Useful when you want to find what others have said about a specific "
-    "sub-problem or concept.\n\n"
+    "Search the forum for posts matching a keyword or topic. Use this "
+    "before posting to check if someone has already addressed your idea, "
+    "or to find earlier work you want to build on or reference.\n\n"
+    "Searching first avoids duplication and helps you write comments "
+    "that connect to the existing discussion.\n\n"
     "Args:\n"
     "    query (str): A keyword or phrase to search for.\n\n"
     "Returns:\n"
@@ -411,26 +432,31 @@ SocialAction.search_posts.__doc__ = (
 )
 
 SocialAction.follow.__doc__ = (
-    "Follow a colleague \u2014 their future posts will appear in your feed, "
-    "so you can track their ongoing contributions more reliably.\n\n"
+    "Follow a scientist. Once you follow someone, their future posts "
+    "will reliably appear in your feed every round, even if they are "
+    "not trending. This is useful when you spot a scientist exploring "
+    "a promising direction and you want to track their progress, "
+    "build on their work, or verify their claims in later rounds.\n\n"
+    "Following is a strategic information choice \u2014 it ensures you "
+    "don't miss contributions from the scientists you think are most "
+    "likely to advance the solution.\n\n"
     "Args:\n"
-    "    followee_id (int): The scientist_id of the colleague to follow "
+    "    followee_id (int): The scientist_id of the scientist to follow "
     "(see 'scientist_id' in each forum post or comment).\n\n"
     "Returns:\n"
     "    dict: {'success': True, 'follow_id': 123}"
 )
 
 SocialAction.do_nothing.__doc__ = (
-    "Explicitly end your turn with no action this round.\n\n"
+    "Explicitly pass your turn this round.\n\n"
     "IMPORTANT: If you do not call any tool at all, your round ends "
-    "immediately anyway \u2014 you get no further opportunity to act. "
-    "Call do_nothing when you have considered the forum and made a "
-    "deliberate decision not to post, comment, endorse, or search "
-    "this round. This makes your choice explicit rather than silent.\n\n"
+    "immediately with no record of your decision. Calling do_nothing "
+    "makes your choice to pause explicit. Always call this rather "
+    "than staying silent.\n\n"
     "Use this when:\n"
-    "- The problem is already resolved and you have nothing new to add.\n"
-    "- You need more time to think and are choosing to pause for now.\n"
-    "- Others have already covered what you would have said.\n\n"
+    "- The problem is solved and you have verified there are no gaps.\n"
+    "- You have read the forum and genuinely have nothing new to add.\n"
+    "- Others are already covering what you would have contributed.\n\n"
     "Returns:\n"
     "    dict: {'success': True}"
 )
