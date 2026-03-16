@@ -3,17 +3,21 @@ Monkey-patches for OASIS to adapt it from a social media simulator
 to a Science Parliament. Import this module before creating any agents.
 
 What we patch:
-1. SocialAgent.__init__       — support single_iteration=False (max_iteration=5)
-2. SocialAgent.perform_action_by_llm — parliament-style user message
-3. SocialEnvironment templates — parliament-style environment descriptions
-4. SocialAction docstrings     — parliament-style tool descriptions
-5. Platform.refresh            — merge followed users' posts into candidate pool
-6. SocialAgent.perform_interview — remove "You are a twitter user" leftover
+1. SocialAgent.__init__            — support single_iteration=False (max_iteration=5)
+1b. SocialAgent.perform_action_by_data — skip memory write (fixes Qwen3.5 system-msg ordering)
+2. SocialAgent.perform_action_by_llm  — parliament-style user message
+3. SocialEnvironment templates         — parliament-style environment descriptions
+4. SocialAction docstrings             — parliament-style tool descriptions
+5. Platform.refresh                    — merge followed posts into candidate pool
+5b. Platform.search_posts              — clean output for agent display
+6. SocialAgent.perform_interview       — remove "You are a twitter user" leftover
+7. Logger redirection                  — keep all logs inside the run directory
 """
 
 import logging
 import os
 import random
+import sqlite3
 from datetime import datetime
 from string import Template
 
@@ -21,6 +25,62 @@ from camel.messages import BaseMessage
 
 _log_dir = os.environ.get("PARLIAMENT_LOG_DIR", "./log")
 os.makedirs(_log_dir, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Shared helpers — clean post JSON for agent display
+# ---------------------------------------------------------------------------
+from oasis.social_platform.database import get_db_path
+
+
+def _get_id_to_name() -> dict:
+    """Query the database for a user_id → scientist name mapping."""
+    try:
+        conn = sqlite3.connect(get_db_path())
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, name FROM user")
+        result = {row[0]: row[1] for row in cursor.fetchall()}
+        conn.close()
+        return result
+    except Exception:
+        return {}
+
+
+def _clean_posts(posts: list, id_to_name: dict) -> list:
+    """
+    Strip Twitter/Reddit artifacts from the post list and replace user_id
+    with human-readable scientist names.
+
+    Raw fields removed: num_shares, num_reports, original_post_id,
+                        quote_content, created_at (from posts & comments).
+    Added fields: author (scientist name), scientist_id (for use with follow).
+    """
+    clean = []
+    for post in posts:
+        uid = post.get("user_id")
+        author = id_to_name.get(uid, f"Scientist_{uid}")
+
+        clean_comments = []
+        for c in post.get("comments", []):
+            cuid = c.get("user_id")
+            cauthor = id_to_name.get(cuid, f"Scientist_{cuid}")
+            clean_comments.append({
+                "comment_id": c["comment_id"],
+                "scientist_id": cuid,   # needed to follow the commenter
+                "author": cauthor,
+                "content": c.get("content", ""),
+                "score": c.get("score", 0),
+            })
+
+        clean.append({
+            "post_id": post["post_id"],
+            "scientist_id": uid,        # needed to follow the poster
+            "author": author,
+            "content": post.get("content", ""),
+            "score": post.get("score", 0),
+            "comments": clean_comments,
+        })
+    return clean
+
 
 # ---------------------------------------------------------------------------
 # 1. Patch SocialAgent.__init__ to support single_iteration
@@ -41,20 +101,20 @@ SocialAgent.__init__ = _patched_init
 
 # ---------------------------------------------------------------------------
 # 1b. Patch SocialAgent.perform_action_by_data — skip memory write
-#     ManualActions are platform-level events (e.g. opening post), not agent
-#     decisions. The agent doesn't need to "remember" them — the results are
-#     visible via forum refresh. The original writes with SYSTEM role, which
-#     breaks models with strict system-message ordering (e.g. Qwen3.5).
+#
+#     ManualActions are platform-level events (e.g. the opening post), not
+#     agent decisions. Writing them to agent memory with SYSTEM role breaks
+#     models that enforce strict system-message ordering (e.g. Qwen3.5).
+#     The results are always visible via forum refresh anyway.
 # ---------------------------------------------------------------------------
+from oasis.social_platform.typing import ActionType
+
+
 async def _patched_perform_action_by_data(self, func_name, *args, **kwargs):
-    func_name = func_name.value if isinstance(func_name,
-                                              ActionType) else func_name
-    function_list = self.env.action.get_openai_function_list()
-    for i in range(len(function_list)):
-        if function_list[i].func.__name__ == func_name:
-            func = function_list[i].func
-            result = await func(*args, **kwargs)
-            return result
+    func_name = func_name.value if isinstance(func_name, ActionType) else func_name
+    for tool in self.env.action.get_openai_function_list():
+        if tool.func.__name__ == func_name:
+            return await tool.func(*args, **kwargs)
     raise ValueError(f"Function {func_name} not found in the list.")
 
 
@@ -65,9 +125,101 @@ SocialAgent.perform_action_by_data = _patched_perform_action_by_data
 # ---------------------------------------------------------------------------
 _agent_log = logging.getLogger("social.agent")
 
-from oasis.social_platform.typing import ActionType
-
 _ALL_SOCIAL_ACTIONS = [action.value for action in ActionType]
+
+
+def _log_anomaly(
+    anomaly_type: str,
+    agent,
+    full_context: list,
+    num_tokens: int,
+    response,
+    error: Exception = None,
+) -> None:
+    """Append one anomaly record to anomalies.jsonl in the run output directory.
+
+    Each record captures everything needed to reproduce and debug the issue:
+    the complete context sent to the model, the model's full response, and
+    (for exceptions) the traceback string.
+
+    anomaly_type values:
+      "no_tool_calls" — model replied with text but called no tool
+      "exception"     — astep() raised an exception
+    """
+    import json
+    import traceback
+
+    log_dir = os.environ.get("PARLIAMENT_LOG_DIR", "./log")
+    run_dir = os.path.dirname(log_dir)   # parent of log/ = timestamped run dir
+    anomaly_path = os.path.join(run_dir, "anomalies.jsonl")
+
+    # Safely serialize an arbitrary value to something JSON-compatible
+    def _safe(obj):
+        try:
+            json.dumps(obj, ensure_ascii=False)
+            return obj
+        except (TypeError, ValueError):
+            return str(obj)
+
+    # Serialize the context (list of message dicts from CAMEL/OpenAI format)
+    serializable_context = []
+    for msg in full_context:
+        if isinstance(msg, dict):
+            serializable_context.append({k: _safe(v) for k, v in msg.items()})
+        else:
+            serializable_context.append(str(msg))
+
+    record = {
+        "timestamp": datetime.now().isoformat(),
+        "type": anomaly_type,
+        "agent_id": agent.social_agent_id,
+        "agent_name": getattr(
+            getattr(agent, "user_info", None), "name",
+            str(agent.social_agent_id)
+        ),
+        "num_tokens_in_context": num_tokens,
+        # Complete input: what was sent to the model this turn
+        "full_context": serializable_context,
+        # Complete output: what the model returned
+        "response_text": None,
+        "response_tool_calls": [],
+        # Error info (exception type only)
+        "error": (
+            "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            if error is not None else None
+        ),
+    }
+
+    if response is not None:
+        # Model's text content (always present even when tool calls exist)
+        try:
+            if response.msgs:
+                record["response_text"] = response.msgs[0].content
+        except Exception:
+            pass
+        # Tool calls the model issued (may be empty for no_tool_calls case)
+        try:
+            tcs = response.info.get("tool_calls", [])
+            record["response_tool_calls"] = [
+                {
+                    "tool_name": tc.tool_name,
+                    "args": tc.args,
+                    "result": str(tc.result),
+                }
+                for tc in tcs
+            ]
+        except Exception:
+            pass
+
+    try:
+        with open(anomaly_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        _agent_log.warning(
+            f"[ANOMALY:{anomaly_type}] agent={agent.social_agent_id} "
+            f"({record['agent_name']}) → {anomaly_path}"
+        )
+    except Exception as log_error:
+        _agent_log.error(f"Failed to write anomaly log: {log_error}")
 
 
 async def _patched_perform_action_by_llm(self):
@@ -78,32 +230,59 @@ async def _patched_perform_action_by_llm(self):
             "A new round of the parliament session has begun. "
             "Review what your fellow scientists have posted, then "
             "decide your next action \u2014 post an analysis, comment on "
-            "someone's work, endorse or challenge a post, or do "
+            "someone\u2019s work, endorse or challenge a post, or do "
             "nothing if you have nothing new to add.\n\n"
             f"{env_prompt}"
         ),
     )
+
+    # ── Capture the complete context BEFORE calling the model ──────────────
+    # memory.get_context() returns (list[OpenAI-format dicts], token_count).
+    # We capture it now (= all previous rounds) then append the current
+    # user_msg, so full_context exactly mirrors what the model will receive.
+    try:
+        history_messages, num_tokens = self.memory.get_context()
+    except Exception:
+        history_messages, num_tokens = [], 0
+
+    full_context = (
+        [{"role": "system", "content": self.system_message.content}]
+        + list(history_messages)
+        + [{"role": "user", "content": user_msg.content}]
+    )
+
     try:
         _agent_log.info(
-            f"Agent {self.social_agent_id} observing environment: "
-            f"{env_prompt}"
+            f"Agent {self.social_agent_id} observing environment "
+            f"(~{num_tokens} tokens in context)"
         )
         response = await self.astep(user_msg)
-        for tool_call in response.info["tool_calls"]:
-            action_name = tool_call.tool_name
-            args = tool_call.args
-            _agent_log.info(
-                f"Agent {self.social_agent_id} performed "
-                f"action: {action_name} with args: {args}"
-            )
-            if action_name not in _ALL_SOCIAL_ACTIONS:
+        tool_calls = response.info.get("tool_calls", [])
+
+        if not tool_calls:
+            # Model replied but issued no tool call — record for debugging
+            _log_anomaly("no_tool_calls", self, full_context, num_tokens, response)
+        else:
+            for tool_call in tool_calls:
+                action_name = tool_call.tool_name
+                args = tool_call.args
                 _agent_log.info(
-                    f"Agent {self.social_agent_id} get the result: "
-                    f"{tool_call.result}"
+                    f"Agent {self.social_agent_id} performed "
+                    f"action: {action_name} with args: {args}"
                 )
+                if action_name not in _ALL_SOCIAL_ACTIONS:
+                    _agent_log.info(
+                        f"Agent {self.social_agent_id} tool result: "
+                        f"{tool_call.result}"
+                    )
+
         return response
+
     except Exception as e:
-        _agent_log.error(f"Agent {self.social_agent_id} error: {e}")
+        _agent_log.error(
+            f"Agent {self.social_agent_id} exception: {e}"
+        )
+        _log_anomaly("exception", self, full_context, num_tokens, None, error=e)
         return e
 
 
@@ -127,25 +306,29 @@ SocialEnvironment.env_template = Template(
     "$posts_env\n\n"
     "$followers_env $follows_env\n\n"
     "Based on the above, decide what action would best advance the "
-    "parliament's progress on the question."
+    "parliament\u2019s progress on the question."
 )
-
-_original_to_text_prompt = SocialEnvironment.to_text_prompt
 
 
 async def _patched_to_text_prompt(self, **kwargs):
+    import json
+
     followers_env = await self.get_followers_env()
     follows_env = await self.get_follows_env()
+
     posts = await self.action.refresh()
     if posts["success"]:
-        import json
-        posts_env = json.dumps(posts["posts"], indent=4)
-        posts_env = self.posts_env_template.substitute(posts=posts_env)
+        id_to_name = _get_id_to_name()
+        clean = _clean_posts(posts["posts"], id_to_name)
+        posts_env = self.posts_env_template.substitute(
+            posts=json.dumps(clean, indent=4, ensure_ascii=False)
+        )
     else:
         posts_env = (
             "No contributions have been posted yet. "
             "You may be the first to share your analysis."
         )
+
     return self.env_template.substitute(
         followers_env=followers_env,
         follows_env=follows_env,
@@ -174,7 +357,7 @@ SocialAction.create_comment.__doc__ = (
     "Reply to a specific post \u2014 correct an error, refine a calculation, "
     "ask a clarifying question, or extend the analysis.\n\n"
     "Args:\n"
-    "    post_id (int): The ID of the post to reply to.\n"
+    "    post_id (int): The ID of the post to reply to (see 'post_id' in the forum).\n"
     "    content (str): Your reply.\n\n"
     "Returns:\n"
     "    dict: {'success': True, 'comment_id': 123}"
@@ -185,7 +368,7 @@ SocialAction.like_post.__doc__ = (
     "contribution valuable. Posts with more endorsements become more visible "
     "to other scientists.\n\n"
     "Args:\n"
-    "    post_id (int): The ID of the post to endorse.\n\n"
+    "    post_id (int): The ID of the post to endorse (see 'post_id' in the forum).\n\n"
     "Returns:\n"
     "    dict: {'success': True, 'like_id': 123}"
 )
@@ -194,7 +377,7 @@ SocialAction.dislike_post.__doc__ = (
     "Challenge a post \u2014 signal that you believe it contains errors or "
     "flawed reasoning. Posts with more challenges become less visible.\n\n"
     "Args:\n"
-    "    post_id (int): The ID of the post to challenge.\n\n"
+    "    post_id (int): The ID of the post to challenge (see 'post_id' in the forum).\n\n"
     "Returns:\n"
     "    dict: {'success': True, 'dislike_id': 123}"
 )
@@ -202,7 +385,8 @@ SocialAction.dislike_post.__doc__ = (
 SocialAction.like_comment.__doc__ = (
     "Endorse a comment \u2014 signal agreement with its content.\n\n"
     "Args:\n"
-    "    comment_id (int): The ID of the comment to endorse.\n\n"
+    "    comment_id (int): The ID of the comment to endorse "
+    "(see 'comment_id' in the forum).\n\n"
     "Returns:\n"
     "    dict: {'success': True, 'comment_like_id': 456}"
 )
@@ -210,7 +394,8 @@ SocialAction.like_comment.__doc__ = (
 SocialAction.dislike_comment.__doc__ = (
     "Challenge a comment \u2014 signal disagreement with its content.\n\n"
     "Args:\n"
-    "    comment_id (int): The ID of the comment to challenge.\n\n"
+    "    comment_id (int): The ID of the comment to challenge "
+    "(see 'comment_id' in the forum).\n\n"
     "Returns:\n"
     "    dict: {'success': True, 'comment_dislike_id': 456}"
 )
@@ -227,9 +412,10 @@ SocialAction.search_posts.__doc__ = (
 
 SocialAction.follow.__doc__ = (
     "Follow a colleague \u2014 their future posts will appear in your feed, "
-    "so you can track their ongoing contributions.\n\n"
+    "so you can track their ongoing contributions more reliably.\n\n"
     "Args:\n"
-    "    followee_id (int): The user ID of the colleague to follow.\n\n"
+    "    followee_id (int): The scientist_id of the colleague to follow "
+    "(see 'scientist_id' in each forum post or comment).\n\n"
     "Returns:\n"
     "    dict: {'success': True, 'follow_id': 123}"
 )
@@ -263,19 +449,19 @@ async def _patched_refresh(self, agent_id: int):
     try:
         user_id = agent_id
 
+        # Recommended posts from the recsys
         rec_query = "SELECT post_id FROM rec WHERE user_id = ?"
         self.pl_utils._execute_db_command(rec_query, (user_id,))
-        rec_results = self.db_cursor.fetchall()
-        post_ids = [row[0] for row in rec_results]
+        post_ids = [row[0] for row in self.db_cursor.fetchall()]
 
+        # Posts from followed colleagues
         query_following_post = (
             "SELECT post.post_id FROM post "
             "JOIN follow ON post.user_id = follow.followee_id "
             "WHERE follow.follower_id = ?"
         )
         self.pl_utils._execute_db_command(query_following_post, (user_id,))
-        following_posts = self.db_cursor.fetchall()
-        following_post_ids = [row[0] for row in following_posts]
+        following_post_ids = [row[0] for row in self.db_cursor.fetchall()]
 
         candidate_pool = list(set(post_ids + following_post_ids))
 
@@ -283,9 +469,7 @@ async def _patched_refresh(self, agent_id: int):
             return {"success": False, "message": "No posts available."}
 
         if len(candidate_pool) >= self.refresh_rec_post_count:
-            selected_post_ids = random.sample(
-                candidate_pool, self.refresh_rec_post_count
-            )
+            selected_post_ids = random.sample(candidate_pool, self.refresh_rec_post_count)
         else:
             selected_post_ids = candidate_pool
 
@@ -299,6 +483,7 @@ async def _patched_refresh(self, agent_id: int):
         results = self.db_cursor.fetchall()
         if not results:
             return {"success": False, "message": "No posts found."}
+
         results_with_comments = self.pl_utils._add_comments_to_posts(results)
 
         action_info = {"posts": results_with_comments}
@@ -311,6 +496,26 @@ async def _patched_refresh(self, agent_id: int):
 
 
 Platform.refresh = _patched_refresh
+
+# ---------------------------------------------------------------------------
+# 5b. Patch Platform.search_posts — clean output for agent display
+#
+#     search_posts returns raw DB rows (user_id numbers, num_shares, etc.).
+#     We clean the result the same way to_text_prompt does, so agents always
+#     see consistent scientist names instead of integer IDs.
+# ---------------------------------------------------------------------------
+_original_search_posts = Platform.search_posts
+
+
+async def _patched_search_posts(self, agent_id: int, query: str):
+    result = await _original_search_posts(self, agent_id, query)
+    if result.get("success") and result.get("posts"):
+        id_to_name = _get_id_to_name()
+        result["posts"] = _clean_posts(result["posts"], id_to_name)
+    return result
+
+
+Platform.search_posts = _patched_search_posts
 
 # ---------------------------------------------------------------------------
 # 6. Patch SocialAgent.perform_interview — remove twitter leftover
@@ -328,8 +533,10 @@ async def _patched_perform_interview(self, interview_prompt: str):
 
     openai_messages, num_tokens = self.memory.get_context()
     openai_messages = (
-        [{"role": self.system_message.role_name,
-          "content": self.system_message.content.split("# RESPONSE METHOD")[0]}]
+        [{
+            "role": self.system_message.role_name,
+            "content": self.system_message.content.split("# RESPONSE METHOD")[0],
+        }]
         + openai_messages
         + [{"role": "user", "content": interview_prompt}]
     )
