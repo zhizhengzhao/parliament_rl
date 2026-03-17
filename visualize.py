@@ -6,7 +6,7 @@ Reads the SQLite database and writes a self-contained index.html with:
   - Scientists view: ranked profiles with activity indicators
   - Network view: follow relationship graph
 
-Auto-refreshes every 8 seconds in the browser.
+Page auto-refreshes every 15 seconds by default (override via serve.py --refresh).
 """
 
 import json

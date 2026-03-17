@@ -1,11 +1,4 @@
-"""
-Science Parliament: A multi-agent scientific reasoning system built on OASIS.
-
-Scientists collaborate on a Reddit-like forum to solve a scientific question.
-The question is embedded in every agent's system prompt so it's always visible.
-Each round, agents observe the forum, think (optionally use tools), then post
-their analysis or build on others' work.
-"""
+"""Science Parliament — multi-agent scientific reasoning on OASIS."""
 
 import argparse
 import asyncio
@@ -19,48 +12,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Import OUTPUT_DIR early (config.py has no OASIS dependencies, safe to import first)
-from config import OUTPUT_DIR as _output_base
-
-# Create timestamped run directory BEFORE importing OASIS (which sets up loggers)
-_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-_run_dir = os.path.join(_output_base, _timestamp)
-_log_dir = os.path.join(_run_dir, "log")
-os.makedirs(_log_dir, exist_ok=True)
-os.environ["PARLIAMENT_LOG_DIR"] = _log_dir
-
-import patches  # noqa: F401 — applies all monkey-patches at import time
-
-# Import all camel/oasis modules NOW.
-# OASIS creates ./log/ at module level (platform.py, env.py) — this is
-# unavoidable without modifying installed source. We clean up after all
-# imports are done (see the redirect + rmtree block below).
-from camel.models import ModelFactory
-from camel.prompts import TextPrompt
-from camel.toolkits import SymPyToolkit
-from camel.types import ModelPlatformType
-
-import oasis
-from oasis import LLMAction, ManualAction, SocialAgent, AgentGraph, UserInfo
-from oasis.social_platform.channel import Channel
-from oasis.social_platform.platform import Platform
-from oasis.social_platform.typing import ActionType
-
-# NOW that every OASIS module has been imported (and may have attached extra
-# FileHandlers to ./log/), redirect all loggers to the run directory and then
-# remove the stray ./log/ tree. Order matters: redirect first so that all open
-# file handles are closed before rmtree tries to delete the files.
-patches._redirect_loggers_to_run_dir()
-if os.path.isdir("./log") and os.path.abspath("./log") != os.path.abspath(_log_dir):
-    try:
-        shutil.rmtree("./log")
-    except OSError:
-        pass
-
 from config import (
     AVAILABLE_ACTIONS_LIST,
     DEFAULT_NUM_AGENTS,
     NUM_ROUNDS,
+    MAX_ITERATION,
     LLM_CONCURRENCY,
     SCIENTIST_PROMPT_TEMPLATE,
     MODEL_NAME,
@@ -73,12 +29,40 @@ from config import (
     get_agent_names,
 )
 
+# ── Set up timestamped directories before OASIS imports ────────────────────
+# Data  → output/<timestamp>/
+# Logs  → log/<timestamp>/
+# OASIS creates ./log/ at module level — we let it, and redirect loggers
+# into log/<timestamp>/ after all imports complete.
+_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+_run_dir = os.path.join(OUTPUT_DIR, _timestamp)
+_log_dir = os.path.join("log", _timestamp)
+os.makedirs(_run_dir, exist_ok=True)
+os.makedirs(_log_dir, exist_ok=True)
+os.environ["PARLIAMENT_LOG_DIR"] = os.path.abspath(_log_dir)
+os.environ["PARLIAMENT_RUN_DIR"] = os.path.abspath(_run_dir)
+
+import patches  # noqa: F401 — applies all monkey-patches
+
+from camel.models import ModelFactory
+from camel.toolkits import SymPyToolkit
+from camel.types import ModelPlatformType
+
+import oasis
+from oasis import LLMAction, ManualAction, SocialAgent, AgentGraph, UserInfo
+from oasis.social_platform.channel import Channel
+from oasis.social_platform.platform import Platform
+from oasis.social_platform.typing import ActionType
+
+patches._redirect_loggers_to_run_dir()  # catch oasis.env logger
+
 
 def build_agents(
     model, agent_graph: AgentGraph, tools, question: str,
     num_agents: int = DEFAULT_NUM_AGENTS,
 ) -> list[SocialAgent]:
-    """Create scientist agents with the question baked into their prompt."""
+    """Create scientist agents with the question baked into their system prompt."""
+    from camel.prompts import TextPrompt
     template = TextPrompt(SCIENTIST_PROMPT_TEMPLATE)
     action_types = [ActionType[a] for a in AVAILABLE_ACTIONS_LIST]
     names = get_agent_names(num_agents)
@@ -204,7 +188,7 @@ async def run_parliament(
     print(f"Question: {question[:300]}{'...' if len(question) > 300 else ''}")
     print(f"Agents: {num_agents}  |  Rounds: {num_rounds}  |  "
           f"Refresh posts: {REFRESH_REC_POST_COUNT}  |  "
-          f"Max iteration: {from_config('MAX_ITERATION')}")
+          f"Max iteration: {MAX_ITERATION}")
     print(f"{'='*70}\n")
 
     opening = (
@@ -224,7 +208,6 @@ async def run_parliament(
         actions = {agent: LLMAction() for agent in agents}
         await env.step(actions)
         print_round_stats(db_path)
-        # Update visualization — wrapped so any failure never stops the run
         try:
             from visualize import generate_html
             generate_html(db_path, output_dir,
@@ -261,12 +244,6 @@ async def run_parliament(
 
     await env.close()
     return session
-
-
-def from_config(name: str):
-    """Read a value from config module by name."""
-    import config
-    return getattr(config, name)
 
 
 def parse_args():

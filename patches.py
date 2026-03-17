@@ -1,17 +1,17 @@
 """
 Monkey-patches for OASIS to adapt it from a social media simulator
-to a Science Parliament. Import this module before creating any agents.
+to a Science Parliament.  Import this module before creating any agents.
 
-What we patch:
-1. SocialAgent.__init__            — support single_iteration=False (max_iteration=5)
-1b. SocialAgent.perform_action_by_data — skip memory write (fixes Qwen3.5 system-msg ordering)
-2. SocialAgent.perform_action_by_llm  — parliament-style user message
-3. SocialEnvironment templates         — parliament-style environment descriptions
-4. SocialAction docstrings             — parliament-style tool descriptions
-5. Platform.refresh                    — merge followed posts into candidate pool
-5b. Platform.search_posts              — clean output for agent display
-6. SocialAgent.perform_interview       — remove "You are a twitter user" leftover
-7. Logger redirection                  — keep all logs inside the run directory
+Patches applied:
+  1.  SocialAgent.__init__             — multi-step iterations per round
+  2.  SocialAgent.perform_action_by_data — skip memory write (Qwen system-msg fix)
+  3.  SocialAgent.perform_action_by_llm  — parliament-style user message + anomaly log
+  4.  SocialEnvironment templates        — parliament-style environment descriptions
+  5.  SocialAction docstrings            — parliament-style tool descriptions
+  6.  Platform.refresh                   — merge followed scientists' posts
+  7.  Platform.search_posts              — clean JSON for agent display
+  8.  SocialAgent.perform_interview      — remove leftover twitter prompt
+  9.  Logger redirection                 — route OASIS logs to log/<timestamp>/
 """
 
 import logging
@@ -22,14 +22,17 @@ from datetime import datetime
 from string import Template
 
 from camel.messages import BaseMessage
+from camel.types import OpenAIBackendRole
+
+from oasis.social_agent.agent import SocialAgent
+from oasis.social_agent.agent_action import SocialAction
+from oasis.social_agent.agent_environment import SocialEnvironment
+from oasis.social_platform.database import get_db_path
+from oasis.social_platform.platform import Platform
+from oasis.social_platform.typing import ActionType, RecsysType
 
 _log_dir = os.environ.get("PARLIAMENT_LOG_DIR", "./log")
 os.makedirs(_log_dir, exist_ok=True)
-
-# ---------------------------------------------------------------------------
-# Shared helpers — clean post JSON for agent display
-# ---------------------------------------------------------------------------
-from oasis.social_platform.database import get_db_path
 
 
 def _get_id_to_name() -> dict:
@@ -83,9 +86,8 @@ def _clean_posts(posts: list, id_to_name: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
-# 1. Patch SocialAgent.__init__ to support single_iteration
+# 1. SocialAgent.__init__ — multi-step iterations per round
 # ---------------------------------------------------------------------------
-from oasis.social_agent.agent import SocialAgent
 
 _original_init = SocialAgent.__init__
 
@@ -100,14 +102,12 @@ def _patched_init(self, *args, single_iteration=True, **kwargs):
 SocialAgent.__init__ = _patched_init
 
 # ---------------------------------------------------------------------------
-# 1b. Patch SocialAgent.perform_action_by_data — skip memory write
+# 2. SocialAgent.perform_action_by_data — skip memory write
 #
-#     ManualActions are platform-level events (e.g. the opening post), not
-#     agent decisions. Writing them to agent memory with SYSTEM role breaks
-#     models that enforce strict system-message ordering (e.g. Qwen3.5).
-#     The results are always visible via forum refresh anyway.
+#    ManualActions are platform-level events (e.g. the opening post), not
+#    agent decisions.  Writing them to memory with SYSTEM role breaks models
+#    that enforce strict system-message ordering (Qwen3.5).
 # ---------------------------------------------------------------------------
-from oasis.social_platform.typing import ActionType
 
 
 async def _patched_perform_action_by_data(self, func_name, *args, **kwargs):
@@ -121,7 +121,7 @@ async def _patched_perform_action_by_data(self, func_name, *args, **kwargs):
 SocialAgent.perform_action_by_data = _patched_perform_action_by_data
 
 # ---------------------------------------------------------------------------
-# 2. Patch SocialAgent.perform_action_by_llm — parliament user message
+# 3. SocialAgent.perform_action_by_llm — parliament user message + anomaly log
 # ---------------------------------------------------------------------------
 _agent_log = logging.getLogger("social.agent")
 
@@ -149,8 +149,7 @@ def _log_anomaly(
     import json
     import traceback
 
-    log_dir = os.environ.get("PARLIAMENT_LOG_DIR", "./log")
-    run_dir = os.path.dirname(log_dir)   # parent of log/ = timestamped run dir
+    run_dir = os.environ.get("PARLIAMENT_RUN_DIR", ".")
     anomaly_path = os.path.join(run_dir, "anomalies.jsonl")
 
     # Safely serialize an arbitrary value to something JSON-compatible
@@ -289,9 +288,8 @@ async def _patched_perform_action_by_llm(self):
 SocialAgent.perform_action_by_llm = _patched_perform_action_by_llm
 
 # ---------------------------------------------------------------------------
-# 3. Patch SocialEnvironment templates
+# 4. SocialEnvironment templates
 # ---------------------------------------------------------------------------
-from oasis.social_agent.agent_environment import SocialEnvironment
 
 SocialEnvironment.followers_env_template = Template(
     "$num_followers colleagues are following your work."
@@ -340,9 +338,8 @@ async def _patched_to_text_prompt(self, **kwargs):
 SocialEnvironment.to_text_prompt = _patched_to_text_prompt
 
 # ---------------------------------------------------------------------------
-# 4. Patch SocialAction docstrings
+# 5. SocialAction docstrings
 # ---------------------------------------------------------------------------
-from oasis.social_agent.agent_action import SocialAction
 
 SocialAction.create_post.__doc__ = (
     "Publish a new top-level contribution to the forum. Other scientists "
@@ -462,10 +459,8 @@ SocialAction.do_nothing.__doc__ = (
 )
 
 # ---------------------------------------------------------------------------
-# 5. Patch Platform.refresh — merge followed users' posts into candidate pool
+# 6. Platform.refresh — merge followed scientists' posts into candidate pool
 # ---------------------------------------------------------------------------
-from oasis.social_platform.platform import Platform
-from oasis.social_platform.typing import RecsysType
 
 
 async def _patched_refresh(self, agent_id: int):
@@ -527,11 +522,7 @@ async def _patched_refresh(self, agent_id: int):
 Platform.refresh = _patched_refresh
 
 # ---------------------------------------------------------------------------
-# 5b. Patch Platform.search_posts — clean output for agent display
-#
-#     search_posts returns raw DB rows (user_id numbers, num_shares, etc.).
-#     We clean the result the same way to_text_prompt does, so agents always
-#     see consistent scientist names instead of integer IDs.
+# 7. Platform.search_posts — clean output for agent display
 # ---------------------------------------------------------------------------
 _original_search_posts = Platform.search_posts
 
@@ -547,9 +538,8 @@ async def _patched_search_posts(self, agent_id: int, query: str):
 Platform.search_posts = _patched_search_posts
 
 # ---------------------------------------------------------------------------
-# 6. Patch SocialAgent.perform_interview — remove twitter leftover
+# 8. SocialAgent.perform_interview — remove leftover twitter prompt
 # ---------------------------------------------------------------------------
-from camel.types import OpenAIBackendRole
 
 
 async def _patched_perform_interview(self, interview_prompt: str):
@@ -593,17 +583,12 @@ async def _patched_perform_interview(self, interview_prompt: str):
 SocialAgent.perform_interview = _patched_perform_interview
 
 # ---------------------------------------------------------------------------
-# 7. Redirect all OASIS loggers to the run's log directory.
+# 9. Redirect OASIS loggers to log/<timestamp>/
 #
-#    OASIS creates FileHandlers pointing to ./log/ at module-import time
-#    (platform.py, agent.py).  Those modules are pulled in transitively when
-#    patches.py imports SocialAgent, so by the time we reach this point the
-#    social.agent and social.twitter loggers already have wrong handlers.
-#
-#    env.py is imported later (via `import oasis` in run_parliament.py), so
-#    its oasis.env handler is also wrong but not yet attached.  We call this
-#    function a second time from run_parliament.py AFTER all imports to catch
-#    that case as well.
+#    OASIS hardcodes FileHandlers to ./log/ at import time.  We close those
+#    and re-attach handlers pointing to the timestamped log directory.
+#    Called once here (catches social.agent + social.twitter) and once more
+#    from run_parliament.py after `import oasis` (catches oasis.env).
 # ---------------------------------------------------------------------------
 def _redirect_loggers_to_run_dir():
     now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

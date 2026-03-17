@@ -83,13 +83,17 @@ python serve.py --output_dir output/<timestamp>/ --token YOUR_NGROK_TOKEN --refr
 ## 输出结构
 
 ```
-output/<timestamp>/
-├── parliament.db    # SQLite（所有帖子、评论、投票、trace）
-├── session.json     # 讨论记录（带科学家姓名）
-├── index.html       # 可视化（每轮更新）
-├── anomalies.jsonl  # 异常记录（无工具调用 / 异常，含完整 context）
-├── config.py        # 该次运行配置快照
-└── log/
+output/<timestamp>/             # 数据
+├── parliament.db               # SQLite（所有帖子、评论、投票、trace）
+├── session.json                # 讨论记录（带科学家姓名）
+├── index.html                  # 可视化（每轮更新）
+├── anomalies.jsonl             # 异常记录（无工具调用 / 异常，含完整 context）
+└── config.py                   # 该次运行配置快照
+
+log/<timestamp>/                # 日志（与 output 同一 timestamp）
+├── social.agent-*.log
+├── social.twitter-*.log
+└── oasis-*.log
 ```
 
 ---
