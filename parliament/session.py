@@ -66,14 +66,22 @@ def init(log_dir: str | None = None):
     _initialized = True
 
 
-def create_model():
-    """Create the CAMEL model using parliament/config.py settings."""
+def create_model(base_url: str | None = None):
+    """Create the CAMEL model.
+
+    Args:
+        base_url: Override the API base URL (e.g. for multi-GPU setups
+                  where each GPU runs vLLM on a different port).
+                  If None, uses the value from config.py.
+    """
     from config import MODEL_NAME, MODEL_BASE_URL, API_KEY
 
     if API_KEY:
         os.environ["OPENAI_API_KEY"] = API_KEY
-    if MODEL_BASE_URL:
-        os.environ["OPENAI_API_BASE_URL"] = MODEL_BASE_URL
+
+    url = base_url or MODEL_BASE_URL
+    if url:
+        os.environ["OPENAI_API_BASE_URL"] = url
 
     from camel.models import ModelFactory
     from camel.types import ModelPlatformType
@@ -285,6 +293,7 @@ async def run_session(
     prev_rowid = 0
     early_stopped = False
     actual_rounds = 0
+    round_boundaries = []  # [(round, max_post_id, max_comment_id), ...]
 
     for round_num in range(1, num_rounds + 1):
         print(f"[Round {round_num}/{num_rounds}]")
@@ -301,6 +310,15 @@ async def run_session(
 
         actual_rounds = round_num
 
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("SELECT COALESCE(MAX(post_id), 0) FROM post")
+        max_pid = c.fetchone()[0]
+        c.execute("SELECT COALESCE(MAX(comment_id), 0) FROM comment")
+        max_cid = c.fetchone()[0]
+        conn.close()
+        round_boundaries.append({"round": round_num, "max_post_id": max_pid, "max_comment_id": max_cid})
+
         try:
             from visualize import generate_html
             generate_html(db_path, output_dir,
@@ -314,6 +332,11 @@ async def run_session(
             print(f"\n  Early stop: {EARLY_STOP_ROUNDS} consecutive idle rounds.")
             early_stopped = True
             break
+
+    # Save round boundaries for Judge to map post/comment IDs to rounds
+    rb_path = os.path.join(output_dir, "round_map.json")
+    with open(rb_path, "w", encoding="utf-8") as f:
+        json.dump(round_boundaries, f)
 
     print(f"\n{'='*70}")
     label = "EARLY STOP" if early_stopped else "SESSION COMPLETE"

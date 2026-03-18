@@ -19,7 +19,8 @@ parliament/              # 核心议会系统
 
 judgement/               # Judge + Benchmark
 ├── judge.py             # Judge：读取论坛记录 → 综合最终答案
-└── run_benchmark.py     # 批量跑数据集（GPQA 等）
+├── run_benchmark.py     # 批量跑数据集（多卡动态队列）
+└── launch_vllm.sh       # 一键启动多卡 vLLM 实例
 
 benchmark/               # 数据集
 ├── gpqa_diamond.csv     # GPQA Diamond（198 题，选择题）
@@ -50,10 +51,17 @@ pip install python-dotenv pyngrok
 
 ### 1. 启动 vLLM
 
+**单卡（demo）：**
 ```bash
 CUDA_VISIBLE_DEVICES=6 vllm serve /path/to/Qwen3.5-9B \
   --port 8000 --max-model-len 65536 --gpu-memory-utilization 0.90 \
   --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
+```
+
+**多卡（benchmark）：**
+```bash
+cd judgement
+bash launch_vllm.sh 8 /path/to/Qwen3.5-9B    # 8 GPUs, ports 8000–8007
 ```
 
 ### 2a. Demo 模式（跑单题）
@@ -63,12 +71,15 @@ cd parliament
 python run_parliament.py --question "Prove that n(n+1)(n+2)(n+3)+1 is always a perfect square."
 ```
 
-### 2b. Benchmark 模式（跑 GPQA）
+### 2b. Benchmark 模式（跑 GPQA，8 卡并行）
 
 ```bash
 cd judgement
-python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --limit 10
+python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv
+python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 4 --limit 20
 ```
+
+动态任务队列：快的 GPU 自动多跑题，无长尾等待。
 
 ---
 
@@ -114,4 +125,4 @@ Question → Parliament (20 scientists × N rounds) → Judge → ANSWER
 
 1. **Parliament**：科学家在论坛讨论（发帖、评论、投票、关注、搜索）
 2. **早停检测**：连续 2 轮无人改变论坛内容 → 提前结束
-3. **Judge**：资深科学家旁听全程，阅读按得分排序的完整讨论，给出最终答案
+3. **Judge**：资深科学家旁听全程，阅读带日期和得分的完整讨论记录，给出最终答案

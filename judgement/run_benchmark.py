@@ -1,28 +1,32 @@
 """
-Science Parliament — Benchmark runner.
+Science Parliament — Benchmark runner (multi-GPU).
 
-Runs parliament + judge on a dataset of questions and records results.
+Each GPU runs its own worker process.  Workers pull questions from a shared
+queue — fast GPUs automatically get more work, no long-tail waiting.
 
 Usage:
     cd judgement
-    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --limit 10
+    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv
+    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 4 --limit 20
+
+Prerequisites:
+    GPU k → vLLM on port (base_port + k).  Use launch_vllm.sh to start them.
 """
 
 import argparse
 import asyncio
 import csv
 import json
+import multiprocessing as mp
 import os
 import random
 import sys
 from datetime import datetime
 
-# Add parliament/ to path for config, session, patches, etc.
 _parliament_dir = os.path.join(os.path.dirname(__file__), "..", "parliament")
 sys.path.insert(0, os.path.abspath(_parliament_dir))
 
-from session import OUTPUT_BASE, LOG_BASE, init, create_model, run_session
-from judge import run_judge
+from session import OUTPUT_BASE, LOG_BASE
 
 
 # ---------------------------------------------------------------------------
@@ -30,39 +34,17 @@ from judge import run_judge
 # ---------------------------------------------------------------------------
 
 def load_dataset(path: str) -> list[dict]:
-    """Load questions from CSV or JSONL.
-
-    Returns list of dicts with keys: question, choices (list|None), ground_truth.
-    """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".jsonl":
-        return _load_jsonl(path)
+        with open(path, "r", encoding="utf-8") as f:
+            return [_normalize(json.loads(l)) for l in f if l.strip()]
     elif ext in (".csv", ".tsv"):
-        return _load_csv(path)
-    else:
-        raise ValueError(f"Unsupported format: {ext}")
-
-
-def _load_jsonl(path: str) -> list[dict]:
-    records = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(_normalize(json.loads(line)))
-    return records
-
-
-def _load_csv(path: str) -> list[dict]:
-    records = []
-    with open(path, "r", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            records.append(_normalize(row))
-    return records
+        with open(path, "r", encoding="utf-8") as f:
+            return [_normalize(row) for row in csv.DictReader(f)]
+    raise ValueError(f"Unsupported format: {ext}")
 
 
 def _normalize(raw: dict) -> dict:
-    """Map various column names to a standard format."""
     question = (
         raw.get("question") or raw.get("Question")
         or raw.get("problem") or raw.get("Problem") or ""
@@ -72,117 +54,87 @@ def _normalize(raw: dict) -> dict:
     if choices is not None:
         if isinstance(choices, str):
             choices = json.loads(choices)
-        answer_letter = raw.get("answer") or raw.get("Answer")
-        return {"question": question, "choices": choices, "ground_truth": answer_letter}
+        return {"question": question, "choices": choices,
+                "ground_truth": raw.get("answer") or raw.get("Answer")}
 
-    # GPQA format: Correct Answer + Incorrect Answer 1/2/3
     correct = raw.get("Correct Answer") or raw.get("correct_answer")
-    incorrects = [
-        raw.get(k) for k in
-        ["Incorrect Answer 1", "Incorrect Answer 2", "Incorrect Answer 3"]
-        if raw.get(k)
-    ]
-
+    incorrects = [raw.get(k) for k in
+                  ["Incorrect Answer 1", "Incorrect Answer 2", "Incorrect Answer 3"]
+                  if raw.get(k)]
     if correct and incorrects:
         all_choices = [correct] + incorrects
         random.shuffle(all_choices)
-        answer_letter = chr(ord("A") + all_choices.index(correct))
-        return {"question": question, "choices": all_choices, "ground_truth": answer_letter}
+        letter = chr(ord("A") + all_choices.index(correct))
+        return {"question": question, "choices": all_choices, "ground_truth": letter}
 
-    return {
-        "question": question,
-        "choices": None,
-        "ground_truth": raw.get("answer") or raw.get("Answer"),
-    }
+    return {"question": question, "choices": None,
+            "ground_truth": raw.get("answer") or raw.get("Answer")}
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Worker process — one per GPU, completely independent
 # ---------------------------------------------------------------------------
 
-async def run_benchmark(
-    dataset_path: str,
-    limit: int | None = None,
-    bench_name: str | None = None,
+def _worker_main(
+    worker_id: int,
+    port: int,
+    task_queue: mp.Queue,
+    result_queue: mp.Queue,
+    bench_dir: str,
+    log_dir: str,
 ):
-    questions = load_dataset(dataset_path)
-    if limit:
-        questions = questions[:limit]
+    """Entry point for each worker process.  Runs in its own address space."""
 
-    if bench_name is None:
-        bench_name = os.path.splitext(os.path.basename(dataset_path))[0]
+    sys.path.insert(0, os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "parliament")
+    ))
+    from session import init, create_model, run_session
+    from judge import run_judge
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    bench_dir = os.path.join(OUTPUT_BASE, bench_name, timestamp)
-    log_dir = os.path.join(LOG_BASE, f"{bench_name}_{timestamp}")
+    init(log_dir=os.path.join(log_dir, f"gpu{worker_id}"))
+    model = create_model(base_url=f"http://localhost:{port}/v1")
 
-    os.makedirs(bench_dir, exist_ok=True)
+    while True:
+        try:
+            idx, q = task_queue.get_nowait()
+        except Exception:
+            break
 
-    init(log_dir=log_dir)
-    model = create_model()
-
-    results_path = os.path.join(bench_dir, "results.jsonl")
-    correct = 0
-    total = 0
-
-    print(f"\n{'='*70}")
-    print(f"BENCHMARK: {len(questions)} questions from {dataset_path}")
-    print(f"Output → {bench_dir}")
-    print(f"{'='*70}\n")
-
-    for idx, q in enumerate(questions):
         question_text = q["question"]
         choices = q.get("choices")
         ground_truth = q.get("ground_truth")
-
-        print(f"\n{'─'*70}")
-        print(f"Question {idx + 1}/{len(questions)}")
-        print(f"{'─'*70}")
-        preview = question_text[:200] + ("..." if len(question_text) > 200 else "")
-        print(f"  {preview}\n")
-
         run_dir = os.path.join(bench_dir, str(idx))
 
-        # ── Parliament ──────────────────────────────────────────────────────
+        print(f"[GPU {worker_id}] Question {idx} starting...")
+
+        rounds_completed = 0
+        early_stopped = False
+        db_path = None
+        answer = None
+
         try:
-            session = await run_session(
-                question=question_text,
-                model=model,
-                output_dir=run_dir,
-            )
+            session = asyncio.run(run_session(
+                question=question_text, model=model, output_dir=run_dir,
+            ))
             db_path = session["db_path"]
             rounds_completed = session["num_rounds_completed"]
             early_stopped = session["early_stopped"]
         except Exception as e:
-            print(f"  [ERROR] Parliament failed: {e}")
-            db_path = None
-            rounds_completed = 0
-            early_stopped = False
+            print(f"[GPU {worker_id}] Question {idx} parliament error: {e}")
 
-        # ── Judge ────────────────────────────────────────────────────────────
-        answer = None
         if db_path and os.path.exists(db_path):
             try:
-                judge_result = await run_judge(
-                    db_path=db_path,
-                    question=question_text,
-                    model=model,
-                    choices=choices,
-                    output_dir=run_dir,
-                )
+                judge_result = asyncio.run(run_judge(
+                    db_path=db_path, question=question_text,
+                    model=model, choices=choices, output_dir=run_dir,
+                ))
                 answer = judge_result["answer"]
             except Exception as e:
-                print(f"  [ERROR] Judge failed: {e}")
+                print(f"[GPU {worker_id}] Question {idx} judge error: {e}")
 
-        # ── Record ───────────────────────────────────────────────────────────
         is_correct = None
         if ground_truth is not None and answer is not None:
-            norm_a = answer.strip("() ").upper()
-            norm_t = str(ground_truth).strip("() ").upper()
-            is_correct = norm_a == norm_t
-            if is_correct:
-                correct += 1
-        total += 1
+            is_correct = answer.strip("() ").upper() == str(ground_truth).strip("() ").upper()
 
         record = {
             "index": idx,
@@ -193,50 +145,107 @@ async def run_benchmark(
             "is_correct": is_correct,
             "rounds_completed": rounds_completed,
             "early_stopped": early_stopped,
+            "gpu": worker_id,
         }
-        with open(results_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        result_queue.put(record)
 
         status = "ok" if is_correct else ("WRONG" if is_correct is False else "?")
-        print(f"\n  [{status}] Answer: {answer}")
-        if ground_truth:
-            print(f"      Truth:  {ground_truth}")
-        if total > 0 and is_correct is not None:
-            print(f"      Running: {correct}/{total} = {correct/total:.0%}")
+        print(f"[GPU {worker_id}] Question {idx} [{status}] answer={answer}")
 
-    # ── Summary ──────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Main process — distribute tasks, collect results
+# ---------------------------------------------------------------------------
+
+def run_benchmark(
+    dataset_path: str,
+    num_gpus: int = 8,
+    base_port: int = 8000,
+    limit: int | None = None,
+    bench_name: str | None = None,
+):
+    questions = load_dataset(dataset_path)
+    random.shuffle(questions)
+    if limit:
+        questions = questions[:limit]
+
+    if bench_name is None:
+        bench_name = os.path.splitext(os.path.basename(dataset_path))[0]
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    bench_dir = os.path.join(OUTPUT_BASE, bench_name, timestamp)
+    log_dir = os.path.join(LOG_BASE, f"{bench_name}_{timestamp}")
+    os.makedirs(bench_dir, exist_ok=True)
+
+    task_queue = mp.Queue()
+    result_queue = mp.Queue()
+    for idx, q in enumerate(questions):
+        task_queue.put((idx, q))
+
+    print(f"\n{'='*70}")
+    print(f"BENCHMARK: {len(questions)} questions, {num_gpus} GPUs")
+    print(f"Dataset:   {dataset_path}")
+    print(f"Output:    {bench_dir}")
+    print(f"Ports:     {base_port}–{base_port + num_gpus - 1}")
+    print(f"{'='*70}\n")
+
+    workers = []
+    for i in range(num_gpus):
+        p = mp.Process(
+            target=_worker_main,
+            args=(i, base_port + i, task_queue, result_queue, bench_dir, log_dir),
+        )
+        p.start()
+        workers.append(p)
+
+    for p in workers:
+        p.join()
+
+    # Collect results
+    results_path = os.path.join(bench_dir, "results.jsonl")
+    correct = 0
+    total = 0
+    with open(results_path, "w", encoding="utf-8") as f:
+        while not result_queue.empty():
+            record = result_queue.get()
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            total += 1
+            if record.get("is_correct") is True:
+                correct += 1
+
+    accuracy = correct / total if total > 0 else 0
     summary = {
         "dataset": dataset_path,
         "bench_name": bench_name,
+        "num_gpus": num_gpus,
         "total": total,
         "correct": correct,
-        "accuracy": correct / total if total > 0 else 0,
+        "accuracy": accuracy,
         "timestamp": timestamp,
     }
-    summary_path = os.path.join(bench_dir, "summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(bench_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     print(f"\n{'='*70}")
     print(f"BENCHMARK COMPLETE")
-    print(f"  Accuracy: {correct}/{total} = {summary['accuracy']:.1%}")
+    print(f"  Accuracy: {correct}/{total} = {accuracy:.1%}")
     print(f"  Results:  {results_path}")
     print(f"{'='*70}\n")
-
     return summary
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Science Parliament Benchmark")
     parser.add_argument("--dataset", required=True, help="Path to dataset (CSV/JSONL)")
+    parser.add_argument("--gpus", type=int, default=8, help="Number of GPUs (default: 8)")
+    parser.add_argument("--base-port", type=int, default=8000, help="First vLLM port (default: 8000)")
     parser.add_argument("--limit", type=int, default=None, help="Only run first N questions")
     parser.add_argument("--name", default=None, help="Benchmark name (default: filename)")
     args = parser.parse_args()
-    asyncio.run(run_benchmark(args.dataset, limit=args.limit, bench_name=args.name))
+    run_benchmark(
+        args.dataset, num_gpus=args.gpus, base_port=args.base_port,
+        limit=args.limit, bench_name=args.name,
+    )
 
 
 if __name__ == "__main__":

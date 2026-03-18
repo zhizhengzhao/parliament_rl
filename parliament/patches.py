@@ -34,6 +34,10 @@ from oasis.social_platform.typing import ActionType, RecsysType
 _log_dir = os.environ.get("PARLIAMENT_LOG_DIR", "./log")
 os.makedirs(_log_dir, exist_ok=True)
 
+# Virtual start date for the parliament timeline.
+# Round 1 = this date, Round 2 = next day, etc.
+_PARLIAMENT_START_DATE = "2026-03-17"
+
 
 def _get_id_to_name() -> dict:
     """Query the database for a user_id → scientist name mapping."""
@@ -48,15 +52,36 @@ def _get_id_to_name() -> dict:
         return {}
 
 
-def _clean_posts(posts: list, id_to_name: dict) -> list:
-    """
-    Strip Twitter/Reddit artifacts from the post list and replace user_id
-    with human-readable scientist names.
+def _load_round_map() -> list[dict] | None:
+    """Load round_map.json from the current run directory."""
+    import json
+    run_dir = os.environ.get("PARLIAMENT_RUN_DIR", ".")
+    rm_path = os.path.join(run_dir, "round_map.json")
+    if not os.path.exists(rm_path):
+        return None
+    try:
+        with open(rm_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
-    Raw fields removed: num_shares, num_reports, original_post_id,
-                        quote_content, created_at (from posts & comments).
-    Added fields: author (scientist name), scientist_id (for use with follow).
-    """
+
+def _id_to_date(item_id: int, boundaries: list[dict], key: str) -> str:
+    """Map a post_id or comment_id to a date string via round_map."""
+    from datetime import date, timedelta
+    start = date.fromisoformat(_PARLIAMENT_START_DATE)
+    for entry in boundaries:
+        if item_id <= entry[key]:
+            return str(start + timedelta(days=entry["round"] - 1))
+    if boundaries:
+        return str(start + timedelta(days=boundaries[-1]["round"] - 1))
+    return _PARLIAMENT_START_DATE
+
+
+def _clean_posts(posts: list, id_to_name: dict) -> list:
+    """Strip social-media artifacts and add scientist names + dates."""
+    round_map = _load_round_map()
+
     clean = []
     for post in posts:
         uid = post.get("user_id")
@@ -66,22 +91,28 @@ def _clean_posts(posts: list, id_to_name: dict) -> list:
         for c in post.get("comments", []):
             cuid = c.get("user_id")
             cauthor = id_to_name.get(cuid, f"Scientist_{cuid}")
-            clean_comments.append({
+            cm = {
                 "comment_id": c["comment_id"],
-                "scientist_id": cuid,   # needed to follow the commenter
+                "scientist_id": cuid,
                 "author": cauthor,
                 "content": c.get("content", ""),
                 "score": c.get("score", 0),
-            })
+            }
+            if round_map:
+                cm["date"] = _id_to_date(c["comment_id"], round_map, "max_comment_id")
+            clean_comments.append(cm)
 
-        clean.append({
+        p = {
             "post_id": post["post_id"],
-            "scientist_id": uid,        # needed to follow the poster
+            "scientist_id": uid,
             "author": author,
             "content": post.get("content", ""),
             "score": post.get("score", 0),
             "comments": clean_comments,
-        })
+        }
+        if round_map:
+            p["date"] = _id_to_date(post["post_id"], round_map, "max_post_id")
+        clean.append(p)
     return clean
 
 
