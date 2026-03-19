@@ -20,8 +20,9 @@ parliament/              # 核心议会系统
 judgement/               # Judge + Benchmark
 ├── judge.py             # Judge：读论坛 → 综合最终答案
 ├── run_benchmark.py     # 一键跑 benchmark（自动启动 vLLM）
+├── run_baseline.py      # 一键跑 baseline 对照（直接模型做题）
 ├── vllm_manager.py      # vLLM 生命周期管理
-└── benchmark_viz.py     # 生成 benchmark 总览 HTML
+└── benchmark_viz.py     # 生成总览 HTML
 
 benchmark/               # 数据集
 ├── gpqa_diamond.csv     # GPQA Diamond（198 题）
@@ -41,7 +42,7 @@ pip install camel-ai==0.2.89
 pip install "sympy>=1.13"
 pip install camel-oasis==0.2.5 --no-deps
 pip install "pandas>=2.2" "igraph>=0.11" "sentence-transformers>=3.0" "neo4j>=5.23"
-pip install python-dotenv
+pip install python-dotenv httpx
 ```
 
 ### 2. 修改配置
@@ -77,6 +78,16 @@ python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv                #
 ```
 
 自动完成：启动 vLLM → 跑 parliament + judge → 生成结果页面 → 启动 HTTP 服务器。
+
+**Baseline（直接模型做题，对照组）：**
+
+```bash
+cd judgement
+python run_baseline.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0           # 单卡
+python run_baseline.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,1,2       # 多卡
+```
+
+同样全自动，用 async batch 推理，速度比 parliament 快得多。
 
 ---
 
