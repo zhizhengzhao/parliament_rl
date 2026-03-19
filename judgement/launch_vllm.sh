@@ -2,34 +2,38 @@
 # Launch vLLM instances — one per GPU.
 #
 # Usage:
-#   bash launch_vllm.sh <MODEL_PATH> [NUM_GPUS]
+#   bash launch_vllm.sh <MODEL_PATH> [GPU_IDS]
 #
 # Examples:
-#   bash launch_vllm.sh /data/models/Qwen3-8B           # 8 GPUs (default)
-#   bash launch_vllm.sh /data/models/Qwen3-8B 4         # 4 GPUs
+#   bash launch_vllm.sh /data/models/Qwen3.5-9B              # all 8 GPUs (0-7)
+#   bash launch_vllm.sh /data/models/Qwen3.5-9B 0,1,2,3      # GPUs 0-3
+#   bash launch_vllm.sh /data/models/Qwen3.5-9B 2,5,7         # specific GPUs
 #
-# Each GPU k gets port (8000 + k).  Logs go to vllm_gpu{k}.log.
+# GPU k → port (8000 + k).  Logs go to vllm_gpu{k}.log.
 # Stop all:  pkill -f 'vllm serve'
 
 set -e
 
 if [ -z "$1" ]; then
-    echo "Usage: bash launch_vllm.sh <MODEL_PATH> [NUM_GPUS]"
+    echo "Usage: bash launch_vllm.sh <MODEL_PATH> [GPU_IDS]"
+    echo "  GPU_IDS: comma-separated, e.g. 0,1,2,3 (default: 0,1,2,3,4,5,6,7)"
     exit 1
 fi
 
 MODEL="$1"
-NUM_GPUS=${2:-8}
-BASE_PORT=8000
+GPU_IDS=${2:-"0,1,2,3,4,5,6,7"}
 
-echo "Launching $NUM_GPUS vLLM instances (ports $BASE_PORT–$((BASE_PORT + NUM_GPUS - 1)))"
+IFS=',' read -ra GPUS <<< "$GPU_IDS"
+
+echo "Launching ${#GPUS[@]} vLLM instances"
 echo "Model: $MODEL"
+echo "GPUs:  $GPU_IDS"
 echo ""
 
-for i in $(seq 0 $((NUM_GPUS - 1))); do
-    PORT=$((BASE_PORT + i))
-    echo "GPU $i → port $PORT"
-    CUDA_VISIBLE_DEVICES=$i nohup vllm serve "$MODEL" \
+for GPU_ID in "${GPUS[@]}"; do
+    PORT=$((8000 + GPU_ID))
+    echo "GPU $GPU_ID → port $PORT"
+    CUDA_VISIBLE_DEVICES=$GPU_ID nohup vllm serve "$MODEL" \
         --port "$PORT" \
         --tensor-parallel-size 1 \
         --max-model-len 65536 \
@@ -37,7 +41,7 @@ for i in $(seq 0 $((NUM_GPUS - 1))); do
         --reasoning-parser qwen3 \
         --enable-auto-tool-choice \
         --tool-call-parser qwen3_coder \
-        > "vllm_gpu${i}.log" 2>&1 &
+        > "vllm_gpu${GPU_ID}.log" 2>&1 &
     echo "  PID: $!"
 done
 

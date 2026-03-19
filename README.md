@@ -80,9 +80,9 @@ python run_parliament.py --question "Prove that n(n+1)(n+2)(n+3)+1 is always a p
 
 ```bash
 cd judgement
-python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv          # 全部 198 题，8 卡
-python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --limit 5  # 先跑 5 题测试
-python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 4   # 4 卡
+python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv                     # 全部 198 题，8 卡
+python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0 --limit 5   # 单卡跑 5 题
+python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,2,4,6       # 指定 GPU
 ```
 
 ---
@@ -105,8 +105,7 @@ python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 4   # 4 �
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--dataset` | 必填 | 数据集路径（CSV 或 JSONL） |
-| `--gpus` | `8` | 使用的 GPU 数量 |
-| `--base-port` | `8000` | 第一个 vLLM 端口（GPU k → port base+k） |
+| `--gpus` | `0-7` | GPU 编号：`0,1,2,3` 或 `0-7` 或 `0`（单卡） |
 | `--limit` | 全部 | 只跑前 N 题 |
 | `--name` | 文件名 | benchmark 名称（影响输出目录名） |
 

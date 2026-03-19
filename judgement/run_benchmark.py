@@ -6,11 +6,13 @@ queue — fast GPUs automatically get more work, no long-tail waiting.
 
 Usage:
     cd judgement
-    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv
-    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 4 --limit 20
+    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv                    # 8 GPUs
+    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0           # single GPU 0
+    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,2,4,6     # specific GPUs
+    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0-3         # GPUs 0-3
 
 Prerequisites:
-    GPU k → vLLM on port (base_port + k).  Use launch_vllm.sh to start them.
+    GPU k → vLLM on port (8000 + k).  Use launch_vllm.sh to start them.
 """
 
 import argparse
@@ -157,13 +159,23 @@ def _worker_main(
 # Main process — distribute tasks, collect results
 # ---------------------------------------------------------------------------
 
+def _parse_gpu_ids(gpu_ids_str: str) -> list[int]:
+    """Parse '0,1,2,3' or '0-7' into a list of GPU IDs."""
+    if "-" in gpu_ids_str and "," not in gpu_ids_str:
+        start, end = gpu_ids_str.split("-")
+        return list(range(int(start), int(end) + 1))
+    return [int(x) for x in gpu_ids_str.split(",")]
+
+
 def run_benchmark(
     dataset_path: str,
-    num_gpus: int = 8,
-    base_port: int = 8000,
+    gpu_ids: list[int] | None = None,
     limit: int | None = None,
     bench_name: str | None = None,
 ):
+    if gpu_ids is None:
+        gpu_ids = list(range(8))
+
     questions = load_dataset(dataset_path)
     random.shuffle(questions)
     if limit:
@@ -182,18 +194,20 @@ def run_benchmark(
     for idx, q in enumerate(questions):
         task_queue.put((idx, q))
 
+    ports = [8000 + gid for gid in gpu_ids]
     print(f"\n{'='*70}")
-    print(f"BENCHMARK: {len(questions)} questions, {num_gpus} GPUs")
+    print(f"BENCHMARK: {len(questions)} questions, {len(gpu_ids)} GPUs ({gpu_ids})")
     print(f"Dataset:   {dataset_path}")
     print(f"Output:    {bench_dir}")
-    print(f"Ports:     {base_port}–{base_port + num_gpus - 1}")
+    print(f"Ports:     {ports}")
     print(f"{'='*70}\n")
 
     workers = []
-    for i in range(num_gpus):
+    for gid in gpu_ids:
+        port = 8000 + gid
         p = mp.Process(
             target=_worker_main,
-            args=(i, base_port + i, task_queue, result_queue, bench_dir, log_dir),
+            args=(gid, port, task_queue, result_queue, bench_dir, log_dir),
         )
         p.start()
         workers.append(p)
@@ -217,7 +231,7 @@ def run_benchmark(
     summary = {
         "dataset": dataset_path,
         "bench_name": bench_name,
-        "num_gpus": num_gpus,
+        "gpu_ids": gpu_ids,
         "total": total,
         "correct": correct,
         "accuracy": accuracy,
@@ -237,13 +251,13 @@ def run_benchmark(
 def main():
     parser = argparse.ArgumentParser(description="Science Parliament Benchmark")
     parser.add_argument("--dataset", required=True, help="Path to dataset (CSV/JSONL)")
-    parser.add_argument("--gpus", type=int, default=8, help="Number of GPUs (default: 8)")
-    parser.add_argument("--base-port", type=int, default=8000, help="First vLLM port (default: 8000)")
+    parser.add_argument("--gpus", type=str, default="0-7",
+                        help="GPU IDs: '0,1,2,3' or '0-7' or '0' (default: 0-7)")
     parser.add_argument("--limit", type=int, default=None, help="Only run first N questions")
     parser.add_argument("--name", default=None, help="Benchmark name (default: filename)")
     args = parser.parse_args()
     run_benchmark(
-        args.dataset, num_gpus=args.gpus, base_port=args.base_port,
+        args.dataset, gpu_ids=_parse_gpu_ids(args.gpus),
         limit=args.limit, bench_name=args.name,
     )
 
