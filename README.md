@@ -1,8 +1,8 @@
 # Science Parliament
 
-多个 LLM 科学家在共享论坛上协作解答难题，通过集体讨论和社区投票涌现出答案。由独立的 Judge 综合论坛共识给出最终回答。
+多个 LLM 科学家在论坛上协作解答难题，通过讨论、验证、投票涌现出答案，最后由 Judge 综合给出最终回答。
 
-基于 [CAMEL](https://github.com/camel-ai/camel) + [OASIS](https://github.com/camel-ai/oasis)，用 `patches.py` 深度适配为科学议会环境。
+基于 [CAMEL](https://github.com/camel-ai/camel) + [OASIS](https://github.com/camel-ai/oasis)。
 
 ---
 
@@ -10,76 +10,120 @@
 
 ```
 parliament/              # 核心议会系统
-├── config.py            # 所有可调参数
-├── patches.py           # OASIS monkey-patches
+├── config.py            # 所有可调参数（模型、agent 数量、轮次等）
+├── patches.py           # OASIS monkey-patches（适配科学论坛场景）
 ├── session.py           # 核心逻辑：init() / create_model() / run_session()
 ├── run_parliament.py    # CLI 入口：demo 模式跑单题
 ├── visualize.py         # 自动生成 HTML 可视化
 └── serve.py             # HTTP 服务器 + ngrok 隧道
 
 judgement/               # Judge + Benchmark
-├── judge.py             # Judge：读取论坛记录 → 综合最终答案
-├── run_benchmark.py     # 批量跑数据集（多卡动态队列）
-└── launch_vllm.sh       # 一键启动多卡 vLLM 实例
+├── judge.py             # Judge：读取论坛 → 综合最终答案
+├── run_benchmark.py     # 多卡并行跑数据集
+└── launch_vllm.sh       # 一键启动多卡 vLLM
 
 benchmark/               # 数据集
-├── gpqa_diamond.csv     # GPQA Diamond（198 题，选择题）
+├── gpqa_diamond.csv     # GPQA Diamond（198 题）
 └── open_ended/          # 非选择题（预留）
 ```
 
-所有输出（`output/`、`log/`）始终生成在项目根目录下，不受 `cd` 位置影响。
-
 ---
 
-## 安装
+## Quick Start
 
-> ⚠️ `camel-ai` 和 `camel-oasis` 版本敏感，`patches.py` 依赖其内部 API，**勿随意升级**。
+### 1. 环境安装
 
 ```bash
 conda create -n parliament python=3.11 -y && conda activate parliament
+
 pip install vllm
 pip install camel-ai==0.2.89
 pip install "sympy>=1.13"
 pip install camel-oasis==0.2.5 --no-deps
 pip install "pandas>=2.2" "igraph>=0.11" "sentence-transformers>=3.0" "neo4j>=5.23"
-pip install python-dotenv pyngrok
+pip install python-dotenv
 ```
 
----
+> **版本锁定**：`camel-ai==0.2.89` 和 `camel-oasis==0.2.5` 不可升级，`patches.py` 依赖其内部 API。
 
-## 运行
+### 2. 启动 vLLM
 
-### 1. 启动 vLLM
-
-**单卡（demo）：**
 ```bash
-CUDA_VISIBLE_DEVICES=6 vllm serve /path/to/Qwen3.5-9B \
+# 单卡（demo 或调试）
+CUDA_VISIBLE_DEVICES=0 vllm serve /path/to/your/model \
   --port 8000 --max-model-len 65536 --gpu-memory-utilization 0.90 \
   --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
-```
 
-**多卡（benchmark）：**
-```bash
+# 多卡（benchmark，每张卡一个 vLLM 实例）
 cd judgement
-bash launch_vllm.sh 8 /path/to/Qwen3.5-9B    # 8 GPUs, ports 8000–8007
+bash launch_vllm.sh /path/to/your/model 8    # 8 GPUs → ports 8000–8007
 ```
 
-### 2a. Demo 模式（跑单题）
+### 3. 修改配置
+
+编辑 `parliament/config.py`，至少改一下模型名称：
+
+```python
+MODEL_NAME = "/path/to/your/model"    # 和 vllm serve 的参数一致
+```
+
+### 4. 运行
+
+**Demo（跑单题看效果）：**
 
 ```bash
 cd parliament
 python run_parliament.py --question "Prove that n(n+1)(n+2)(n+3)+1 is always a perfect square."
 ```
 
-### 2b. Benchmark 模式（跑 GPQA，8 卡并行）
+**Benchmark（跑 GPQA）：**
 
 ```bash
 cd judgement
-python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv
-python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 4 --limit 20
+python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv          # 全部 198 题，8 卡
+python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --limit 5  # 先跑 5 题测试
+python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 4   # 4 卡
 ```
 
-动态任务队列：快的 GPU 自动多跑题，无长尾等待。
+---
+
+## 可控参数
+
+### `parliament/config.py`（议会参数）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `MODEL_NAME` | `"Qwen/Qwen3-8B"` | 模型路径，需和 vLLM 启动时一致 |
+| `MODEL_BASE_URL` | `"http://localhost:8000/v1"` | vLLM API 地址（demo 模式使用） |
+| `DEFAULT_NUM_AGENTS` | `20` | 科学家数量 |
+| `NUM_ROUNDS` | `20` | 最大讨论轮数（早停可能提前结束） |
+| `MAX_ITERATION` | `10` | 每 agent 每轮最多几步工具调用 |
+| `LLM_CONCURRENCY` | `5` | 每轮内并发请求数 |
+
+### `run_benchmark.py` 命令行参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--dataset` | 必填 | 数据集路径（CSV 或 JSONL） |
+| `--gpus` | `8` | 使用的 GPU 数量 |
+| `--base-port` | `8000` | 第一个 vLLM 端口（GPU k → port base+k） |
+| `--limit` | 全部 | 只跑前 N 题 |
+| `--name` | 文件名 | benchmark 名称（影响输出目录名） |
+
+### `launch_vllm.sh` 参数
+
+```bash
+bash launch_vllm.sh <MODEL_PATH> [NUM_GPUS]
+# 默认 8 卡。每张卡 port = 8000 + gpu_id。
+```
+
+### `serve.py` 参数（可视化）
+
+```bash
+cd parliament
+python serve.py --output_dir ../output/<timestamp>/ [--refresh 60] [--refresh 0]
+# --refresh N : 自动刷新间隔（秒），0 = 关闭刷新
+```
 
 ---
 
@@ -88,32 +132,28 @@ python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 4 --limit
 **Demo 模式：**
 ```
 output/<timestamp>/
-├── parliament.db       session.json       index.html       anomalies.jsonl       config.py
+├── parliament.db         # SQLite 数据库（帖子、评论、投票）
+├── session.json          # 讨论记录
+├── round_map.json        # 轮次 ↔ post/comment ID 映射
+├── index.html            # 可视化页面
+├── anomalies.jsonl       # 异常记录（调试用）
+└── config.py             # 本次运行参数快照
 ```
 
 **Benchmark 模式：**
 ```
 output/gpqa_diamond/<timestamp>/
-├── 0/                  # 第 0 题
-│   ├── parliament.db   session.json   index.html   judge_response.json
-├── 1/                  # 第 1 题
+├── 0/                    # 第 0 题
+│   ├── parliament.db
+│   ├── session.json
+│   ├── round_map.json
+│   ├── index.html
+│   └── judge_response.json
+├── 1/
 │   └── ...
-├── results.jsonl       # 每题：答案、是否正确、轮次
-└── summary.json        # 准确率
+├── results.jsonl         # 全部结果（答案、得分、轮次）
+└── summary.json          # 准确率汇总
 ```
-
----
-
-## 配置（`parliament/config.py`）
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `DEFAULT_NUM_AGENTS` | `20` | 科学家数量 |
-| `NUM_ROUNDS` | `20` | 最大讨论轮数 |
-| `MAX_ITERATION` | `10` | 每 agent 每轮最多几步工具调用 |
-| `LLM_CONCURRENCY` | `5` | 并发数 |
-
-**早停**：连续 2 轮无内容变更（无发帖/评论/投票） → 自动提前结束。
 
 ---
 
@@ -123,6 +163,22 @@ output/gpqa_diamond/<timestamp>/
 Question → Parliament (20 scientists × N rounds) → Judge → ANSWER
 ```
 
-1. **Parliament**：科学家在论坛讨论（发帖、评论、投票、关注、搜索）
-2. **早停检测**：连续 2 轮无人改变论坛内容 → 提前结束
-3. **Judge**：资深科学家旁听全程，阅读带日期和得分的完整讨论记录，给出最终答案
+1. **Parliament**：科学家在论坛讨论（发帖、评论、投票、关注、搜索、SymPy 计算）
+2. **早停**：连续 2 轮无人改变论坛内容 → 自动提前结束
+3. **Judge**：一位资深科学家旁听全程，阅读带日期和得分的讨论记录，给出最终答案
+
+---
+
+## FAQ
+
+**vLLM 报 `"auto" tool choice requires...`**
+→ 确认启动 vLLM 时加了 `--enable-auto-tool-choice --tool-call-parser qwen3_coder`
+
+**GPU 显存不够**
+→ 降低 `--gpu-memory-utilization` 或 `--max-model-len`
+
+**想先快速验证流程**
+→ 改 `config.py` 里 `DEFAULT_NUM_AGENTS = 3`，`NUM_ROUNDS = 3`，单卡跑一题
+
+**停掉所有 vLLM 实例**
+→ `pkill -f 'vllm serve'`

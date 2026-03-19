@@ -1,10 +1,25 @@
 #!/bin/bash
 # Launch vLLM instances — one per GPU.
-# Usage: bash launch_vllm.sh [NUM_GPUS] [MODEL_PATH]
-#   defaults: 8 GPUs, model path from first argument
+#
+# Usage:
+#   bash launch_vllm.sh <MODEL_PATH> [NUM_GPUS]
+#
+# Examples:
+#   bash launch_vllm.sh /data/models/Qwen3-8B           # 8 GPUs (default)
+#   bash launch_vllm.sh /data/models/Qwen3-8B 4         # 4 GPUs
+#
+# Each GPU k gets port (8000 + k).  Logs go to vllm_gpu{k}.log.
+# Stop all:  pkill -f 'vllm serve'
 
-NUM_GPUS=${1:-8}
-MODEL=${2:-"/miaojiawei/zhizheng/models/qwen/Qwen3___5-9B"}
+set -e
+
+if [ -z "$1" ]; then
+    echo "Usage: bash launch_vllm.sh <MODEL_PATH> [NUM_GPUS]"
+    exit 1
+fi
+
+MODEL="$1"
+NUM_GPUS=${2:-8}
 BASE_PORT=8000
 
 echo "Launching $NUM_GPUS vLLM instances (ports $BASE_PORT–$((BASE_PORT + NUM_GPUS - 1)))"

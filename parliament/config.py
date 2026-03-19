@@ -1,47 +1,32 @@
-"""Science Parliament configuration (local model version).
+"""Science Parliament — configuration.
 
-All tunable parameters are here. Modify this file before each run.
-
-Local model setup:
-  CUDA_VISIBLE_DEVICES=6 vllm serve /miaojiawei/zhizheng/models/qwen/Qwen3___5-9B \\
-    --port 8000 \\
-    --tensor-parallel-size 1 \\
-    --max-model-len 65536 \\
-    --gpu-memory-utilization 0.90 \\
-    --reasoning-parser qwen3 \\
-    --enable-auto-tool-choice \\
-    --tool-call-parser qwen3_coder
+All tunable parameters are here.  Modify this file before each run.
 """
 
 # =============================================================================
-# LLM 模型配置（本地 vLLM 服务）
+# LLM model (local vLLM service)
 # =============================================================================
-MODEL_NAME = "/miaojiawei/zhizheng/models/qwen/Qwen3___5-9B"
-MODEL_BASE_URL = "http://localhost:8000/v1"
-API_KEY = "EMPTY"
+MODEL_NAME = "Qwen/Qwen3-8B"                  # model name (must match vLLM --model)
+MODEL_BASE_URL = "http://localhost:8000/v1"    # vLLM API endpoint (single-GPU demo)
+API_KEY = "EMPTY"                              # vLLM doesn't need a real key
 
 # =============================================================================
-# 议会参数
+# Parliament parameters
 # =============================================================================
-DEFAULT_NUM_AGENTS = 20        # 科学家数量
-NUM_ROUNDS = 20                # 讨论轮数
-LLM_CONCURRENCY = 5           # LLM API 最大并发请求数（受 semaphore 控制）
-MAX_ITERATION = 10             # 每个 agent 每轮最多执行几步工具调用
+DEFAULT_NUM_AGENTS = 20        # number of scientist agents
+NUM_ROUNDS = 20                # max discussion rounds
+LLM_CONCURRENCY = 5           # concurrent LLM requests per round (semaphore)
+MAX_ITERATION = 10             # max tool calls per agent per round
 
 # =============================================================================
-# 平台参数（控制 agent 每轮能看到多少内容）
+# Platform parameters (how much each agent sees per round)
 # =============================================================================
-REFRESH_REC_POST_COUNT = 200   # 每次 refresh 返回的帖子数上限
-MAX_REC_POST_LEN = 1000        # 推荐系统缓冲区中每用户最多存多少帖子
-ALLOW_SELF_RATING = False      # 是否允许 agent 给自己的帖子点赞/踩
+REFRESH_REC_POST_COUNT = 200   # max posts returned per refresh
+MAX_REC_POST_LEN = 1000        # max posts in recommendation buffer per user
+ALLOW_SELF_RATING = False      # allow agents to vote on their own posts
 
 # =============================================================================
-# 输出
-# =============================================================================
-OUTPUT_DIR = "output"
-
-# =============================================================================
-# Agent 名字（最多 26 个预设名，超出则自动生成 Scientist_N）
+# Agent names (up to 26 preset, auto-generated beyond that)
 # =============================================================================
 ALL_AGENT_NAMES = [
     "Alice", "Bob", "Carol", "David", "Eve", "Frank",
@@ -53,19 +38,16 @@ ALL_AGENT_NAMES = [
 
 
 def get_agent_names(n: int) -> list[str]:
-    """Return the first n agent names. If n > 26, generate extra names."""
     if n <= len(ALL_AGENT_NAMES):
         return ALL_AGENT_NAMES[:n]
     names = list(ALL_AGENT_NAMES)
-    i = len(names)
-    while len(names) < n:
+    for i in range(len(names), n):
         names.append(f"Scientist_{i}")
-        i += 1
     return names
 
 
 # =============================================================================
-# Agent 可用动作
+# Available actions
 # =============================================================================
 AVAILABLE_ACTIONS_LIST = [
     "LIKE_POST",
@@ -80,7 +62,7 @@ AVAILABLE_ACTIONS_LIST = [
 ]
 
 # =============================================================================
-# Prompt 模板（{name} 和 {question} 会被自动替换）
+# Scientist prompt template ({name} and {question} are auto-substituted)
 # =============================================================================
 SCIENTIST_PROMPT_TEMPLATE = """\
 You are {name}, a scientist at the Science Parliament.
