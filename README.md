@@ -15,7 +15,7 @@ parliament/              # 核心议会系统
 ├── session.py           # 核心逻辑：init() / create_model() / run_session()
 ├── run_parliament.py    # CLI 入口：demo 模式跑单题
 ├── visualize.py         # 自动生成 HTML 可视化
-└── serve.py             # HTTP 服务器 + ngrok 隧道
+└── serve.py             # HTTP 服务器（通过 SSH 隧道访问）
 
 judgement/               # Judge + Benchmark
 ├── judge.py             # Judge：读取论坛 → 综合最终答案
@@ -117,13 +117,23 @@ bash launch_vllm.sh <MODEL_PATH> [NUM_GPUS]
 # 默认 8 卡。每张卡 port = 8000 + gpu_id。
 ```
 
-### `serve.py` 参数（可视化）
+### 可视化（通过 SSH 隧道）
 
 ```bash
+# 服务器上：
 cd parliament
-python serve.py --output_dir ../output/<timestamp>/ [--refresh 60] [--refresh 0]
-# --refresh N : 自动刷新间隔（秒），0 = 关闭刷新
+python serve.py --output_dir ../output/<timestamp>/
+
+# 本地机器上（新开终端）：
+ssh -p 8795 -L 18888:localhost:18888 root@your-server-ip
+
+# 浏览器打开：http://localhost:18888/index.html
 ```
+
+| 参数 | 说明 |
+|------|------|
+| `--port` | HTTP 端口（默认 18888） |
+| `--refresh N` | 自动刷新间隔（秒），0 = 关闭 |
 
 ---
 

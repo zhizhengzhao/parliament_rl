@@ -138,7 +138,7 @@ def _forum_html(data):
     <span class="pid">#{pid}</span>
     <div class="post-head-right">{_score_badge(post['score'])}</div>
   </div>
-  <div class="post-body"><div class="post-text">{content}</div></div>
+  <div class="post-body"><div class="post-text">{content}</div><div class="post-expand" onclick="togglePost(this)"><span></span></div></div>
   {cmt_section}
 </article>"""
 
@@ -291,8 +291,21 @@ a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}
 .name{{font-weight:700;font-size:.9rem;color:var(--accent);cursor:pointer}}
 .pid{{color:var(--muted);font-size:.75rem}}
 .post-head-right{{margin-left:auto;display:flex;align-items:center;gap:8px}}
-.post-body{{padding:4px 18px 14px}}
-.post-text{{font-size:.88rem;white-space:pre-wrap;word-break:break-word}}
+.post-body{{padding:4px 18px 14px;position:relative}}
+.post-text{{font-size:.88rem;white-space:pre-wrap;word-break:break-word;
+  max-height:200px;overflow:hidden;transition:max-height .3s ease}}
+.post-text.expanded{{max-height:none}}
+.post-expand{{display:none;position:absolute;bottom:0;left:0;right:0;height:60px;
+  background:linear-gradient(transparent,var(--card));cursor:pointer;
+  align-items:flex-end;justify-content:center;padding-bottom:6px}}
+.post-expand span{{font-size:.75rem;color:var(--accent);font-weight:600;
+  background:var(--card);padding:2px 14px;border-radius:12px;
+  border:1px solid var(--border)}}
+.post-body.needs-expand .post-expand{{display:flex}}
+.post-body.needs-expand .post-text.expanded + .post-expand{{
+  position:relative;height:auto;background:none;padding:6px 0 0}}
+.post-body.needs-expand .post-text.expanded + .post-expand span::before{{content:'Collapse ▲'}}
+.post-expand span::before{{content:'Expand ▼'}}
 
 /* comments */
 .cmt-section{{border-top:1px solid var(--border)}}
@@ -301,7 +314,15 @@ a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}
 .cmt-list{{display:none;padding:0 18px 12px}}.cmt-section.open .cmt-list{{display:block}}
 .cmt{{padding:8px 0 8px 12px;border-left:3px solid var(--border);margin-bottom:6px}}
 .cmt-head{{display:flex;align-items:center;gap:8px;margin-bottom:2px}}
-.cmt-body{{font-size:.82rem;color:#444;white-space:pre-wrap;word-break:break-word;padding-left:40px}}
+.cmt-body{{font-size:.82rem;color:#444;white-space:pre-wrap;word-break:break-word;
+  padding-left:40px;max-height:150px;overflow:hidden;position:relative;
+  transition:max-height .3s ease;cursor:pointer}}
+.cmt-body.expanded{{max-height:none}}
+.cmt-body.clipped::after{{content:'▼ click to expand';position:absolute;bottom:0;left:0;right:0;
+  height:40px;background:linear-gradient(transparent,var(--card));display:flex;
+  align-items:flex-end;justify-content:center;font-size:.7rem;color:var(--accent);
+  font-weight:600;padding-bottom:4px}}
+.cmt-body.expanded::after{{display:none}}
 
 /* scientists */
 .sci{{background:var(--card);border-radius:12px;margin-bottom:10px;padding:16px 20px;
@@ -404,6 +425,16 @@ function showProfile(uid){{const p=P[uid];if(!p)return;
   document.getElementById('mc').innerHTML=h;document.getElementById('ov').classList.add('open')}}
 function cl(){{document.getElementById('ov').classList.remove('open')}}
 document.addEventListener('keydown',ev=>{{if(ev.key==='Escape')cl()}});
+function togglePost(btn){{const txt=btn.previousElementSibling;
+  txt.classList.toggle('expanded')}}
+document.addEventListener('DOMContentLoaded',()=>{{
+  document.querySelectorAll('.post-text').forEach(el=>{{
+    if(el.scrollHeight>210)el.parentElement.classList.add('needs-expand')}});
+  document.querySelectorAll('.cmt-body').forEach(el=>{{
+    if(el.scrollHeight>160){{el.classList.add('clipped');
+      el.onclick=()=>el.classList.toggle('expanded')}}
+  }})
+}});
 </script></body></html>"""
 
 
