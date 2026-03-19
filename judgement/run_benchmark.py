@@ -1,18 +1,11 @@
 """
-Science Parliament — Benchmark runner (multi-GPU).
+Science Parliament — Benchmark runner.
 
-Each GPU runs its own worker process.  Workers pull questions from a shared
-queue — fast GPUs automatically get more work, no long-tail waiting.
+One command does everything: start vLLM → run parliament + judge → generate results page.
 
 Usage:
     cd judgement
-    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv                    # 8 GPUs
-    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0           # single GPU 0
-    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,2,4,6     # specific GPUs
-    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0-3         # GPUs 0-3
-
-Prerequisites:
-    GPU k → vLLM on port (8000 + k).  Use launch_vllm.sh to start them.
+    python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,1,2 --limit 6
 """
 
 import argparse
@@ -23,12 +16,16 @@ import multiprocessing as mp
 import os
 import random
 import sys
+import threading
 from datetime import datetime
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 _parliament_dir = os.path.join(os.path.dirname(__file__), "..", "parliament")
 sys.path.insert(0, os.path.abspath(_parliament_dir))
 
 from session import OUTPUT_BASE, LOG_BASE
+import vllm_manager
+import benchmark_viz
 
 
 # ---------------------------------------------------------------------------
@@ -74,19 +71,14 @@ def _normalize(raw: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Worker process — one per GPU, completely independent
+# Worker process — one per GPU
 # ---------------------------------------------------------------------------
 
 def _worker_main(
-    worker_id: int,
-    port: int,
-    task_queue: mp.Queue,
-    result_queue: mp.Queue,
-    bench_dir: str,
-    log_dir: str,
+    worker_id: int, port: int,
+    task_queue: mp.Queue, result_queue: mp.Queue,
+    bench_dir: str, log_dir: str,
 ):
-    """Entry point for each worker process.  Runs in its own address space."""
-
     sys.path.insert(0, os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "parliament")
     ))
@@ -156,26 +148,27 @@ def _worker_main(
 
 
 # ---------------------------------------------------------------------------
-# Main process — distribute tasks, collect results
+# Parse GPU IDs
 # ---------------------------------------------------------------------------
 
-def _parse_gpu_ids(gpu_ids_str: str) -> list[int]:
-    """Parse '0,1,2,3' or '0-7' into a list of GPU IDs."""
-    if "-" in gpu_ids_str and "," not in gpu_ids_str:
-        start, end = gpu_ids_str.split("-")
-        return list(range(int(start), int(end) + 1))
-    return [int(x) for x in gpu_ids_str.split(",")]
+def _parse_gpu_ids(s: str) -> list[int]:
+    if "-" in s and "," not in s:
+        a, b = s.split("-")
+        return list(range(int(a), int(b) + 1))
+    return [int(x) for x in s.split(",")]
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def run_benchmark(
     dataset_path: str,
-    gpu_ids: list[int] | None = None,
+    gpu_ids: list[int],
     limit: int | None = None,
     bench_name: str | None = None,
+    serve_port: int = 18888,
 ):
-    if gpu_ids is None:
-        gpu_ids = list(range(8))
-
     questions = load_dataset(dataset_path)
     random.shuffle(questions)
     if limit:
@@ -189,33 +182,31 @@ def run_benchmark(
     log_dir = os.path.join(LOG_BASE, f"{bench_name}_{timestamp}")
     os.makedirs(bench_dir, exist_ok=True)
 
+    # ── Step 1: Start vLLM ──────────────────────────────────────────────
+    print("\n[1/4] Starting vLLM instances...")
+    vllm_manager.start(gpu_ids)
+    vllm_manager.wait_ready(gpu_ids)
+
+    # ── Step 2: Run parliament + judge ──────────────────────────────────
+    print(f"\n[2/4] Running benchmark: {len(questions)} questions, {len(gpu_ids)} GPUs")
     task_queue = mp.Queue()
     result_queue = mp.Queue()
     for idx, q in enumerate(questions):
         task_queue.put((idx, q))
 
-    ports = [8000 + gid for gid in gpu_ids]
-    print(f"\n{'='*70}")
-    print(f"BENCHMARK: {len(questions)} questions, {len(gpu_ids)} GPUs ({gpu_ids})")
-    print(f"Dataset:   {dataset_path}")
-    print(f"Output:    {bench_dir}")
-    print(f"Ports:     {ports}")
-    print(f"{'='*70}\n")
-
     workers = []
     for gid in gpu_ids:
-        port = 8000 + gid
         p = mp.Process(
             target=_worker_main,
-            args=(gid, port, task_queue, result_queue, bench_dir, log_dir),
+            args=(gid, 8000 + gid, task_queue, result_queue, bench_dir, log_dir),
         )
         p.start()
         workers.append(p)
-
     for p in workers:
         p.join()
 
-    # Collect results
+    # ── Step 3: Collect results ─────────────────────────────────────────
+    print("\n[3/4] Collecting results...")
     results_path = os.path.join(bench_dir, "results.jsonl")
     correct = 0
     total = 0
@@ -240,25 +231,44 @@ def run_benchmark(
     with open(os.path.join(bench_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
+    # ── Step 4: Generate overview HTML + serve ──────────────────────────
+    print("\n[4/4] Generating results page...")
+    html_path = benchmark_viz.generate(bench_dir, summary)
+
     print(f"\n{'='*70}")
     print(f"BENCHMARK COMPLETE")
-    print(f"  Accuracy: {correct}/{total} = {accuracy:.1%}")
-    print(f"  Results:  {results_path}")
-    print(f"{'='*70}\n")
-    return summary
+    print(f"  Accuracy:  {correct}/{total} = {accuracy:.1%}")
+    print(f"  Results:   {results_path}")
+    print(f"  Dashboard: {html_path}")
+    print(f"{'='*70}")
+
+    # Serve the results directory
+    print(f"\n  Serving results at http://localhost:{serve_port}/")
+    print(f"  SSH tunnel: ssh -p 8795 -L {serve_port}:localhost:{serve_port} root@your-server")
+    print(f"  Press Ctrl+C to stop.\n")
+
+    os.chdir(bench_dir)
+    server = HTTPServer(("", serve_port), type("H", (SimpleHTTPRequestHandler,),
+                         {"log_message": lambda *a: None}))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.shutdown()
+        print("\nStopped.")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Science Parliament Benchmark")
     parser.add_argument("--dataset", required=True, help="Path to dataset (CSV/JSONL)")
     parser.add_argument("--gpus", type=str, default="0-7",
-                        help="GPU IDs: '0,1,2,3' or '0-7' or '0' (default: 0-7)")
+                        help="GPU IDs: '0,1,2' or '0-7' or '0' (default: 0-7)")
     parser.add_argument("--limit", type=int, default=None, help="Only run first N questions")
     parser.add_argument("--name", default=None, help="Benchmark name (default: filename)")
+    parser.add_argument("--port", type=int, default=18888, help="HTTP port for results page")
     args = parser.parse_args()
     run_benchmark(
         args.dataset, gpu_ids=_parse_gpu_ids(args.gpus),
-        limit=args.limit, bench_name=args.name,
+        limit=args.limit, bench_name=args.name, serve_port=args.port,
     )
 
 

@@ -4,11 +4,17 @@ All tunable parameters are here.  Modify this file before each run.
 """
 
 # =============================================================================
-# LLM model (local vLLM service)
+# LLM model
 # =============================================================================
-MODEL_NAME = "Qwen/Qwen3-8B"                  # model name (must match vLLM --model)
-MODEL_BASE_URL = "http://localhost:8000/v1"    # vLLM API endpoint (single-GPU demo)
+MODEL_NAME = "Qwen/Qwen3-8B"                  # model path (must match vLLM --model)
+MODEL_BASE_URL = "http://localhost:8000/v1"    # vLLM API endpoint (demo mode only)
 API_KEY = "EMPTY"                              # vLLM doesn't need a real key
+
+# =============================================================================
+# vLLM serving parameters (used by judgement/vllm_manager.py)
+# =============================================================================
+VLLM_MAX_MODEL_LEN = 131072                   # 128K context (Qwen3.5 native)
+VLLM_GPU_MEMORY_UTILIZATION = 0.90
 
 # =============================================================================
 # Parliament parameters
