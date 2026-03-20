@@ -12,7 +12,6 @@ Usage:
 
 import argparse
 import asyncio
-import csv
 import json
 import os
 import random
@@ -23,6 +22,7 @@ _parliament_dir = os.path.join(os.path.dirname(__file__), "..", "parliament")
 sys.path.insert(0, os.path.abspath(_parliament_dir))
 
 from session import OUTPUT_BASE
+from dataset import load_dataset, parse_gpu_ids
 from judge import extract_answer
 import vllm_manager
 import benchmark_viz
@@ -56,48 +56,6 @@ The answer between <<<FINAL>>> and <<<END>>> must be self-contained.\
 
 
 # ---------------------------------------------------------------------------
-# Dataset loading (same as run_benchmark.py)
-# ---------------------------------------------------------------------------
-
-def load_dataset(path: str) -> list[dict]:
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".jsonl":
-        with open(path, "r", encoding="utf-8") as f:
-            return [_normalize(json.loads(l)) for l in f if l.strip()]
-    elif ext in (".csv", ".tsv"):
-        with open(path, "r", encoding="utf-8") as f:
-            return [_normalize(row) for row in csv.DictReader(f)]
-    raise ValueError(f"Unsupported format: {ext}")
-
-
-def _normalize(raw: dict) -> dict:
-    question = (
-        raw.get("question") or raw.get("Question")
-        or raw.get("problem") or raw.get("Problem") or ""
-    ).strip()
-
-    choices = raw.get("choices")
-    if choices is not None:
-        if isinstance(choices, str):
-            choices = json.loads(choices)
-        return {"question": question, "choices": choices,
-                "ground_truth": raw.get("answer") or raw.get("Answer")}
-
-    correct = raw.get("Correct Answer") or raw.get("correct_answer")
-    incorrects = [raw.get(k) for k in
-                  ["Incorrect Answer 1", "Incorrect Answer 2", "Incorrect Answer 3"]
-                  if raw.get(k)]
-    if correct and incorrects:
-        all_choices = [correct] + incorrects
-        random.shuffle(all_choices)
-        letter = chr(ord("A") + all_choices.index(correct))
-        return {"question": question, "choices": all_choices, "ground_truth": letter}
-
-    return {"question": question, "choices": None,
-            "ground_truth": raw.get("answer") or raw.get("Answer")}
-
-
-# ---------------------------------------------------------------------------
 # Build prompt for a single question
 # ---------------------------------------------------------------------------
 
@@ -117,6 +75,7 @@ def _build_prompt(question: str, choices: list[str] | None) -> str:
 async def _run_batch(questions: list[dict], ports: list[int], concurrency: int = 32):
     """Send all questions to vLLM instances with async concurrency."""
     import httpx
+    from config import MODEL_NAME
 
     semaphore = asyncio.Semaphore(concurrency)
     results = [None] * len(questions)
@@ -131,7 +90,7 @@ async def _run_batch(questions: list[dict], ports: list[int], concurrency: int =
                 resp = await client.post(
                     f"http://localhost:{port}/v1/chat/completions",
                     json={
-                        "model": "",
+                        "model": MODEL_NAME,
                         "messages": [
                             {"role": "system", "content": system},
                             {"role": "user", "content": user_msg},
@@ -180,17 +139,6 @@ async def _run_batch(questions: list[dict], ports: list[int], concurrency: int =
         await asyncio.gather(*tasks)
 
     return results
-
-
-# ---------------------------------------------------------------------------
-# Parse GPU IDs
-# ---------------------------------------------------------------------------
-
-def _parse_gpu_ids(s: str) -> list[int]:
-    if "-" in s and "," not in s:
-        a, b = s.split("-")
-        return list(range(int(a), int(b) + 1))
-    return [int(x) for x in s.split(",")]
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +243,7 @@ def main():
     parser.add_argument("--port", type=int, default=18888, help="HTTP port for results page")
     args = parser.parse_args()
     run_baseline(
-        args.dataset, gpu_ids=_parse_gpu_ids(args.gpus),
+        args.dataset, gpu_ids=parse_gpu_ids(args.gpus),
         limit=args.limit, bench_name=args.name, serve_port=args.port,
     )
 

@@ -1,20 +1,12 @@
-"""Generate a self-contained overview HTML for a benchmark run."""
+"""Science Parliament — benchmark results overview HTML."""
 
 import json
 import os
+import sys
 from datetime import datetime
 
-
-def _esc(text):
-    if text is None:
-        return ""
-    return (
-        str(text)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "parliament"))
+from visualize import _esc
 
 
 def generate(bench_dir: str, summary: dict):
@@ -36,6 +28,12 @@ def generate(bench_dir: str, summary: dict):
     timestamp = summary.get("timestamp", "")
     gpu_ids = summary.get("gpu_ids", [])
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    rounds_list = [r.get("rounds_completed", 0) for r in records if r.get("rounds_completed")]
+    avg_rounds = sum(rounds_list) / len(rounds_list) if rounds_list else 0
+    early_stopped = sum(1 for r in records if r.get("early_stopped"))
+    early_pct = early_stopped / total * 100 if total > 0 else 0
+    unanswered = sum(1 for r in records if r.get("parliament_answer") is None)
 
     rows_html = ""
     for r in records:
@@ -91,6 +89,9 @@ tr:hover{{background:#f8f9ff}}
     <div class="stat"><div class="stat-val">{accuracy:.1%}</div><div class="stat-lbl">Accuracy</div></div>
     <div class="stat"><div class="stat-val">{correct}/{total}</div><div class="stat-lbl">Correct</div></div>
     <div class="stat"><div class="stat-val">{len(gpu_ids)}</div><div class="stat-lbl">GPUs</div></div>
+    <div class="stat"><div class="stat-val">{avg_rounds:.1f}</div><div class="stat-lbl">Avg Rounds</div></div>
+    <div class="stat"><div class="stat-val">{early_pct:.0f}%</div><div class="stat-lbl">Early Stop</div></div>
+    <div class="stat"><div class="stat-val">{unanswered}</div><div class="stat-lbl">Unanswered</div></div>
     <div class="stat"><div class="stat-val">{_esc(timestamp)}</div><div class="stat-lbl">Run</div></div>
   </div>
 </div>

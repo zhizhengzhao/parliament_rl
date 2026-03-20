@@ -241,6 +241,13 @@ def _build_html(data, question, current_round, num_rounds):
 <meta charset="UTF-8"><meta http-equiv="refresh" content="15">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Science Parliament</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body,{{delimiters:[
+    {{left:'$$',right:'$$',display:true}},{{left:'$',right:'$',display:false}},
+    {{left:'\\\\(',right:'\\\\)',display:false}},{{left:'\\\\[',right:'\\\\]',display:true}}
+  ],throwOnError:false}})"></script>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 :root{{--bg:#f4f5f9;--card:#fff;--border:#e8e9f0;--text:#1e1e2e;--muted:#8b8da0;

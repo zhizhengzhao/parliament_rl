@@ -25,6 +25,7 @@ judgement/               # Judge + Benchmark
 ├── judge.py             # Judge：读论坛 → 综合最终答案
 ├── run_benchmark.py     # 一键跑 benchmark（自动启动 vLLM）
 ├── run_baseline.py      # 一键跑 baseline 对照（直接模型做题）
+├── dataset.py           # 数据集加载 + GPU ID 解析（共用）
 ├── vllm_manager.py      # vLLM 生命周期管理
 └── benchmark_viz.py     # 生成总览 HTML
 

@@ -151,11 +151,12 @@ def _count_context_actions(db_path: str, prev_rowid: int) -> tuple[int, int]:
     """Count context-affecting actions since prev_rowid. Returns (count, new_max_rowid)."""
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
-    placeholders = ",".join(f"'{a}'" for a in CONTEXT_ACTIONS)
+    actions = list(CONTEXT_ACTIONS)
+    placeholders = ",".join("?" for _ in actions)
     c.execute(f"""
         SELECT COUNT(*) FROM trace
         WHERE action IN ({placeholders}) AND rowid > ?
-    """, (prev_rowid,))
+    """, (*actions, prev_rowid))
     n = c.fetchone()[0]
     c.execute("SELECT COALESCE(MAX(rowid), 0) FROM trace")
     new_max = c.fetchone()[0]
@@ -194,18 +195,25 @@ def dump_discussion(db_path: str) -> list[dict]:
     return posts
 
 
-def _snapshot(db_path: str) -> tuple[int, int, int]:
-    """Capture current max IDs for rollback."""
+def _snapshot(db_path: str) -> dict:
+    """Capture current max IDs for all mutable tables, used for rollback."""
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
-    c.execute("SELECT COALESCE(MAX(post_id), 0) FROM post")
-    max_pid = c.fetchone()[0]
-    c.execute("SELECT COALESCE(MAX(comment_id), 0) FROM comment")
-    max_cid = c.fetchone()[0]
-    c.execute("SELECT COALESCE(MAX(rowid), 0) FROM trace")
-    max_rid = c.fetchone()[0]
+    snap = {}
+    for key, sql in (
+        ("max_post_id",             "SELECT COALESCE(MAX(post_id), 0) FROM post"),
+        ("max_comment_id",          "SELECT COALESCE(MAX(comment_id), 0) FROM comment"),
+        ("max_trace_rowid",         "SELECT COALESCE(MAX(rowid), 0) FROM trace"),
+        ("max_follow_rowid",        "SELECT COALESCE(MAX(rowid), 0) FROM follow"),
+        ("max_like_rowid",          "SELECT COALESCE(MAX(rowid), 0) FROM 'like'"),
+        ("max_dislike_rowid",       "SELECT COALESCE(MAX(rowid), 0) FROM 'dislike'"),
+        ("max_comment_like_rowid",  "SELECT COALESCE(MAX(rowid), 0) FROM comment_like"),
+        ("max_comment_dislike_rowid", "SELECT COALESCE(MAX(rowid), 0) FROM comment_dislike"),
+    ):
+        c.execute(sql)
+        snap[key] = c.fetchone()[0]
     conn.close()
-    return max_pid, max_cid, max_rid
+    return snap
 
 
 async def run_session(
@@ -308,7 +316,7 @@ async def run_session(
         print(f"[Round {round_num}/{num_rounds}]")
 
         # Snapshot before the round (for rollback)
-        snap_pid, snap_cid, snap_rid = _snapshot(db_path)
+        snap = _snapshot(db_path)
 
         actions = {agent: LLMAction() for agent in agents}
         try:
@@ -317,7 +325,7 @@ async def run_session(
             # An agent's context exceeded the safety limit.
             # Rollback this round, compress, then check if we can continue.
             print("  Context overflow detected — rolling back and compressing...")
-            rollback_to(db_path, snap_pid, snap_cid, snap_rid)
+            rollback_to(db_path, snap)
             await compress_posts(output_dir)
 
             # Check if compression was enough
@@ -352,9 +360,11 @@ async def run_session(
 
         actual_rounds = round_num
 
-        max_pid, max_cid, _ = _snapshot(db_path)
+        end_snap = _snapshot(db_path)
         round_boundaries.append({
-            "round": round_num, "max_post_id": max_pid, "max_comment_id": max_cid,
+            "round": round_num,
+            "max_post_id": end_snap["max_post_id"],
+            "max_comment_id": end_snap["max_comment_id"],
         })
 
         try:

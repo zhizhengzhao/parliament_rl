@@ -29,13 +29,16 @@ _watermarks: dict[int, tuple[int, int]] = {}
 # Loaded from / saved to compressed_posts.json.
 _compressed_posts: dict[int, str] = {}     # post_id → compressed content
 _compressed_comments: dict[int, str] = {}  # comment_id → compressed content
+_compressed_loaded = False
 
 
 def reset():
     """Clear all state. Call at the start of each parliament session."""
+    global _compressed_loaded
     _watermarks.clear()
     _compressed_posts.clear()
     _compressed_comments.clear()
+    _compressed_loaded = False
 
 
 def _db_path() -> str:
@@ -43,7 +46,10 @@ def _db_path() -> str:
 
 
 def _load_compressed(output_dir: str):
-    """Load compressed_posts.json if it exists."""
+    """Load compressed_posts.json if it exists. Skips if already loaded."""
+    global _compressed_loaded
+    if _compressed_loaded:
+        return
     path = os.path.join(output_dir, "compressed_posts.json")
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
@@ -52,6 +58,7 @@ def _load_compressed(output_dir: str):
             _compressed_posts[int(k)] = v
         for k, v in data.get("comments", {}).items():
             _compressed_comments[int(k)] = v
+    _compressed_loaded = True
 
 
 def _save_compressed(output_dir: str):
@@ -80,6 +87,7 @@ def _get_all_posts(db_path: str) -> list[dict]:
         ORDER BY p.post_id ASC
     """)
     posts = [dict(r) for r in c.fetchall()]
+    post_map = {p["post_id"]: p for p in posts}
 
     c.execute("""
         SELECT cm.comment_id, cm.post_id, u.name AS author, cm.content,
@@ -89,10 +97,9 @@ def _get_all_posts(db_path: str) -> list[dict]:
     """)
     for r in c.fetchall():
         d = dict(r)
-        for p in posts:
-            if p["post_id"] == d["post_id"]:
-                p.setdefault("comments", []).append(d)
-                break
+        parent = post_map.get(d["post_id"])
+        if parent is not None:
+            parent.setdefault("comments", []).append(d)
 
     conn.close()
     for p in posts:
@@ -273,7 +280,6 @@ def build_context(agent_id: int, agent_name: str, system_content: str) -> list[d
     elif not old_posts:
         parts.append("No posts yet. You may be the first to contribute.\n")
 
-    # Section 4: Follower/following info
     try:
         conn = sqlite3.connect(db_path, timeout=3)
         c = conn.cursor()
@@ -316,6 +322,7 @@ from prompts import COMPRESS_SYSTEM, COMPRESS_USER
 
 async def compress_posts(output_dir: str):
     """Compress all uncompressed posts/comments individually via batch HTTP requests."""
+    global _compressed_loaded
     import httpx
 
     db_path = _db_path()
@@ -372,6 +379,7 @@ async def compress_posts(output_dir: str):
         await asyncio.gather(*tasks)
 
     _save_compressed(output_dir)
+    _compressed_loaded = True
     n = len(_compressed_posts) + len(_compressed_comments)
     print(f"  Compressed {n} items → {output_dir}/compressed_posts.json")
 
@@ -380,24 +388,46 @@ async def compress_posts(output_dir: str):
 # Rollback — delete all data created after a given point
 # ---------------------------------------------------------------------------
 
-def rollback_to(db_path: str, max_post_id: int, max_comment_id: int, max_trace_rowid: int):
-    """Delete all data created after the given IDs + reset watermarks."""
+def rollback_to(db_path: str, snap: dict):
+    """Delete all data created after the snapshot + reset watermarks.
+
+    Args:
+        snap: dict returned by session._snapshot() with keys:
+              max_post_id, max_comment_id, max_trace_rowid,
+              max_follow_rowid, max_like_rowid, max_dislike_rowid,
+              max_comment_like_rowid, max_comment_dislike_rowid.
+    """
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
-    c.execute("DELETE FROM post WHERE post_id > ?", (max_post_id,))
-    c.execute("DELETE FROM comment WHERE comment_id > ?", (max_comment_id,))
-    c.execute("DELETE FROM trace WHERE rowid > ?", (max_trace_rowid,))
-    c.execute("DELETE FROM 'like' WHERE post_id > ?", (max_post_id,))
-    c.execute("DELETE FROM 'dislike' WHERE post_id > ?", (max_post_id,))
-    # Also clean comment likes/dislikes and follows created this round
-    c.execute("DELETE FROM comment_like WHERE comment_id > ?", (max_comment_id,))
-    c.execute("DELETE FROM comment_dislike WHERE comment_id > ?", (max_comment_id,))
-    c.execute("DELETE FROM follow WHERE rowid > ?", (max_trace_rowid,))
+    c.execute("DELETE FROM post WHERE post_id > ?", (snap["max_post_id"],))
+    c.execute("DELETE FROM comment WHERE comment_id > ?", (snap["max_comment_id"],))
+    c.execute("DELETE FROM trace WHERE rowid > ?", (snap["max_trace_rowid"],))
+    c.execute("DELETE FROM 'like' WHERE rowid > ?", (snap["max_like_rowid"],))
+    c.execute("DELETE FROM 'dislike' WHERE rowid > ?", (snap["max_dislike_rowid"],))
+    c.execute("DELETE FROM comment_like WHERE rowid > ?", (snap["max_comment_like_rowid"],))
+    c.execute("DELETE FROM comment_dislike WHERE rowid > ?", (snap["max_comment_dislike_rowid"],))
+    c.execute("DELETE FROM follow WHERE rowid > ?", (snap["max_follow_rowid"],))
+
+    # Recalculate denormalized counters — the DELETE above removed
+    # like/dislike rows but left num_likes/num_dislikes on post/comment stale.
+    c.execute("""
+        UPDATE post SET
+            num_likes = (SELECT COUNT(*) FROM 'like' WHERE 'like'.post_id = post.post_id),
+            num_dislikes = (SELECT COUNT(*) FROM dislike WHERE dislike.post_id = post.post_id)
+    """)
+    c.execute("""
+        UPDATE comment SET
+            num_likes = (SELECT COUNT(*) FROM comment_like
+                         WHERE comment_like.comment_id = comment.comment_id),
+            num_dislikes = (SELECT COUNT(*) FROM comment_dislike
+                           WHERE comment_dislike.comment_id = comment.comment_id)
+    """)
+
     conn.commit()
     conn.close()
 
-    # Reset all agent watermarks to the rollback point so that
-    # retried round correctly classifies posts as new vs old
+    max_post_id = snap["max_post_id"]
+    max_comment_id = snap["max_comment_id"]
     for agent_id in _watermarks:
         _watermarks[agent_id] = (max_post_id, max_comment_id)
 
