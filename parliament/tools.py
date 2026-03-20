@@ -4,7 +4,112 @@ Handles loading external tool packages and overriding OASIS tool descriptions
 to match the parliament context.  Tool sets are controlled via config.TOOL_SETS.
 """
 
+import os
+import subprocess
+import tempfile
+
 from oasis.social_agent.agent_action import SocialAction
+
+
+# ---------------------------------------------------------------------------
+# Python code executor — sandboxed computation for scientists
+# ---------------------------------------------------------------------------
+
+_PYTHON_PREAMBLE = """\
+import math, cmath, fractions, decimal, itertools, collections, re, json
+try:
+    import numpy as np
+except ImportError:
+    pass
+try:
+    import scipy.constants as const
+except ImportError:
+    pass
+try:
+    import sympy
+    from sympy import *
+except ImportError:
+    pass
+"""
+
+_PYTHON_TIMEOUT = 30
+_PYTHON_MAX_OUTPUT = 4000
+
+
+def run_python(code: str) -> str:
+    """Execute Python code to perform a computation and return the printed
+    output. Use this as your personal lab bench — run calculations, verify
+    formulas, test edge cases, and produce numerical evidence that
+    strengthens or refutes a claim in the parliament.
+
+    A computation that confirms or disproves a claim is the strongest
+    possible contribution. If someone posts a formula, you can check it.
+    If you derive a result, you can verify it numerically. If you suspect
+    an error, you can find a counterexample.
+
+    Available packages (pre-imported):
+    - math, cmath — standard math functions
+    - numpy (as np) — numerical arrays, linear algebra, FFT
+    - scipy.constants (as const) — physical constants and unit conversions
+      e.g. const.c, const.hbar, const.eV, const.k, const.m_e, const.N_A
+    - sympy — symbolic math (all symbols imported via 'from sympy import *')
+
+    IMPORTANT: You MUST use print() to produce output. Only printed text
+    is returned. Variables assigned without printing will not appear.
+
+    Example:
+        code = '''
+        # Check energy-time uncertainty for a 1ns lifetime
+        delta_t = 1e-9
+        delta_E = const.hbar / delta_t
+        print(f"Energy uncertainty: {delta_E / const.eV:.2e} eV")
+
+        # Verify a matrix eigenvalue claim
+        M = np.array([[2, 1], [1, 3]])
+        eigenvalues = np.linalg.eigvalsh(M)
+        print(f"Eigenvalues: {eigenvalues}")
+        '''
+
+    Args:
+        code (str): Python code to execute.
+
+    Returns:
+        str: The printed output, or an error message if execution fails.
+    """
+    full_code = _PYTHON_PREAMBLE + "\n" + code
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".py", prefix="parliament_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(full_code)
+
+        result = subprocess.run(
+            ["python3", tmp_path],
+            capture_output=True, text=True,
+            timeout=_PYTHON_TIMEOUT,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        output = ""
+        if result.stdout:
+            output += result.stdout
+        if result.returncode != 0 and result.stderr:
+            err = result.stderr.strip().splitlines()
+            output += "\n[error]\n" + "\n".join(err[-15:])
+
+        if not output.strip():
+            output = "(no output — use print() to see results)"
+
+        return output[:_PYTHON_MAX_OUTPUT]
+
+    except subprocess.TimeoutExpired:
+        return f"(execution timed out after {_PYTHON_TIMEOUT}s)"
+    except Exception as e:
+        return f"(execution error: {e})"
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -17,17 +122,15 @@ def load_tools(tool_sets: list[str] | None = None) -> list:
         from config import TOOL_SETS
         tool_sets = TOOL_SETS
 
+    from camel.toolkits import FunctionTool
+
     tools = []
     for name in tool_sets:
         if name == "sympy":
             from camel.toolkits import SymPyToolkit
             tools.extend(SymPyToolkit().get_tools())
-        # Future tool sets go here:
-        # elif name == "wolfram":
-        #     from camel.toolkits import WolframToolkit
-        #     tools.extend(WolframToolkit().get_tools())
-        # elif name == "code_exec":
-        #     ...
+        elif name == "python":
+            tools.append(FunctionTool(run_python))
     return tools
 
 

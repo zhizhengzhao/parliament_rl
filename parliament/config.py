@@ -34,7 +34,7 @@ ALLOW_SELF_RATING = False
 # =============================================================================
 # Tools — which external tool sets to load for scientists
 # =============================================================================
-TOOL_SETS = ["sympy"]              # options: "sympy" (more coming)
+TOOL_SETS = ["sympy", "python"]    # options: "sympy", "python"
 
 # =============================================================================
 # Experience (reserved for future use)

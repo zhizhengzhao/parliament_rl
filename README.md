@@ -109,7 +109,7 @@ python run_baseline.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,1,2     
 | `LLM_CONCURRENCY` | `5` | 每轮并发请求数 |
 | `VLLM_MAX_MODEL_LEN` | `131072` | vLLM context 长度（128K） |
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.90` | vLLM GPU 显存占用比例 |
-| `TOOL_SETS` | `["sympy"]` | 科学家可用工具包 |
+| `TOOL_SETS` | `["sympy", "python"]` | 科学家可用工具包：`"sympy"` 符号计算、`"python"` 代码执行 |
 | `EXPERIENCE_ENABLED` | `False` | 经验闭环（预留） |
 
 ### `run_benchmark.py` 命令行
