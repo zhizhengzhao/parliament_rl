@@ -357,7 +357,8 @@ async def run_session(
         fail_n = _patches.round_fail_count
         total_n = _patches.round_agent_count
         if total_n > 0 and fail_n / total_n >= AGENT_FAIL_THRESHOLD:
-            print(f"  {fail_n}/{total_n} agents failed — stopping.")
+            rollback_to(db_path, snap)
+            print(f"  {fail_n}/{total_n} agents failed — rolled back, stopping.")
             early_stopped = True
             stop_reason = "agent_failures"
             break

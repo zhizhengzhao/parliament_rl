@@ -19,7 +19,7 @@ VLLM_GPU_MEMORY_UTILIZATION = 0.90
 # =============================================================================
 # Parliament
 # =============================================================================
-DEFAULT_NUM_AGENTS = 20
+DEFAULT_NUM_AGENTS = 5
 NUM_ROUNDS = 20
 LLM_CONCURRENCY = 5
 MAX_ITERATION = 10
