@@ -287,12 +287,8 @@ def build_context(agent_id: int, agent_name: str, system_content: str) -> list[d
     except Exception:
         pass
 
-    # Section 5: Guidance
-    parts.append(
-        "Before posting anything new, consider: Is there a post you should "
-        "comment on? An error to challenge? Strong work to endorse? "
-        "A scientist to follow? You can do ALL of these in one round."
-    )
+    from prompts import ROUND_GUIDANCE
+    parts.append(ROUND_GUIDANCE)
 
     user_content = "\n".join(parts)
 
@@ -315,19 +311,7 @@ def context_overflows(messages: list[dict]) -> bool:
 # Compression — triggered only on context overflow
 # ---------------------------------------------------------------------------
 
-_COMPRESS_SYSTEM = "You are a concise scientific summarizer."
-
-_COMPRESS_PROMPT = """\
-Summarize the following scientific contribution. Preserve:
-- Core reasoning and approach
-- Key results, formulas, numerical values
-- Identified errors or open questions
-
-Keep the summary to 2-3 sentences. Output ONLY the summary, nothing else.
-
-<<<CONTENT>>>
-{content}
-<<<END>>>"""
+from prompts import COMPRESS_SYSTEM, COMPRESS_USER
 
 
 async def compress_posts(output_dir: str):
@@ -368,8 +352,8 @@ async def compress_posts(output_dir: str):
                         json={
                             "model": MODEL_NAME,
                             "messages": [
-                                {"role": "system", "content": _COMPRESS_SYSTEM},
-                                {"role": "user", "content": _COMPRESS_PROMPT.format(content=content)},
+                                {"role": "system", "content": COMPRESS_SYSTEM},
+                                {"role": "user", "content": COMPRESS_USER.format(content=content)},
                             ],
                             "max_tokens": 512,
                         },

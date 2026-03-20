@@ -99,13 +99,12 @@ def create_model(base_url: str | None = None):
 def _build_agents(model, agent_graph, tools, question, num_agents):
     """Create scientist agents with the question baked into their system prompt."""
     from camel.prompts import TextPrompt
-    from config import (
-        SCIENTIST_PROMPT_TEMPLATE, AVAILABLE_ACTIONS_LIST, get_agent_names,
-    )
+    from config import AVAILABLE_ACTIONS_LIST, get_agent_names
+    from prompts import SCIENTIST_SYSTEM
     from oasis import SocialAgent, UserInfo
     from oasis.social_platform.typing import ActionType
 
-    template = TextPrompt(SCIENTIST_PROMPT_TEMPLATE)
+    template = TextPrompt(SCIENTIST_SYSTEM)
     action_types = [ActionType[a] for a in AVAILABLE_ACTIONS_LIST]
     names = get_agent_names(num_agents)
 
@@ -231,7 +230,7 @@ async def run_session(
     from oasis.social_platform.channel import Channel
     from oasis.social_platform.platform import Platform
     from oasis.social_platform.typing import ActionType
-    from camel.toolkits import SymPyToolkit
+    from tools import load_tools
     from context import (
         reset as ctx_reset, compress_posts, rollback_to,
         build_context, context_overflows,
@@ -255,7 +254,7 @@ async def run_session(
 
     ctx_reset()
 
-    tools = SymPyToolkit().get_tools()
+    tools = load_tools()
     agent_graph = AgentGraph()
     agents = _build_agents(model, agent_graph, tools, question, num_agents)
 

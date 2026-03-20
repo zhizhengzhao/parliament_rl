@@ -10,13 +10,16 @@
 
 ```
 parliament/              # 核心议会系统
-├── config.py            # 所有可调参数（模型、agent、轮次、vLLM）
+├── config.py            # 参数（模型、agent、轮次、vLLM、工具集）
+├── prompts.py           # 所有 prompt 模板（scientist / compress）
+├── tools.py             # 工具加载 + OASIS 工具描述覆盖
 ├── context.py           # context 组装、压缩、回滚
 ├── patches.py           # OASIS monkey-patches
 ├── session.py           # 核心逻辑：init() / create_model() / run_session()
 ├── run_parliament.py    # CLI：demo 模式跑单题
 ├── visualize.py         # 生成单题 HTML 可视化
-└── serve.py             # HTTP 服务器（SSH 隧道访问）
+├── serve.py             # HTTP 服务器（SSH 隧道访问）
+└── experience/          # 经验闭环（预留）
 
 judgement/               # Judge + Benchmark
 ├── judge.py             # Judge：读论坛 → 综合最终答案
@@ -105,6 +108,8 @@ python run_baseline.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,1,2     
 | `LLM_CONCURRENCY` | `5` | 每轮并发请求数 |
 | `VLLM_MAX_MODEL_LEN` | `131072` | vLLM context 长度（128K） |
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.90` | vLLM GPU 显存占用比例 |
+| `TOOL_SETS` | `["sympy"]` | 科学家可用工具包 |
+| `EXPERIENCE_ENABLED` | `False` | 经验闭环（预留） |
 
 ### `run_benchmark.py` 命令行
 
