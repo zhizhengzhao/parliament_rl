@@ -344,6 +344,7 @@ async def run_session(
             try:
                 await env.step(actions)
             except ContextOverflowError:
+                rollback_to(db_path, snap)
                 print("  Still overflowing after compression — stopping.")
                 early_stopped = True
                 stop_reason = "context_overflow"

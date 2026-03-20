@@ -407,6 +407,7 @@ def rollback_to(db_path: str, snap: dict):
     c.execute("DELETE FROM comment_like WHERE rowid > ?", (snap["max_comment_like_rowid"],))
     c.execute("DELETE FROM comment_dislike WHERE rowid > ?", (snap["max_comment_dislike_rowid"],))
     c.execute("DELETE FROM follow WHERE rowid > ?", (snap["max_follow_rowid"],))
+    c.execute("DELETE FROM rec")
 
     # Recalculate denormalized counters — the DELETE above removed
     # like/dislike rows but left num_likes/num_dislikes on post/comment stale.
