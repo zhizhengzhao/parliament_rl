@@ -231,7 +231,7 @@ async def run_session(
     from config import (
         DEFAULT_NUM_AGENTS, NUM_ROUNDS, LLM_CONCURRENCY,
         MAX_ITERATION, REFRESH_REC_POST_COUNT, MAX_REC_POST_LEN,
-        ALLOW_SELF_RATING,
+        ALLOW_SELF_RATING, AGENT_FAIL_THRESHOLD,
     )
     import oasis
     from oasis import LLMAction, ManualAction, AgentGraph
@@ -243,7 +243,8 @@ async def run_session(
         reset as ctx_reset, compress_posts, rollback_to,
         build_context, context_overflows,
     )
-    from patches import ContextOverflowError
+    from patches import ContextOverflowError, reset_round_stats, round_fail_count, round_agent_count
+    import patches as _patches
 
     if num_agents is None:
         num_agents = DEFAULT_NUM_AGENTS
@@ -314,6 +315,7 @@ async def run_session(
 
     for round_num in range(1, num_rounds + 1):
         print(f"[Round {round_num}/{num_rounds}]")
+        _patches.reset_round_stats()
 
         # Snapshot before the round (for rollback)
         snap = _snapshot(db_path)
@@ -341,6 +343,7 @@ async def run_session(
 
             # Compression helped — retry this round
             print("  Compression done — retrying round...")
+            _patches.reset_round_stats()
             try:
                 await env.step(actions)
             except ContextOverflowError:
@@ -349,6 +352,15 @@ async def run_session(
                 early_stopped = True
                 stop_reason = "context_overflow"
                 break
+
+        # Check if too many agents failed (timeout / error) this round
+        fail_n = _patches.round_fail_count
+        total_n = _patches.round_agent_count
+        if total_n > 0 and fail_n / total_n >= AGENT_FAIL_THRESHOLD:
+            print(f"  {fail_n}/{total_n} agents failed — stopping.")
+            early_stopped = True
+            stop_reason = "agent_failures"
+            break
 
         _print_round_stats(db_path)
 

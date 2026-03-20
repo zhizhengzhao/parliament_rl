@@ -13,7 +13,7 @@ API_KEY = "EMPTY"
 # =============================================================================
 # vLLM serving
 # =============================================================================
-VLLM_MAX_MODEL_LEN = 131072       # 128K context
+VLLM_MAX_MODEL_LEN = 65536        # 64K context
 VLLM_GPU_MEMORY_UTILIZATION = 0.90
 
 # =============================================================================
@@ -23,6 +23,7 @@ DEFAULT_NUM_AGENTS = 20
 NUM_ROUNDS = 20
 LLM_CONCURRENCY = 5
 MAX_ITERATION = 10
+AGENT_FAIL_THRESHOLD = 0.5   # stop if >50% of agents fail/timeout in a round
 
 # =============================================================================
 # Platform

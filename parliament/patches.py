@@ -117,6 +117,16 @@ SocialAgent.perform_action_by_data = _patched_perform_action_by_data
 _agent_log = logging.getLogger("social.agent")
 _ALL_SOCIAL_ACTIONS = [action.value for action in ActionType]
 
+# Per-round failure tracking — session.py reads and resets these each round.
+round_fail_count = 0
+round_agent_count = 0
+
+
+def reset_round_stats():
+    global round_fail_count, round_agent_count
+    round_fail_count = 0
+    round_agent_count = 0
+
 
 def _log_anomaly(anomaly_type, agent, full_context, num_tokens, response, error=None):
     import json
@@ -170,8 +180,10 @@ def _log_anomaly(anomaly_type, agent, full_context, num_tokens, response, error=
 
 
 async def _patched_perform_action_by_llm(self):
+    global round_fail_count, round_agent_count
     from context import build_context, estimate_tokens, context_overflows
 
+    round_agent_count += 1
     agent_name = getattr(getattr(self, "user_info", None), "name", "?")
     messages = build_context(
         agent_id=self.social_agent_id,
@@ -211,6 +223,7 @@ async def _patched_perform_action_by_llm(self):
     except ContextOverflowError:
         raise
     except Exception as e:
+        round_fail_count += 1
         if "input tokens" in str(e).lower() and "context length" in str(e).lower():
             raise ContextOverflowError(str(e)) from e
         _agent_log.error(f"Agent {self.social_agent_id}: {e}")
