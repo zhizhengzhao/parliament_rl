@@ -1,11 +1,11 @@
 """
-Science Parliament — Baseline runner.
+Science Parliament — Baseline runner (no tools, single-turn).
 
-Direct model inference (no parliament discussion) as a control group.
+Direct model inference as a control group.
 One command does everything: start vLLM → batch inference → generate results page.
 
 Usage:
-    cd judgement
+    cd baseline
     python run_baseline.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0
     python run_baseline.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,1,2 --limit 20
 """
@@ -17,9 +17,11 @@ import os
 import random
 import sys
 from datetime import datetime
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 
-_parliament_dir = os.path.join(os.path.dirname(__file__), "..", "parliament")
-sys.path.insert(0, os.path.abspath(_parliament_dir))
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_project_root, "parliament"))
+sys.path.insert(0, os.path.join(_project_root, "judgement"))
 
 from session import OUTPUT_BASE
 from dataset import load_dataset, parse_gpu_ids
@@ -55,10 +57,6 @@ The answer between <<<FINAL>>> and <<<END>>> must be self-contained.\
 """
 
 
-# ---------------------------------------------------------------------------
-# Build prompt for a single question
-# ---------------------------------------------------------------------------
-
 def _build_prompt(question: str, choices: list[str] | None) -> str:
     parts = [question]
     if choices:
@@ -68,12 +66,7 @@ def _build_prompt(question: str, choices: list[str] | None) -> str:
     return "\n".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Async batch inference
-# ---------------------------------------------------------------------------
-
 async def _run_batch(questions: list[dict], ports: list[int], concurrency: int = 32):
-    """Send all questions to vLLM instances with async concurrency."""
     import httpx
     from config import MODEL_NAME
 
@@ -107,28 +100,24 @@ async def _run_batch(questions: list[dict], ports: list[int], concurrency: int =
                 raw_text = ""
                 answer = None
 
+            gt = q.get("ground_truth")
+            is_correct = None
+            if gt is not None and answer is not None:
+                is_correct = answer.strip("() ").upper() == str(gt).strip("() ").upper()
+
             results[idx] = {
                 "index": idx,
                 "question": q["question"][:500],
                 "choices": q.get("choices"),
-                "ground_truth": q.get("ground_truth"),
-                "baseline_answer": answer,
-                "raw_response": raw_text,
-                "port": port,
+                "ground_truth": gt,
+                "parliament_answer": answer,
+                "is_correct": is_correct,
+                "rounds_completed": 0,
+                "early_stopped": False,
+                "gpu": port,
             }
 
-            # Compare
-            gt = q.get("ground_truth")
-            if gt is not None and answer is not None:
-                results[idx]["is_correct"] = (
-                    answer.strip("() ").upper() == str(gt).strip("() ").upper()
-                )
-            else:
-                results[idx]["is_correct"] = None
-
-            status = "ok" if results[idx]["is_correct"] else (
-                "WRONG" if results[idx]["is_correct"] is False else "?"
-            )
+            status = "ok" if is_correct else ("WRONG" if is_correct is False else "?")
             print(f"  [{status}] Question {idx}: answer={answer}")
 
     async with httpx.AsyncClient() as client:
@@ -140,10 +129,6 @@ async def _run_batch(questions: list[dict], ports: list[int], concurrency: int =
 
     return results
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def run_baseline(
     dataset_path: str,
@@ -167,30 +152,20 @@ def run_baseline(
 
     ports = [8000 + g for g in gpu_ids]
 
-    # ── Step 1: Start vLLM ──────────────────────────────────────────────
     print("\n[1/3] Starting vLLM instances...")
     vllm_manager.start(gpu_ids)
     vllm_manager.wait_ready(gpu_ids)
 
-    # ── Step 2: Batch inference ─────────────────────────────────────────
     print(f"\n[2/3] Running baseline: {len(questions)} questions, {len(gpu_ids)} GPUs")
     results = asyncio.run(_run_batch(questions, ports))
 
-    # ── Step 3: Collect + visualize ─────────────────────────────────────
     print("\n[3/3] Generating results...")
     results_path = os.path.join(bench_dir, "results.jsonl")
-    correct = 0
-    total = 0
+    correct = total = 0
     with open(results_path, "w", encoding="utf-8") as f:
         for r in results:
             if r is None:
                 continue
-            # Rename for benchmark_viz compatibility
-            r["parliament_answer"] = r.pop("baseline_answer", None)
-            r.pop("raw_response", None)
-            r["rounds_completed"] = 0
-            r["early_stopped"] = False
-            r["gpu"] = r.pop("port", "?")
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
             total += 1
             if r.get("is_correct") is True:
@@ -198,13 +173,9 @@ def run_baseline(
 
     accuracy = correct / total if total > 0 else 0
     summary = {
-        "dataset": dataset_path,
-        "bench_name": bench_name,
-        "gpu_ids": gpu_ids,
-        "total": total,
-        "correct": correct,
-        "accuracy": accuracy,
-        "timestamp": timestamp,
+        "dataset": dataset_path, "bench_name": bench_name,
+        "gpu_ids": gpu_ids, "total": total, "correct": correct,
+        "accuracy": accuracy, "timestamp": timestamp,
     }
     with open(os.path.join(bench_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -218,7 +189,6 @@ def run_baseline(
     print(f"  Dashboard: {html_path}")
     print(f"{'='*70}")
 
-    from http.server import HTTPServer, SimpleHTTPRequestHandler
     print(f"\n  Serving at http://localhost:{serve_port}/")
     print(f"  SSH tunnel: ssh -p 8795 -L {serve_port}:localhost:{serve_port} root@your-server")
     print(f"  Press Ctrl+C to stop.\n")
@@ -234,7 +204,7 @@ def run_baseline(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Science Parliament Baseline")
+    parser = argparse.ArgumentParser(description="Science Parliament Baseline (no tools)")
     parser.add_argument("--dataset", required=True, help="Path to dataset")
     parser.add_argument("--gpus", type=str, default="0",
                         help="GPU IDs: '0', '0,1,2', '0-7' (default: 0)")
