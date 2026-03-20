@@ -15,10 +15,12 @@ import asyncio
 import json
 import os
 import sqlite3
+from datetime import date, timedelta
 
 from config import VLLM_MAX_MODEL_LEN
 
 CONTEXT_SAFETY_RATIO = 0.85
+_PARLIAMENT_START_DATE = "2026-03-17"
 
 # Per-agent high-water marks: agent_id → (last_seen_post_id, last_seen_comment_id)
 _watermarks: dict[int, tuple[int, int]] = {}
@@ -143,21 +145,51 @@ def _get_agent_actions(db_path: str, agent_id: int) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Date mapping via round_map.json
+# ---------------------------------------------------------------------------
+
+def _load_round_map(output_dir: str) -> list[dict] | None:
+    path = os.path.join(output_dir, "round_map.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _id_to_date(item_id: int, boundaries: list[dict], key: str) -> str:
+    """Map a post_id or comment_id to a date string."""
+    start = date.fromisoformat(_PARLIAMENT_START_DATE)
+    for entry in boundaries:
+        if item_id <= entry[key]:
+            return str(start + timedelta(days=entry["round"] - 1))
+    if boundaries:
+        return str(start + timedelta(days=boundaries[-1]["round"]))
+    return _PARLIAMENT_START_DATE
+
+
+# ---------------------------------------------------------------------------
 # Format posts for display
 # ---------------------------------------------------------------------------
 
-def _format_post(post: dict, compressed: bool = False) -> str:
+def _format_post(post: dict, compressed: bool = False, round_map: list[dict] | None = None) -> str:
     """Format a single post with its comments for context display."""
     pid = post["post_id"]
     score = post["score"] or 0
     author = post["author"]
 
+    date_tag = ""
+    if round_map:
+        date_tag = f" [{_id_to_date(pid, round_map, 'max_post_id')}]"
+
     if compressed and pid in _compressed_posts:
         content = _compressed_posts[pid]
-        lines = [f"Post #{pid} [score: {score:+d}] by {author} [summarized]"]
+        lines = [f"Post #{pid}{date_tag} [score: {score:+d}] by {author} [summarized]"]
     else:
         content = post["content"] or ""
-        lines = [f"Post #{pid} [score: {score:+d}] by {author}"]
+        lines = [f"Post #{pid}{date_tag} [score: {score:+d}] by {author}"]
     lines.append(content)
 
     comments = post.get("comments", [])
@@ -165,10 +197,13 @@ def _format_post(post: dict, compressed: bool = False) -> str:
         lines.append("  Comments:")
         for cm in comments:
             cid = cm["comment_id"]
+            cm_date = ""
+            if round_map:
+                cm_date = f"{_id_to_date(cid, round_map, 'max_comment_id')}, "
             if compressed and cid in _compressed_comments:
-                lines.append(f"  [{cm['score'] or 0:+d}] {cm['author']} [summarized]: {_compressed_comments[cid]}")
+                lines.append(f"  [{cm_date}{cm['score'] or 0:+d}] {cm['author']} [summarized]: {_compressed_comments[cid]}")
             else:
-                lines.append(f"  [{cm['score'] or 0:+d}] {cm['author']}: {cm['content'] or ''}")
+                lines.append(f"  [{cm_date}{cm['score'] or 0:+d}] {cm['author']}: {cm['content'] or ''}")
 
     return "\n".join(lines)
 
@@ -185,18 +220,15 @@ def build_context(agent_id: int, agent_name: str, system_content: str) -> list[d
     db_path = _db_path()
     output_dir = os.environ.get("PARLIAMENT_RUN_DIR", ".")
     _load_compressed(output_dir)
+    round_map = _load_round_map(output_dir)
 
     posts = _get_all_posts(db_path)
-
-    # Skip the automated opening post
     posts = [p for p in posts if not (
         p["post_id"] == 1 and "Parliament is now in session" in (p["content"] or "")
     )]
 
-    # Get this agent's watermarks
     prev_post_wm, prev_comment_wm = _watermarks.get(agent_id, (0, 0))
 
-    # Classify posts as old vs new/updated
     old_posts = []
     new_posts = []
     for p in posts:
@@ -209,40 +241,34 @@ def build_context(agent_id: int, agent_name: str, system_content: str) -> list[d
         else:
             old_posts.append(p)
 
-    # Update watermarks
     all_post_ids = [p["post_id"] for p in posts]
     all_comment_ids = [cm["comment_id"] for p in posts for cm in p.get("comments", [])]
     new_post_wm = max(all_post_ids) if all_post_ids else prev_post_wm
     new_comment_wm = max(all_comment_ids) if all_comment_ids else prev_comment_wm
     _watermarks[agent_id] = (new_post_wm, new_comment_wm)
 
-    # Agent's action history
     actions = _get_agent_actions(db_path, agent_id)
 
-    # Assemble user message
     parts = []
 
-    # Section 1: Earlier posts (no new activity)
     if old_posts:
         parts.append("EARLIER POSTS (no new activity since you last saw them):")
         for p in old_posts:
             use_compressed = p["post_id"] in _compressed_posts
-            parts.append(_format_post(p, compressed=use_compressed))
+            parts.append(_format_post(p, compressed=use_compressed, round_map=round_map))
         parts.append("")
 
-    # Section 2: Your previous actions
     if actions:
         parts.append("YOUR PREVIOUS ACTIONS:")
         for a in actions:
             parts.append(f"  - {a}")
         parts.append("")
 
-    # Section 3: New or updated posts
     if new_posts:
         label = "NEW OR UPDATED POSTS:" if old_posts else "FORUM POSTS:"
         parts.append(label)
         for p in new_posts:
-            parts.append(_format_post(p, compressed=False))
+            parts.append(_format_post(p, compressed=False, round_map=round_map))
         parts.append("")
     elif not old_posts:
         parts.append("No posts yet. You may be the first to contribute.\n")
@@ -304,7 +330,7 @@ Keep the summary to 2-3 sentences. Output ONLY the summary, nothing else.
 <<<END>>>"""
 
 
-async def compress_posts(model, output_dir: str):
+async def compress_posts(output_dir: str):
     """Compress all uncompressed posts/comments individually via batch HTTP requests."""
     import httpx
 
@@ -371,15 +397,24 @@ async def compress_posts(model, output_dir: str):
 # ---------------------------------------------------------------------------
 
 def rollback_to(db_path: str, max_post_id: int, max_comment_id: int, max_trace_rowid: int):
-    """Delete all posts, comments, and traces created after the given IDs."""
+    """Delete all data created after the given IDs + reset watermarks."""
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
     c.execute("DELETE FROM post WHERE post_id > ?", (max_post_id,))
     c.execute("DELETE FROM comment WHERE comment_id > ?", (max_comment_id,))
     c.execute("DELETE FROM trace WHERE rowid > ?", (max_trace_rowid,))
-    # Clean up likes/dislikes/follows that reference deleted content
     c.execute("DELETE FROM 'like' WHERE post_id > ?", (max_post_id,))
     c.execute("DELETE FROM 'dislike' WHERE post_id > ?", (max_post_id,))
+    # Also clean comment likes/dislikes and follows created this round
+    c.execute("DELETE FROM comment_like WHERE comment_id > ?", (max_comment_id,))
+    c.execute("DELETE FROM comment_dislike WHERE comment_id > ?", (max_comment_id,))
+    c.execute("DELETE FROM follow WHERE rowid > ?", (max_trace_rowid,))
     conn.commit()
     conn.close()
+
+    # Reset all agent watermarks to the rollback point so that
+    # retried round correctly classifies posts as new vs old
+    for agent_id in _watermarks:
+        _watermarks[agent_id] = (max_post_id, max_comment_id)
+
     print(f"  Rolled back: posts>{max_post_id}, comments>{max_comment_id}")

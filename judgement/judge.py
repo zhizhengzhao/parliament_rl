@@ -38,10 +38,10 @@ The forum posts below are presented with their community scores \
 more rigorous by the participating scientists. However, the majority \
 is not always right — use your own judgment.
 
-Each post and comment is dated (e.g. [2026-03-17], [2026-03-18]). \
-Later dates often correct or refine earlier work. Pay special \
-attention to later comments on early high-scored posts — they may \
-contain important corrections.
+Each post and comment is dated. Later contributions often correct or \
+refine earlier work. Pay special attention to later comments on \
+high-scored early posts — they may contain important corrections. \
+Posts marked [summarized] have been condensed; core reasoning is preserved.
 
 Instructions:
 - Read all posts and comments carefully.
@@ -50,7 +50,6 @@ Instructions:
   pick the one with better evidence.
 - If critical errors were identified in highly-scored posts, account \
   for those corrections.
-- Pay attention to the temporal flow: later work may supersede earlier claims.
 - Synthesize a single, definitive answer."""
 
 JUDGE_SYSTEM_PROMPT = _JUDGE_COMMON + """
@@ -104,6 +103,7 @@ def build_judge_context(
 
     output_dir = os.path.dirname(db_path)
     ctx._load_compressed(output_dir)
+    round_map = ctx._load_round_map(output_dir)
 
     posts = ctx._get_all_posts(db_path)
     posts = [p for p in posts if not (
@@ -122,13 +122,13 @@ def build_judge_context(
     sort_desc = "chronological order" if sort_mode == "time" else "community score, highest first"
     parts.append("\n" + "=" * 60)
     parts.append("PARLIAMENT DISCUSSION RECORD")
-    parts.append(f"(Posts in {sort_desc}. [summarized] = compressed due to length.)")
+    parts.append(f"(Posts in {sort_desc}. Each post is dated.)")
     parts.append("=" * 60)
 
     for post in posts:
         is_compressed = post["post_id"] in ctx._compressed_posts
         parts.append("")
-        parts.append(ctx._format_post(post, compressed=is_compressed))
+        parts.append(ctx._format_post(post, compressed=is_compressed, round_map=round_map))
 
     parts.append("\n" + "=" * 60)
     parts.append("Based on the above discussion, provide your final answer.")

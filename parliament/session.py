@@ -319,7 +319,7 @@ async def run_session(
             # Rollback this round, compress, then check if we can continue.
             print("  Context overflow detected — rolling back and compressing...")
             rollback_to(db_path, snap_pid, snap_cid, snap_rid)
-            await compress_posts(model, output_dir)
+            await compress_posts(output_dir)
 
             # Check if compression was enough
             test_msgs = build_context(

@@ -11,6 +11,7 @@
 ```
 parliament/              # 核心议会系统
 ├── config.py            # 所有可调参数（模型、agent、轮次、vLLM）
+├── context.py           # context 组装、压缩、回滚
 ├── patches.py           # OASIS monkey-patches
 ├── session.py           # 核心逻辑：init() / create_model() / run_session()
 ├── run_parliament.py    # CLI：demo 模式跑单题
@@ -112,6 +113,7 @@ python run_baseline.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,1,2     
 | `--dataset` | 必填 | 数据集路径 |
 | `--gpus` | `0-7` | GPU 编号：`0`、`0,1,2`、`0-7` |
 | `--limit` | 全部 | 只跑前 N 题 |
+| `--name` | 文件名 | benchmark 名称（影响输出目录名） |
 | `--port` | `18888` | 结果页面 HTTP 端口 |
 
 ---

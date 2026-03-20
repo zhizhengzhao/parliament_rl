@@ -13,7 +13,7 @@ API_KEY = "EMPTY"                              # vLLM doesn't need a real key
 # =============================================================================
 # vLLM serving parameters (used by judgement/vllm_manager.py)
 # =============================================================================
-VLLM_MAX_MODEL_LEN = 131072                   # 128K context (Qwen3.5 native)
+VLLM_MAX_MODEL_LEN = 131072                   # 128K context
 VLLM_GPU_MEMORY_UTILIZATION = 0.90
 
 # =============================================================================
@@ -95,6 +95,10 @@ Higher-scored content appears more prominently. When you endorse or \
 challenge something, you directly shape what other scientists see. \
 This is not a formality — it is how the parliament filters signal \
 from noise.
+
+Each round, the forum shows you what is new since your last turn \
+and what has not changed. Posts are dated so you can track how the \
+discussion evolved over time.
 
 When you follow a scientist, their contributions reliably appear in \
 the material you receive each round. Follow scientists whose thread \
