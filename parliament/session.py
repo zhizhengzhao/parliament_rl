@@ -195,6 +195,20 @@ def dump_discussion(db_path: str) -> list[dict]:
     return posts
 
 
+def _snapshot(db_path: str) -> tuple[int, int, int]:
+    """Capture current max IDs for rollback."""
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(MAX(post_id), 0) FROM post")
+    max_pid = c.fetchone()[0]
+    c.execute("SELECT COALESCE(MAX(comment_id), 0) FROM comment")
+    max_cid = c.fetchone()[0]
+    c.execute("SELECT COALESCE(MAX(rowid), 0) FROM trace")
+    max_rid = c.fetchone()[0]
+    conn.close()
+    return max_pid, max_cid, max_rid
+
+
 async def run_session(
     question: str,
     model,
@@ -205,19 +219,7 @@ async def run_session(
 ) -> dict:
     """Run a full Science Parliament session on one question.
 
-    This is the core function.  The caller must have called init() first.
-
-    Args:
-        question:   The problem to discuss.
-        model:      A CAMEL model instance (reusable across calls).
-        output_dir: Where to write parliament.db, session.json, index.html.
-        num_agents: Override config.DEFAULT_NUM_AGENTS.
-        num_rounds: Override config.NUM_ROUNDS.
-        concurrency: Override config.LLM_CONCURRENCY.
-
-    Returns:
-        dict with keys: question, num_rounds_completed, early_stopped,
-        num_agents, discussion, db_path.
+    The caller must have called init() first.
     """
     from config import (
         DEFAULT_NUM_AGENTS, NUM_ROUNDS, LLM_CONCURRENCY,
@@ -230,6 +232,11 @@ async def run_session(
     from oasis.social_platform.platform import Platform
     from oasis.social_platform.typing import ActionType
     from camel.toolkits import SymPyToolkit
+    from context import (
+        reset as ctx_reset, compress_posts, rollback_to,
+        build_context, context_overflows,
+    )
+    from patches import ContextOverflowError
 
     if num_agents is None:
         num_agents = DEFAULT_NUM_AGENTS
@@ -245,6 +252,8 @@ async def run_session(
     if os.path.exists(db_path):
         os.remove(db_path)
     os.environ["OASIS_DB_PATH"] = os.path.abspath(db_path)
+
+    ctx_reset()
 
     tools = SymPyToolkit().get_tools()
     agent_graph = AgentGraph()
@@ -292,13 +301,47 @@ async def run_session(
     idle_streak = 0
     prev_rowid = 0
     early_stopped = False
+    stop_reason = "max_rounds"
     actual_rounds = 0
-    round_boundaries = []  # [(round, max_post_id, max_comment_id), ...]
+    round_boundaries = []
 
     for round_num in range(1, num_rounds + 1):
         print(f"[Round {round_num}/{num_rounds}]")
+
+        # Snapshot before the round (for rollback)
+        snap_pid, snap_cid, snap_rid = _snapshot(db_path)
+
         actions = {agent: LLMAction() for agent in agents}
-        await env.step(actions)
+        try:
+            await env.step(actions)
+        except ContextOverflowError:
+            # An agent's context exceeded the safety limit.
+            # Rollback this round, compress, then check if we can continue.
+            print("  Context overflow detected — rolling back and compressing...")
+            rollback_to(db_path, snap_pid, snap_cid, snap_rid)
+            await compress_posts(model, output_dir)
+
+            # Check if compression was enough
+            test_msgs = build_context(
+                agent_id=0, agent_name="test",
+                system_content=agents[0].system_message.content,
+            )
+            if context_overflows(test_msgs):
+                print("  Still too large after compression — stopping.")
+                early_stopped = True
+                stop_reason = "context_overflow"
+                break
+
+            # Compression helped — retry this round
+            print("  Compression done — retrying round...")
+            try:
+                await env.step(actions)
+            except ContextOverflowError:
+                print("  Still overflowing after compression — stopping.")
+                early_stopped = True
+                stop_reason = "context_overflow"
+                break
+
         _print_round_stats(db_path)
 
         n_ctx, prev_rowid = _count_context_actions(db_path, prev_rowid)
@@ -310,14 +353,10 @@ async def run_session(
 
         actual_rounds = round_num
 
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        c.execute("SELECT COALESCE(MAX(post_id), 0) FROM post")
-        max_pid = c.fetchone()[0]
-        c.execute("SELECT COALESCE(MAX(comment_id), 0) FROM comment")
-        max_cid = c.fetchone()[0]
-        conn.close()
-        round_boundaries.append({"round": round_num, "max_post_id": max_pid, "max_comment_id": max_cid})
+        max_pid, max_cid, _ = _snapshot(db_path)
+        round_boundaries.append({
+            "round": round_num, "max_post_id": max_pid, "max_comment_id": max_cid,
+        })
 
         try:
             from visualize import generate_html
@@ -331,15 +370,15 @@ async def run_session(
         if idle_streak >= EARLY_STOP_ROUNDS:
             print(f"\n  Early stop: {EARLY_STOP_ROUNDS} consecutive idle rounds.")
             early_stopped = True
+            stop_reason = "idle"
             break
 
-    # Save round boundaries for Judge to map post/comment IDs to rounds
     rb_path = os.path.join(output_dir, "round_map.json")
     with open(rb_path, "w", encoding="utf-8") as f:
         json.dump(round_boundaries, f)
 
     print(f"\n{'='*70}")
-    label = "EARLY STOP" if early_stopped else "SESSION COMPLETE"
+    label = f"STOPPED ({stop_reason})" if early_stopped else "SESSION COMPLETE"
     print(f"{label} after {actual_rounds} rounds")
     print(f"{'='*70}\n")
 
@@ -349,6 +388,7 @@ async def run_session(
         "num_rounds": num_rounds,
         "num_rounds_completed": actual_rounds,
         "early_stopped": early_stopped,
+        "stop_reason": stop_reason,
         "num_agents": num_agents,
         "discussion": posts,
         "db_path": os.path.abspath(db_path),

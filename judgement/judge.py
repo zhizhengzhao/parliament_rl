@@ -82,37 +82,11 @@ Nothing else should appear between the markers.\
 
 # ---------------------------------------------------------------------------
 # Build the forum context for the Judge
+# Uses context.py's _get_all_posts and _format_post for consistency
+# with what scientists see (including compressed posts if applicable).
 # ---------------------------------------------------------------------------
 
-_PARLIAMENT_START_DATE = "2026-03-17"
-
-# Sort modes for judge context:
-#   "time"  — chronological order (post_id ascending)
-#   "score" — highest score first
-JUDGE_SORT_MODE = "time"
-
-
-def _load_round_map(db_path: str) -> list[dict] | None:
-    rm_path = os.path.join(os.path.dirname(db_path), "round_map.json")
-    if not os.path.exists(rm_path):
-        return None
-    try:
-        with open(rm_path, "r") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def _id_to_date(item_id: int, boundaries: list[dict], key: str) -> str:
-    """Map a post_id or comment_id to a date string via round_map."""
-    from datetime import date, timedelta
-    start = date.fromisoformat(_PARLIAMENT_START_DATE)
-    for entry in boundaries:
-        if item_id <= entry[key]:
-            return str(start + timedelta(days=entry["round"] - 1))
-    if boundaries:
-        return str(start + timedelta(days=boundaries[-1]["round"] - 1))
-    return _PARLIAMENT_START_DATE
+JUDGE_SORT_MODE = "time"   # "time" or "score"
 
 
 def build_judge_context(
@@ -121,45 +95,25 @@ def build_judge_context(
     choices: list[str] | None = None,
     sort_mode: str | None = None,
 ) -> str:
-    """Read parliament.db and format the discussion for the Judge.
+    """Read parliament.db and format the discussion for the Judge."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "parliament"))
+    import context as ctx
 
-    Args:
-        sort_mode: "time" (chronological) or "score" (highest score first).
-                   Defaults to JUDGE_SORT_MODE.
-    """
     if sort_mode is None:
         sort_mode = JUDGE_SORT_MODE
 
-    conn = sqlite3.connect(db_path, timeout=3)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    output_dir = os.path.dirname(db_path)
+    ctx._load_compressed(output_dir)
 
-    order_clause = "p.post_id ASC" if sort_mode == "time" else "score DESC, p.post_id ASC"
-    c.execute(f"""
-        SELECT p.post_id, u.name AS author, p.content,
-               (p.num_likes - p.num_dislikes) AS score
-        FROM post p JOIN user u ON p.user_id = u.user_id
-        ORDER BY {order_clause}
-    """)
-    posts = [dict(r) for r in c.fetchall()]
+    posts = ctx._get_all_posts(db_path)
+    posts = [p for p in posts if not (
+        p["post_id"] == 1 and "Parliament is now in session" in (p["content"] or "")
+    )]
 
-    cm_order = "cm.comment_id ASC" if sort_mode == "time" else "(cm.num_likes - cm.num_dislikes) DESC, cm.comment_id ASC"
-    c.execute(f"""
-        SELECT cm.comment_id, cm.post_id, u.name AS author, cm.content,
-               (cm.num_likes - cm.num_dislikes) AS score
-        FROM comment cm JOIN user u ON cm.user_id = u.user_id
-        ORDER BY cm.post_id, {cm_order}
-    """)
-    comments_by_post: dict[int, list[dict]] = {}
-    for r in c.fetchall():
-        d = dict(r)
-        comments_by_post.setdefault(d["post_id"], []).append(d)
-    conn.close()
-
-    round_map = _load_round_map(db_path)
+    if sort_mode == "score":
+        posts.sort(key=lambda p: -(p["score"] or 0))
 
     parts = ["THE PROBLEM:", question]
-
     if choices:
         parts.append("\nCHOICES:")
         for i, ch in enumerate(choices):
@@ -168,32 +122,13 @@ def build_judge_context(
     sort_desc = "chronological order" if sort_mode == "time" else "community score, highest first"
     parts.append("\n" + "=" * 60)
     parts.append("PARLIAMENT DISCUSSION RECORD")
-    parts.append(f"(Posts in {sort_desc}. Each post is dated.)")
+    parts.append(f"(Posts in {sort_desc}. [summarized] = compressed due to length.)")
     parts.append("=" * 60)
 
     for post in posts:
-        if post["post_id"] == 1 and "Parliament is now in session" in (post["content"] or ""):
-            continue
-        score = post["score"] or 0
-        date_tag = ""
-        if round_map:
-            date_tag = f" [{_id_to_date(post['post_id'], round_map, 'max_post_id')}]"
-        parts.append(
-            f"\n--- Post #{post['post_id']}{date_tag} "
-            f"[score: {score:+d}] by {post['author']} ---"
-        )
-        parts.append(post["content"] or "")
-        cmts = comments_by_post.get(post["post_id"], [])
-        if cmts:
-            parts.append("  Comments:")
-            for cm in cmts:
-                cm_date = ""
-                if round_map:
-                    cm_date = f"{_id_to_date(cm['comment_id'], round_map, 'max_comment_id')}, "
-                parts.append(
-                    f"  [{cm_date}{cm['score'] or 0:+d}] "
-                    f"{cm['author']}: {cm['content'] or ''}"
-                )
+        is_compressed = post["post_id"] in ctx._compressed_posts
+        parts.append("")
+        parts.append(ctx._format_post(post, compressed=is_compressed))
 
     parts.append("\n" + "=" * 60)
     parts.append("Based on the above discussion, provide your final answer.")

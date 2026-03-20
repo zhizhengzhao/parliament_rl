@@ -5,13 +5,12 @@ to a Science Parliament.  Import this module before creating any agents.
 Patches applied:
   1.  SocialAgent.__init__             — multi-step iterations per round
   2.  SocialAgent.perform_action_by_data — skip memory write (Qwen system-msg fix)
-  3.  SocialAgent.perform_action_by_llm  — parliament-style user message + anomaly log
-  4.  SocialEnvironment templates        — parliament-style environment descriptions
-  5.  SocialAction docstrings            — parliament-style tool descriptions
-  6.  Platform.refresh                   — merge followed scientists' posts
-  7.  Platform.search_posts              — clean JSON for agent display
-  8.  SocialAgent.perform_interview      — remove leftover twitter prompt
-  9.  Logger redirection                 — route OASIS logs to log/<timestamp>/
+  3.  SocialAgent.perform_action_by_llm  — context.py-based assembly + anomaly log
+  4.  SocialAction docstrings            — parliament-style tool descriptions
+  5.  Platform.refresh                   — merge followed scientists' posts
+  6.  Platform.search_posts              — clean JSON for agent display
+  7.  SocialAgent.perform_interview      — remove leftover twitter prompt
+  8.  Logger redirection                 — route OASIS logs to log/<timestamp>/
 """
 
 import logging
@@ -19,25 +18,17 @@ import os
 import random
 import sqlite3
 from datetime import datetime
-from string import Template
-
 from camel.messages import BaseMessage
 from camel.types import OpenAIBackendRole
 
 from oasis.social_agent.agent import SocialAgent
 from oasis.social_agent.agent_action import SocialAction
-from oasis.social_agent.agent_environment import SocialEnvironment
 from oasis.social_platform.database import get_db_path
 from oasis.social_platform.platform import Platform
 from oasis.social_platform.typing import ActionType, RecsysType
 
 _log_dir = os.environ.get("PARLIAMENT_LOG_DIR", "./log")
 os.makedirs(_log_dir, exist_ok=True)
-
-# Virtual start date for the parliament timeline.
-# Round 1 = this date, Round 2 = next day, etc.
-_PARLIAMENT_START_DATE = "2026-03-17"
-
 
 def _get_id_to_name() -> dict:
     """Query the database for a user_id → scientist name mapping."""
@@ -52,67 +43,31 @@ def _get_id_to_name() -> dict:
         return {}
 
 
-def _load_round_map() -> list[dict] | None:
-    """Load round_map.json from the current run directory."""
-    import json
-    run_dir = os.environ.get("PARLIAMENT_RUN_DIR", ".")
-    rm_path = os.path.join(run_dir, "round_map.json")
-    if not os.path.exists(rm_path):
-        return None
-    try:
-        with open(rm_path, "r") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def _id_to_date(item_id: int, boundaries: list[dict], key: str) -> str:
-    """Map a post_id or comment_id to a date string via round_map."""
-    from datetime import date, timedelta
-    start = date.fromisoformat(_PARLIAMENT_START_DATE)
-    for entry in boundaries:
-        if item_id <= entry[key]:
-            return str(start + timedelta(days=entry["round"] - 1))
-    if boundaries:
-        return str(start + timedelta(days=boundaries[-1]["round"] - 1))
-    return _PARLIAMENT_START_DATE
-
-
 def _clean_posts(posts: list, id_to_name: dict) -> list:
-    """Strip social-media artifacts and add scientist names + dates."""
-    round_map = _load_round_map()
-
+    """Clean search results for agent display (used by search_posts only)."""
     clean = []
     for post in posts:
         uid = post.get("user_id")
         author = id_to_name.get(uid, f"Scientist_{uid}")
-
         clean_comments = []
         for c in post.get("comments", []):
             cuid = c.get("user_id")
             cauthor = id_to_name.get(cuid, f"Scientist_{cuid}")
-            cm = {
+            clean_comments.append({
                 "comment_id": c["comment_id"],
                 "scientist_id": cuid,
                 "author": cauthor,
                 "content": c.get("content", ""),
                 "score": c.get("score", 0),
-            }
-            if round_map:
-                cm["date"] = _id_to_date(c["comment_id"], round_map, "max_comment_id")
-            clean_comments.append(cm)
-
-        p = {
+            })
+        clean.append({
             "post_id": post["post_id"],
             "scientist_id": uid,
             "author": author,
             "content": post.get("content", ""),
             "score": post.get("score", 0),
             "comments": clean_comments,
-        }
-        if round_map:
-            p["date"] = _id_to_date(post["post_id"], round_map, "max_post_id")
-        clean.append(p)
+        })
     return clean
 
 
@@ -253,123 +208,91 @@ def _log_anomaly(
 
 
 async def _patched_perform_action_by_llm(self):
-    env_prompt = await self.env.to_text_prompt()
-    user_msg = BaseMessage.make_user_message(
-        role_name="User",
-        content=(
-            "A new round has begun. Read the forum carefully.\n\n"
-            "Before posting anything new, consider: Is there a post "
-            "you should comment on? An error to challenge? Strong work "
-            "to endorse? A scientist to follow? You can do ALL of these "
-            "in one round. Use the full range of actions.\n\n"
-            f"{env_prompt}"
-        ),
+    from context import build_context, estimate_tokens, context_overflows
+
+    agent_name = getattr(
+        getattr(self, "user_info", None), "name", str(self.social_agent_id)
     )
 
-    # ── Capture the complete context BEFORE calling the model ──────────────
-    # memory.get_context() returns (list[OpenAI-format dicts], token_count).
-    # We capture it now (= all previous rounds) then append the current
-    # user_msg, so full_context exactly mirrors what the model will receive.
-    try:
-        history_messages, num_tokens = self.memory.get_context()
-    except Exception:
-        history_messages, num_tokens = [], 0
+    # Build context from scratch — no CAMEL memory accumulation
+    messages = build_context(
+        agent_id=self.social_agent_id,
+        agent_name=agent_name,
+        system_content=self.system_message.content,
+    )
 
-    full_context = (
-        [{"role": "system", "content": self.system_message.content}]
-        + list(history_messages)
-        + [{"role": "user", "content": user_msg.content}]
+    num_tokens = estimate_tokens(messages)
+
+    if context_overflows(messages):
+        _agent_log.warning(
+            f"Agent {self.social_agent_id} context overflow "
+            f"(~{num_tokens} tokens) — raising to trigger compression"
+        )
+        raise ContextOverflowError(
+            f"Context ~{num_tokens} tokens exceeds safety limit"
+        )
+
+    # Clear CAMEL memory so astep only sees our custom context.
+    # Without this, CAMEL accumulates all previous rounds' messages
+    # (including repeated forum snapshots), causing context explosion.
+    try:
+        self.memory.clear()
+    except AttributeError:
+        # Fallback: reset the internal records list directly
+        if hasattr(self.memory, 'records'):
+            self.memory.records.clear()
+        elif hasattr(self.memory, '_records'):
+            self.memory._records.clear()
+
+    user_msg = BaseMessage.make_user_message(
+        role_name="User", content=messages[-1]["content"],
     )
 
     try:
         _agent_log.info(
-            f"Agent {self.social_agent_id} observing environment "
-            f"(~{num_tokens} tokens in context)"
+            f"Agent {self.social_agent_id} ({agent_name}) "
+            f"observing (~{num_tokens} tokens)"
         )
         response = await self.astep(user_msg)
         tool_calls = response.info.get("tool_calls", [])
 
         if not tool_calls:
-            # Model replied but issued no tool call — record for debugging
-            _log_anomaly("no_tool_calls", self, full_context, num_tokens, response)
+            _log_anomaly("no_tool_calls", self, messages, num_tokens, response)
         else:
-            for tool_call in tool_calls:
-                action_name = tool_call.tool_name
-                args = tool_call.args
+            for tc in tool_calls:
                 _agent_log.info(
-                    f"Agent {self.social_agent_id} performed "
-                    f"action: {action_name} with args: {args}"
+                    f"Agent {self.social_agent_id} action: "
+                    f"{tc.tool_name} args={tc.args}"
                 )
-                if action_name not in _ALL_SOCIAL_ACTIONS:
+                if tc.tool_name not in _ALL_SOCIAL_ACTIONS:
                     _agent_log.info(
-                        f"Agent {self.social_agent_id} tool result: "
-                        f"{tool_call.result}"
+                        f"Agent {self.social_agent_id} tool result: {tc.result}"
                     )
 
         return response
 
+    except ContextOverflowError:
+        raise
     except Exception as e:
-        _agent_log.error(
-            f"Agent {self.social_agent_id} exception: {e}"
-        )
-        _log_anomaly("exception", self, full_context, num_tokens, None, error=e)
+        # If vLLM returned 400 due to context length, re-raise as
+        # ContextOverflowError so session.py can trigger compression.
+        err_msg = str(e).lower()
+        if "input tokens" in err_msg and "context length" in err_msg:
+            raise ContextOverflowError(str(e)) from e
+        _agent_log.error(f"Agent {self.social_agent_id} exception: {e}")
+        _log_anomaly("exception", self, messages, num_tokens, None, error=e)
         return e
+
+
+class ContextOverflowError(Exception):
+    """Raised when context exceeds safety limit, triggering compression."""
+    pass
 
 
 SocialAgent.perform_action_by_llm = _patched_perform_action_by_llm
 
 # ---------------------------------------------------------------------------
-# 4. SocialEnvironment templates
-# ---------------------------------------------------------------------------
-
-SocialEnvironment.followers_env_template = Template(
-    "$num_followers colleagues are following your work."
-)
-SocialEnvironment.follows_env_template = Template(
-    "You are following $num_follows colleagues."
-)
-SocialEnvironment.posts_env_template = Template(
-    "Here are the current contributions from the parliament:\n$posts"
-)
-SocialEnvironment.env_template = Template(
-    "$posts_env\n\n"
-    "$followers_env $follows_env\n\n"
-    "Look at the scores. Which posts deserve endorsement? Which have "
-    "errors worth challenging? Who should you follow? Is there a "
-    "comment you should leave before writing a new post?"
-)
-
-
-async def _patched_to_text_prompt(self, **kwargs):
-    import json
-
-    followers_env = await self.get_followers_env()
-    follows_env = await self.get_follows_env()
-
-    posts = await self.action.refresh()
-    if posts["success"]:
-        id_to_name = _get_id_to_name()
-        clean = _clean_posts(posts["posts"], id_to_name)
-        posts_env = self.posts_env_template.substitute(
-            posts=json.dumps(clean, indent=4, ensure_ascii=False)
-        )
-    else:
-        posts_env = (
-            "No contributions have been posted yet. "
-            "You may be the first to share your analysis."
-        )
-
-    return self.env_template.substitute(
-        followers_env=followers_env,
-        follows_env=follows_env,
-        posts_env=posts_env,
-    )
-
-
-SocialEnvironment.to_text_prompt = _patched_to_text_prompt
-
-# ---------------------------------------------------------------------------
-# 5. SocialAction docstrings
+# 4. SocialAction docstrings
 # ---------------------------------------------------------------------------
 
 SocialAction.create_post.__doc__ = (
