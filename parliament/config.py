@@ -20,7 +20,7 @@ VLLM_GPU_MEMORY_UTILIZATION = 0.90
 # Parliament
 # =============================================================================
 DEFAULT_NUM_AGENTS = 5
-NUM_ROUNDS = 20
+NUM_ROUNDS = 10
 LLM_CONCURRENCY = 5
 MAX_ITERATION = 10
 AGENT_FAIL_THRESHOLD = 0.5   # stop if >50% of agents fail/timeout in a round

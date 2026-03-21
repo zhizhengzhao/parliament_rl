@@ -11,7 +11,9 @@ See run_parliament.py for demo usage, or judgement/run_benchmark.py for batch us
 
 import json
 import os
+import shutil
 import sqlite3
+import time
 
 # ---------------------------------------------------------------------------
 # Project root — all output paths are relative to this, regardless of cwd.
@@ -231,7 +233,7 @@ async def run_session(
     from config import (
         DEFAULT_NUM_AGENTS, NUM_ROUNDS, LLM_CONCURRENCY,
         MAX_ITERATION, REFRESH_REC_POST_COUNT, MAX_REC_POST_LEN,
-        ALLOW_SELF_RATING, AGENT_FAIL_THRESHOLD,
+        ALLOW_SELF_RATING, AGENT_FAIL_THRESHOLD, VLLM_MAX_MODEL_LEN,
     )
     import oasis
     from oasis import LLMAction, ManualAction, AgentGraph
@@ -262,6 +264,17 @@ async def run_session(
     os.environ["OASIS_DB_PATH"] = os.path.abspath(db_path)
 
     ctx_reset()
+    session_t0 = time.time()
+
+    _patches.log_event({
+        "event": "session_start",
+        "question": question[:500],
+        "num_agents": num_agents,
+        "num_rounds": num_rounds,
+        "concurrency": concurrency,
+        "max_iteration": MAX_ITERATION,
+        "vllm_max_model_len": VLLM_MAX_MODEL_LEN,
+    })
 
     tools = load_tools()
     agent_graph = AgentGraph()
@@ -316,6 +329,7 @@ async def run_session(
     for round_num in range(1, num_rounds + 1):
         print(f"[Round {round_num}/{num_rounds}]")
         _patches.reset_round_stats()
+        round_t0 = time.time()
 
         # Snapshot before the round (for rollback)
         snap = _snapshot(db_path)
@@ -327,6 +341,7 @@ async def run_session(
             # An agent's context exceeded the safety limit.
             # Rollback this round, compress, then check if we can continue.
             print("  Context overflow detected — rolling back and compressing...")
+            _patches.log_event({"event": "overflow", "round": round_num, "action": "rollback_and_compress"})
             rollback_to(db_path, snap)
             await compress_posts(output_dir)
 
@@ -373,8 +388,21 @@ async def run_session(
             idle_streak = 0
 
         actual_rounds = round_num
+        round_duration = round(time.time() - round_t0, 2)
 
         end_snap = _snapshot(db_path)
+
+        _patches.log_event({
+            "event": "round_end",
+            "round": round_num,
+            "duration_s": round_duration,
+            "agents_succeeded": _patches.round_agent_count - _patches.round_fail_count,
+            "agents_failed": _patches.round_fail_count,
+            "posts": end_snap["max_post_id"],
+            "comments": end_snap["max_comment_id"],
+            "context_actions": n_ctx,
+            "idle_streak": idle_streak,
+        })
         round_boundaries.append({
             "round": round_num,
             "max_post_id": end_snap["max_post_id"],
@@ -429,6 +457,14 @@ async def run_session(
         score_str = f"+{p['score']}" if p['score'] >= 0 else str(p['score'])
         preview = (p["content"] or "")[:120].replace("\n", " ")
         print(f"  [{score_str}] {p['author']}: {preview}...")
+
+    _patches.log_event({
+        "event": "session_end",
+        "total_rounds": actual_rounds,
+        "stop_reason": stop_reason,
+        "total_posts": len(posts),
+        "duration_s": round(time.time() - session_t0, 2),
+    })
 
     await env.close()
     return session

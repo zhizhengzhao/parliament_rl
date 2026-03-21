@@ -43,6 +43,11 @@ refine earlier work. Pay special attention to later comments on \
 high-scored early posts — they may contain important corrections. \
 Posts marked [summarized] have been condensed; core reasoning is preserved.
 
+The parliament may not have reached a definitive conclusion. That is \
+fine — you are the final decision-maker. Even if the discussion is \
+incomplete or inconclusive, you must still provide your best answer \
+based on the evidence available, combined with your own expertise.
+
 Instructions:
 - Read all posts and comments carefully.
 - Identify the strongest line of reasoning in the discussion.
@@ -50,7 +55,9 @@ Instructions:
   pick the one with better evidence.
 - If critical errors were identified in highly-scored posts, account \
   for those corrections.
-- Synthesize a single, definitive answer."""
+- Synthesize a single, definitive answer.
+- You MUST always provide an answer — never refuse or say the \
+  discussion was insufficient."""
 
 JUDGE_SYSTEM_PROMPT = _JUDGE_COMMON + """
 
@@ -155,35 +162,57 @@ async def run_judge(
     model,
     choices: list[str] | None = None,
     output_dir: str | None = None,
+    max_attempts: int = 2,
 ) -> dict:
-    """Invoke the Judge to synthesize a final answer from the parliament."""
+    """Invoke the Judge to synthesize a final answer from the parliament.
+
+    Retries up to max_attempts if the first attempt fails or returns no answer.
+    """
     from camel.agents import ChatAgent
     from camel.messages import BaseMessage
 
     system_prompt = JUDGE_SYSTEM_PROMPT_CHOICES if choices else JUDGE_SYSTEM_PROMPT
     user_message = build_judge_context(db_path, question, choices)
 
-    agent = ChatAgent(
-        system_message=BaseMessage.make_assistant_message(
-            role_name="Judge",
-            content=system_prompt,
-        ),
-        model=model,
-    )
-    user_msg = BaseMessage.make_user_message(
-        role_name="User",
-        content=user_message,
-    )
+    raw_text = ""
+    answer = None
+    error_log = []
 
-    response = await agent.astep(user_msg)
-    raw_text = response.msgs[0].content if response.msgs else ""
-    answer = extract_answer(raw_text)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            agent = ChatAgent(
+                system_message=BaseMessage.make_assistant_message(
+                    role_name="Judge",
+                    content=system_prompt,
+                ),
+                model=model,
+            )
+            user_msg = BaseMessage.make_user_message(
+                role_name="User",
+                content=user_message,
+            )
+
+            response = await agent.astep(user_msg)
+            raw_text = response.msgs[0].content if response.msgs else ""
+            answer = extract_answer(raw_text)
+
+            if answer is not None:
+                break
+
+            error_log.append(f"attempt {attempt}: no <<<FINAL>>> marker found")
+            print(f"[Judge] Attempt {attempt}: no answer marker, {'retrying' if attempt < max_attempts else 'giving up'}...")
+
+        except Exception as e:
+            error_log.append(f"attempt {attempt}: {e}")
+            print(f"[Judge] Attempt {attempt} error: {e}")
 
     result = {
         "answer": answer,
         "raw_response": raw_text,
         "system_prompt": system_prompt,
         "user_message": user_message,
+        "attempts": len(error_log) + (1 if answer else 0),
+        "errors": error_log if error_log else None,
     }
 
     if output_dir:

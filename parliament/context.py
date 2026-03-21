@@ -81,7 +81,7 @@ def _get_all_posts(db_path: str) -> list[dict]:
     c = conn.cursor()
 
     c.execute("""
-        SELECT p.post_id, u.name AS author, p.content,
+        SELECT p.post_id, p.user_id, u.name AS author, p.content,
                (p.num_likes - p.num_dislikes) AS score
         FROM post p JOIN user u ON p.user_id = u.user_id
         ORDER BY p.post_id ASC
@@ -90,7 +90,7 @@ def _get_all_posts(db_path: str) -> list[dict]:
     post_map = {p["post_id"]: p for p in posts}
 
     c.execute("""
-        SELECT cm.comment_id, cm.post_id, u.name AS author, cm.content,
+        SELECT cm.comment_id, cm.post_id, cm.user_id, u.name AS author, cm.content,
                (cm.num_likes - cm.num_dislikes) AS score
         FROM comment cm JOIN user u ON cm.user_id = u.user_id
         ORDER BY cm.comment_id ASC
@@ -191,12 +191,13 @@ def _format_post(post: dict, compressed: bool = False, round_map: list[dict] | N
     if round_map:
         date_tag = f" [{_id_to_date(pid, round_map, 'max_post_id')}]"
 
+    uid = post.get("user_id", "?")
     if compressed and pid in _compressed_posts:
         content = _compressed_posts[pid]
-        lines = [f"Post #{pid}{date_tag} [score: {score:+d}] by {author} [summarized]"]
+        lines = [f"Post #{pid}{date_tag} [score: {score:+d}] by {author} (scientist_id:{uid}) [summarized]"]
     else:
         content = post["content"] or ""
-        lines = [f"Post #{pid}{date_tag} [score: {score:+d}] by {author}"]
+        lines = [f"Post #{pid}{date_tag} [score: {score:+d}] by {author} (scientist_id:{uid})"]
     lines.append(content)
 
     comments = post.get("comments", [])
@@ -204,13 +205,14 @@ def _format_post(post: dict, compressed: bool = False, round_map: list[dict] | N
         lines.append("  Comments:")
         for cm in comments:
             cid = cm["comment_id"]
+            cm_uid = cm.get("user_id", "?")
             cm_date = ""
             if round_map:
                 cm_date = f"{_id_to_date(cid, round_map, 'max_comment_id')}, "
             if compressed and cid in _compressed_comments:
-                lines.append(f"  [{cm_date}{cm['score'] or 0:+d}] {cm['author']} [summarized]: {_compressed_comments[cid]}")
+                lines.append(f"  [comment_id:{cid}, {cm_date}{cm['score'] or 0:+d}] {cm['author']} (scientist_id:{cm_uid}) [summarized]: {_compressed_comments[cid]}")
             else:
-                lines.append(f"  [{cm_date}{cm['score'] or 0:+d}] {cm['author']}: {cm['content'] or ''}")
+                lines.append(f"  [comment_id:{cid}, {cm_date}{cm['score'] or 0:+d}] {cm['author']} (scientist_id:{cm_uid}): {cm['content'] or ''}")
 
     return "\n".join(lines)
 

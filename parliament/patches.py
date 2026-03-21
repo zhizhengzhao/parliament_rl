@@ -13,10 +13,13 @@ Patches:
   8. Logger redirection                 — route to log/<timestamp>/
 """
 
+import json as _json
 import logging
 import os
 import random
 import sqlite3
+import time
+import traceback as _tb
 from datetime import datetime
 
 from camel.messages import BaseMessage
@@ -102,6 +105,23 @@ SocialAgent.__init__ = _patched_init
 
 async def _patched_perform_action_by_data(self, func_name, *args, **kwargs):
     func_name = func_name.value if isinstance(func_name, ActionType) else func_name
+
+    if func_name == "follow":
+        followee_id = kwargs.get("followee_id") or (args[0] if args else None)
+        if followee_id is not None:
+            try:
+                conn = sqlite3.connect(get_db_path())
+                c = conn.cursor()
+                c.execute("SELECT user_id FROM user WHERE user_id = ?", (followee_id,))
+                valid = c.fetchone() is not None
+                conn.close()
+            except Exception:
+                valid = False
+            if not valid:
+                return {"success": False, "error": f"scientist_id {followee_id} does not exist"}
+            if followee_id == self.social_agent_id:
+                return {"success": False, "error": "cannot follow yourself"}
+
     for tool in self.env.action.get_openai_function_list():
         if tool.func.__name__ == func_name:
             return await tool.func(*args, **kwargs)
@@ -128,53 +148,14 @@ def reset_round_stats():
     round_agent_count = 0
 
 
-def _log_anomaly(anomaly_type, agent, full_context, num_tokens, response, error=None):
-    import json
-    import traceback
-
+def log_event(data: dict):
+    """Append a JSON event to run_log.jsonl in the current run directory."""
     run_dir = os.environ.get("PARLIAMENT_RUN_DIR", ".")
-    path = os.path.join(run_dir, "anomalies.jsonl")
-
-    def _safe(obj):
-        try:
-            json.dumps(obj, ensure_ascii=False)
-            return obj
-        except (TypeError, ValueError):
-            return str(obj)
-
-    ctx = [
-        {k: _safe(v) for k, v in m.items()} if isinstance(m, dict) else str(m)
-        for m in full_context
-    ]
-    record = {
-        "timestamp": datetime.now().isoformat(),
-        "type": anomaly_type,
-        "agent_id": agent.social_agent_id,
-        "agent_name": getattr(getattr(agent, "user_info", None), "name", "?"),
-        "num_tokens": num_tokens,
-        "context": ctx,
-        "response_text": None,
-        "tool_calls": [],
-        "error": (
-            "".join(traceback.format_exception(type(error), error, error.__traceback__))
-            if error else None
-        ),
-    }
-    if response is not None:
-        try:
-            record["response_text"] = response.msgs[0].content if response.msgs else None
-        except Exception:
-            pass
-        try:
-            record["tool_calls"] = [
-                {"name": tc.tool_name, "args": tc.args, "result": str(tc.result)}
-                for tc in response.info.get("tool_calls", [])
-            ]
-        except Exception:
-            pass
+    path = os.path.join(run_dir, "run_log.jsonl")
+    data["timestamp"] = datetime.now().isoformat()
     try:
         with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.write(_json.dumps(data, ensure_ascii=False, default=str) + "\n")
     except Exception:
         pass
 
@@ -184,6 +165,7 @@ async def _patched_perform_action_by_llm(self):
     from context import build_context, estimate_tokens, context_overflows
 
     round_agent_count += 1
+    t0 = time.time()
     agent_name = getattr(getattr(self, "user_info", None), "name", "?")
     messages = build_context(
         agent_id=self.social_agent_id,
@@ -211,12 +193,23 @@ async def _patched_perform_action_by_llm(self):
         _agent_log.info(f"Agent {self.social_agent_id} ({agent_name}) ~{num_tokens} tokens")
         response = await self.astep(user_msg)
         tool_calls = response.info.get("tool_calls", [])
+        duration = round(time.time() - t0, 2)
 
-        if not tool_calls:
-            _log_anomaly("no_tool_calls", self, messages, num_tokens, response)
-        else:
-            for tc in tool_calls:
-                _agent_log.info(f"Agent {self.social_agent_id}: {tc.tool_name} {tc.args}")
+        tc_list = []
+        for tc in tool_calls:
+            _agent_log.info(f"Agent {self.social_agent_id}: {tc.tool_name} {tc.args}")
+            tc_list.append({"name": tc.tool_name, "args": tc.args, "result": str(tc.result)[:200]})
+
+        log_event({
+            "event": "agent_done",
+            "agent_id": self.social_agent_id,
+            "agent_name": agent_name,
+            "tokens": num_tokens,
+            "duration_s": duration,
+            "success": True,
+            "tool_calls": tc_list,
+            "response_preview": (response.msgs[0].content[:300] if response.msgs else None),
+        })
 
         return response
 
@@ -224,10 +217,23 @@ async def _patched_perform_action_by_llm(self):
         raise
     except Exception as e:
         round_fail_count += 1
+        duration = round(time.time() - t0, 2)
+
+        log_event({
+            "event": "agent_done",
+            "agent_id": self.social_agent_id,
+            "agent_name": agent_name,
+            "tokens": num_tokens,
+            "duration_s": duration,
+            "success": False,
+            "error_type": type(e).__name__,
+            "error": str(e)[:500],
+            "traceback": "".join(_tb.format_exception(type(e), e, e.__traceback__))[-1000:],
+        })
+
         if "input tokens" in str(e).lower() and "context length" in str(e).lower():
             raise ContextOverflowError(str(e)) from e
         _agent_log.error(f"Agent {self.social_agent_id}: {e}")
-        _log_anomaly("exception", self, messages, num_tokens, None, error=e)
         return e
 
 

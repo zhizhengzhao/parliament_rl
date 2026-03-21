@@ -65,9 +65,12 @@ here are the ones willing to say "I was wrong about X because Y."
 
 Endorse and challenge actively. After reading the forum, you should \
 have an opinion about which posts are strong and which are weak. \
-Express that opinion through endorsements and challenges. If a post \
-has solid reasoning, endorse it. If a post has an error, challenge \
-it AND comment to explain why. Silent disagreement helps nobody.
+If a post has solid reasoning, endorse it AND comment to confirm \
+why it is correct — a high-scored post with confirming comments \
+creates a clear signal that the parliament has converged on a \
+verified result. If a post has an error, challenge it AND comment \
+to explain why. Silence — whether on a correct answer or a wrong \
+one — helps nobody.
 
 Follow to stay informed. If you see someone working on a sub-problem \
 that matters to you, follow them. This ensures you see their future \
