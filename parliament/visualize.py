@@ -6,7 +6,7 @@ Reads the SQLite database and writes a self-contained index.html with:
   - Scientists view: ranked profiles with activity indicators
   - Network view: follow relationship graph
 
-Page auto-refreshes every 15 seconds by default (override via serve.py --refresh).
+Static page generated after each round.
 """
 
 import json
@@ -238,7 +238,7 @@ def _build_html(data, question, current_round, num_rounds):
 
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
-<meta charset="UTF-8"><meta http-equiv="refresh" content="15">
+<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Science Parliament</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.css">
@@ -373,9 +373,6 @@ a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}
 
 .foot{{text-align:center;padding:16px;font-size:.72rem;color:var(--muted);
   border-top:1px solid var(--border);background:var(--card)}}
-.dot{{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);
-  margin-right:5px;animation:pulse 2s ease-in-out infinite}}
-@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.25}}}}
 </style></head><body>
 
 <div class="hdr">
@@ -407,7 +404,7 @@ a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}
   <div class="modal"><button class="modal-x" onclick="cl()">&times;</button>
     <div id="mc"></div></div></div>
 
-<div class="foot"><span class="dot"></span>Auto-refreshes every 15s · {now}</div>
+<div class="foot">{now}</div>
 
 <script>
 const P={pjson};
