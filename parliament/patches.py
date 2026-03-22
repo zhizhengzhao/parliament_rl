@@ -115,8 +115,11 @@ _TOOL_ALIASES = {
 
 
 async def _patched_perform_action_by_data(self, func_name, *args, **kwargs):
-    func_name = func_name.value if isinstance(func_name, ActionType) else func_name
-    func_name = _TOOL_ALIASES.get(func_name, func_name)
+    raw_name = func_name.value if isinstance(func_name, ActionType) else func_name
+    func_name = _TOOL_ALIASES.get(raw_name, raw_name)
+    if func_name != raw_name:
+        log_event({"event": "tool_alias", "agent_id": self.social_agent_id,
+                   "from": raw_name, "to": func_name})
 
     if func_name == "follow":
         followee_id = kwargs.get("followee_id") or (args[0] if args else None)

@@ -149,15 +149,29 @@ def build_judge_context(
 def extract_answer(response_text: str) -> str | None:
     """Parse the FINAL...END block from the Judge's response.
 
-    Tolerates variations like >>>FINAL>>>, **FINAL**, <<<FINAL>>>, etc.
-    Falls back to finding the last (A)/(B)/(C)/(D) in the text.
+    Tolerates marker variations (>>>, <<<, **).  If the block contains
+    a long explanation instead of just the answer, extracts the last
+    (A)/(B)/(C)/(D) from it.  Falls back to the last choice letter
+    anywhere in the full response.
     """
-    m = re.search(r"[<>]{3}\s*FINAL\s*[<>]{3}\s*(.+?)\s*[<>]{3}\s*END\s*[<>]{3}", response_text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r"\*{2,3}\s*FINAL\s*\*{2,3}\s*(.+?)\s*\*{2,3}\s*END\s*\*{2,3}", response_text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
+    block = None
+    for pattern in (
+        r"[<>]{3}\s*FINAL\s*[<>]{3}\s*(.+?)\s*[<>]{3}\s*END\s*[<>]{3}",
+        r"\*{2,3}\s*FINAL\s*\*{2,3}\s*(.+?)\s*\*{2,3}\s*END\s*\*{2,3}",
+    ):
+        m = re.search(pattern, response_text, re.DOTALL)
+        if m:
+            block = m.group(1).strip()
+            break
+
+    if block:
+        if len(block) <= 20:
+            return block
+        choices = re.findall(r"\(([A-D])\)", block)
+        if choices:
+            return f"({choices[-1]})"
+        return block
+
     choices = re.findall(r"\(([A-D])\)", response_text)
     if choices:
         return f"({choices[-1]})"
@@ -185,6 +199,7 @@ async def run_judge(
 
     system_prompt = JUDGE_SYSTEM_PROMPT_CHOICES if choices else JUDGE_SYSTEM_PROMPT
     user_message = build_judge_context(db_path, question, choices)
+    judge_tokens = (len(system_prompt) + len(user_message)) // 4
 
     raw_text = ""
     answer = None
@@ -223,6 +238,7 @@ async def run_judge(
         "raw_response": raw_text,
         "system_prompt": system_prompt,
         "user_message": user_message,
+        "judge_tokens": judge_tokens,
         "attempts": len(error_log) + (1 if answer else 0),
         "errors": error_log if error_log else None,
     }

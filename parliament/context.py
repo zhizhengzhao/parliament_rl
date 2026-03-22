@@ -295,8 +295,23 @@ def build_context(agent_id: int, agent_name: str, system_content: str) -> list[d
     except Exception:
         pass
 
-    from prompts import ROUND_GUIDANCE
+    import re as _re
+    q_match = _re.search(r"--- PROBLEM ---\s*(.+?)\s*--- END PROBLEM ---", system_content, _re.DOTALL)
+    if q_match:
+        q_reminder = q_match.group(1).strip()[:300]
+        parts.append(f"REMINDER — The problem you are solving: {q_reminder}{'...' if len(q_match.group(1).strip()) > 300 else ''}\n")
+
+    from prompts import ROUND_GUIDANCE, LATE_ROUND_NUDGE
     parts.append(ROUND_GUIDANCE)
+
+    round_info = os.environ.get("PARLIAMENT_ROUND", "")
+    if round_info:
+        try:
+            cur, tot = map(int, round_info.split("/"))
+            if tot > 0 and cur / tot >= 0.7:
+                parts.append(f"\n[Round {cur}/{tot}] " + LATE_ROUND_NUDGE)
+        except ValueError:
+            pass
 
     user_content = "\n".join(parts)
 

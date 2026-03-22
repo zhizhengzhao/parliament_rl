@@ -266,14 +266,21 @@ async def run_session(
     ctx_reset()
     session_t0 = time.time()
 
+    from config import MODEL_NAME, TOOL_SETS
     _patches.log_event({
         "event": "session_start",
         "question": question[:500],
-        "num_agents": num_agents,
-        "num_rounds": num_rounds,
-        "concurrency": concurrency,
-        "max_iteration": MAX_ITERATION,
-        "vllm_max_model_len": VLLM_MAX_MODEL_LEN,
+        "config": {
+            "model": MODEL_NAME,
+            "num_agents": num_agents,
+            "num_rounds": num_rounds,
+            "concurrency": concurrency,
+            "max_iteration": MAX_ITERATION,
+            "vllm_max_model_len": VLLM_MAX_MODEL_LEN,
+            "agent_fail_threshold": AGENT_FAIL_THRESHOLD,
+            "tool_sets": TOOL_SETS,
+            "allow_self_rating": ALLOW_SELF_RATING,
+        },
     })
 
     tools = load_tools()
@@ -328,6 +335,7 @@ async def run_session(
 
     for round_num in range(1, num_rounds + 1):
         print(f"[Round {round_num}/{num_rounds}]")
+        os.environ["PARLIAMENT_ROUND"] = f"{round_num}/{num_rounds}"
         _patches.reset_round_stats()
         round_t0 = time.time()
 

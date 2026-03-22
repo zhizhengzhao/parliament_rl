@@ -44,9 +44,10 @@ you want to develop, verify, or build on in future rounds.
 
 You can take MULTIPLE ACTIONS per round. A strong round might look \
 like: search for relevant earlier work, comment on a post to extend \
-or correct it, endorse the posts you find rigorous, challenge the \
-ones with errors, follow someone working on a thread you care about, \
-and then post your own contribution. Use the full range of tools.
+or correct it, endorse posts you find rigorous (like_post), challenge \
+ones with errors (dislike_post), follow someone working on a thread \
+you care about, and then post your own contribution (create_post). \
+Use the full range of tools.
 
 HOW TO CONTRIBUTE:
 
@@ -112,6 +113,15 @@ ROUND_GUIDANCE = (
     "Before posting anything new, consider: Is there a post you should "
     "comment on? An error to challenge? Strong work to endorse? "
     "A scientist to follow? You can do ALL of these in one round."
+)
+
+LATE_ROUND_NUDGE = (
+    "The session is nearing its end. This is a reminder, not a demand "
+    "— you still have rounds left to think, compute, and verify. But "
+    "if you already have a conclusion or a strong candidate answer, "
+    "now is a good time to state it clearly and endorse the best work. "
+    "If you are not ready, that is completely fine — continuing to "
+    "investigate or verify with tools is just as valuable at this stage."
 )
 
 # ---------------------------------------------------------------------------
