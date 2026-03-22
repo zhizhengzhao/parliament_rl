@@ -147,9 +147,21 @@ def build_judge_context(
 # ---------------------------------------------------------------------------
 
 def extract_answer(response_text: str) -> str | None:
-    """Parse the <<<FINAL>>>...<<<END>>> block from the Judge's response."""
-    m = re.search(r"<<<FINAL>>>\s*(.+?)\s*<<<END>>>", response_text, re.DOTALL)
-    return m.group(1).strip() if m else None
+    """Parse the FINAL...END block from the Judge's response.
+
+    Tolerates variations like >>>FINAL>>>, **FINAL**, <<<FINAL>>>, etc.
+    Falls back to finding the last (A)/(B)/(C)/(D) in the text.
+    """
+    m = re.search(r"[<>]{3}\s*FINAL\s*[<>]{3}\s*(.+?)\s*[<>]{3}\s*END\s*[<>]{3}", response_text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"\*{2,3}\s*FINAL\s*\*{2,3}\s*(.+?)\s*\*{2,3}\s*END\s*\*{2,3}", response_text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    choices = re.findall(r"\(([A-D])\)", response_text)
+    if choices:
+        return f"({choices[-1]})"
+    return None
 
 
 # ---------------------------------------------------------------------------

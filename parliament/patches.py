@@ -103,8 +103,20 @@ SocialAgent.__init__ = _patched_init
 # ---------------------------------------------------------------------------
 
 
+_TOOL_ALIASES = {
+    "comment": "create_comment",
+    "post": "create_post",
+    "endorse_post": "like_post",
+    "endorse": "like_post",
+    "challenge_post": "dislike_post",
+    "endorse_comment": "like_comment",
+    "challenge_comment": "dislike_comment",
+}
+
+
 async def _patched_perform_action_by_data(self, func_name, *args, **kwargs):
     func_name = func_name.value if isinstance(func_name, ActionType) else func_name
+    func_name = _TOOL_ALIASES.get(func_name, func_name)
 
     if func_name == "follow":
         followee_id = kwargs.get("followee_id") or (args[0] if args else None)
