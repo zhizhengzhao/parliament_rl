@@ -183,12 +183,14 @@ def apply_tool_descriptions():
     )
 
     SocialAction.dislike_post.__doc__ = (
-        "Challenge a post. This decreases its score, making it less "
-        "prominent in the forum so fewer scientists spend time on it. "
-        "Use this to flag posts with errors, flawed logic, or misleading "
-        "claims \u2014 before others waste effort building on a wrong foundation.\n\n"
-        "When you challenge a post, consider also commenting to explain "
-        "what the error is, so the author and others can learn from it.\n\n"
+        "Challenge a post you disagree with or found an error in. This "
+        "is a constructive scientific action — it lowers the post's score "
+        "so the parliament focuses on stronger work instead. Challenging "
+        "flawed reasoning is just as important as endorsing correct work; "
+        "both help the parliament converge on the right answer.\n\n"
+        "Use this when a post contains errors, unjustified assumptions, "
+        "or a wrong conclusion. Pair it with a comment explaining the "
+        "flaw so others can verify your objection.\n\n"
         "Args:\n"
         "    post_id (int): The post to challenge (see 'post_id' in the forum).\n\n"
         "Returns:\n"
@@ -206,8 +208,9 @@ def apply_tool_descriptions():
     )
 
     SocialAction.dislike_comment.__doc__ = (
-        "Challenge a comment. This decreases its score, signaling to others "
-        "that the comment may contain errors.\n\n"
+        "Challenge a comment you believe is incorrect. This signals to "
+        "other scientists that the comment may contain errors, helping "
+        "the parliament avoid building on flawed reasoning.\n\n"
         "Args:\n"
         "    comment_id (int): The comment to challenge "
         "(see 'comment_id' in the forum).\n\n"
