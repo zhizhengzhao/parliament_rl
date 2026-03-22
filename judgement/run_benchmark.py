@@ -33,7 +33,7 @@ import benchmark_viz
 
 def _worker_main(
     worker_id: int, port: int,
-    task_queue: mp.Queue, result_queue: mp.Queue,
+    task_queue: mp.Queue,
     bench_dir: str, log_dir: str,
 ):
     sys.path.insert(0, os.path.abspath(
@@ -60,8 +60,11 @@ def _worker_main(
 
         rounds_completed = 0
         early_stopped = False
+        stop_reason = "unknown"
         db_path = None
         answer = None
+        parliament_error = None
+        judge_error = None
 
         try:
             session = asyncio.run(run_session(
@@ -70,7 +73,9 @@ def _worker_main(
             db_path = session["db_path"]
             rounds_completed = session["num_rounds_completed"]
             early_stopped = session["early_stopped"]
+            stop_reason = session.get("stop_reason", "max_rounds")
         except Exception as e:
+            parliament_error = str(e)
             print(f"[GPU {worker_id}] Question {idx} parliament error: {e}")
 
         if db_path and os.path.exists(db_path):
@@ -81,6 +86,7 @@ def _worker_main(
                 ))
                 answer = judge_result["answer"]
             except Exception as e:
+                judge_error = str(e)
                 print(f"[GPU {worker_id}] Question {idx} judge error: {e}")
 
         is_correct = None
@@ -96,9 +102,15 @@ def _worker_main(
             "is_correct": is_correct,
             "rounds_completed": rounds_completed,
             "early_stopped": early_stopped,
+            "stop_reason": stop_reason,
             "gpu": worker_id,
+            "parliament_error": parliament_error,
+            "judge_error": judge_error,
         }
-        result_queue.put(record)
+
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, "result.json"), "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False)
 
         status = "ok" if is_correct else ("WRONG" if is_correct is False else "?")
         print(f"[GPU {worker_id}] Question {idx} [{status}] answer={answer}")
@@ -136,7 +148,6 @@ def run_benchmark(
     # ── Step 2: Run parliament + judge ──────────────────────────────────
     print(f"\n[2/4] Running benchmark: {len(questions)} questions, {len(gpu_ids)} GPUs")
     task_queue = mp.Queue()
-    result_queue = mp.Queue()
     for idx, q in enumerate(questions):
         task_queue.put((idx, q))
 
@@ -144,27 +155,32 @@ def run_benchmark(
     for gid in gpu_ids:
         p = mp.Process(
             target=_worker_main,
-            args=(gid, 8000 + gid, task_queue, result_queue, bench_dir, log_dir),
+            args=(gid, 8000 + gid, task_queue, bench_dir, log_dir),
         )
         p.start()
         workers.append(p)
     for p in workers:
         p.join()
 
-    # ── Step 3: Collect results ─────────────────────────────────────────
+    # ── Step 3: Collect results from disk ────────────────────────────────
     print("\n[3/4] Collecting results...")
-    results_path = os.path.join(bench_dir, "results.jsonl")
-    correct = 0
-    total = 0
-    with open(results_path, "w", encoding="utf-8") as f:
-        while not result_queue.empty():
-            record = result_queue.get()
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            total += 1
-            if record.get("is_correct") is True:
-                correct += 1
+    records = []
+    for idx in range(len(questions)):
+        result_path = os.path.join(bench_dir, str(idx), "result.json")
+        if os.path.exists(result_path):
+            with open(result_path, "r", encoding="utf-8") as f:
+                records.append(json.load(f))
 
+    records.sort(key=lambda r: r.get("index", 0))
+    correct = sum(1 for r in records if r.get("is_correct") is True)
+    total = len(records)
     accuracy = correct / total if total > 0 else 0
+
+    results_path = os.path.join(bench_dir, "results.jsonl")
+    with open(results_path, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
     summary = {
         "dataset": dataset_path,
         "bench_name": bench_name,
@@ -188,7 +204,6 @@ def run_benchmark(
     print(f"  Dashboard: {html_path}")
     print(f"{'='*70}")
 
-    # Serve the results directory
     print(f"\n  Serving results at http://localhost:{serve_port}/")
     print(f"  SSH tunnel: ssh -p 8795 -L {serve_port}:localhost:{serve_port} root@your-server")
     print(f"  Press Ctrl+C to stop.\n")
