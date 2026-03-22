@@ -15,9 +15,7 @@ import asyncio
 import json
 import os
 import random
-import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
@@ -26,7 +24,8 @@ sys.path.insert(0, os.path.join(_project_root, "parliament"))
 sys.path.insert(0, os.path.join(_project_root, "judgement"))
 
 from session import OUTPUT_BASE
-from dataset import load_dataset, parse_gpu_ids
+from dataset import load_dataset, parse_gpu_ids, build_prompt
+from tools import run_python as _run_python, _PYTHON_PREAMBLE
 from judge import extract_answer
 import vllm_manager
 import benchmark_viz
@@ -77,23 +76,6 @@ The answer between <<<FINAL>>> and <<<END>>> must be self-contained.\
 # Tool definitions (OpenAI function-calling format for vLLM)
 # ---------------------------------------------------------------------------
 
-_PYTHON_PREAMBLE = """\
-import math, cmath, fractions, decimal, itertools, collections, re, json
-try:
-    import numpy as np
-except ImportError:
-    pass
-try:
-    import scipy.constants as const
-except ImportError:
-    pass
-try:
-    import sympy
-    from sympy import *
-except ImportError:
-    pass
-"""
-
 TOOLS_SCHEMA = [
     {
         "type": "function",
@@ -124,53 +106,10 @@ TOOLS_SCHEMA = [
 ]
 
 
-def _execute_python(code: str) -> str:
-    fd, tmp_path = tempfile.mkstemp(suffix=".py", prefix="baseline_")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(_PYTHON_PREAMBLE + "\n" + code)
-        result = subprocess.run(
-            ["python3", tmp_path],
-            capture_output=True, text=True, timeout=30,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-        )
-        output = ""
-        if result.stdout:
-            output += result.stdout
-        if result.returncode != 0 and result.stderr:
-            err = result.stderr.strip().splitlines()
-            output += "\n[error]\n" + "\n".join(err[-15:])
-        if not output.strip():
-            output = "(no output — use print() to see results)"
-        return output[:4000]
-    except subprocess.TimeoutExpired:
-        return "(execution timed out after 30s)"
-    except Exception as e:
-        return f"(execution error: {e})"
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-
-
 def _dispatch_tool(name: str, arguments: dict) -> str:
     if name == "run_python":
-        return _execute_python(arguments.get("code", ""))
+        return _run_python(arguments.get("code", ""))
     return f"(unknown tool: {name})"
-
-
-# ---------------------------------------------------------------------------
-# Build prompt
-# ---------------------------------------------------------------------------
-
-def _build_prompt(question: str, choices: list[str] | None) -> str:
-    parts = [question]
-    if choices:
-        parts.append("\nCHOICES:")
-        for i, ch in enumerate(choices):
-            parts.append(f"  ({chr(ord('A') + i)}) {ch}")
-    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +122,7 @@ async def _infer_one(
     async with semaphore:
         choices = q.get("choices")
         system = SYSTEM_PROMPT if choices else SYSTEM_PROMPT_OPEN
-        user_msg = _build_prompt(q["question"], choices)
+            user_msg = build_prompt(q["question"], choices)
 
         messages = [
             {"role": "system", "content": system},

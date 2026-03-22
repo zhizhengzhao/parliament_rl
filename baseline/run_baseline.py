@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(_project_root, "parliament"))
 sys.path.insert(0, os.path.join(_project_root, "judgement"))
 
 from session import OUTPUT_BASE
-from dataset import load_dataset, parse_gpu_ids
+from dataset import load_dataset, parse_gpu_ids, build_prompt
 from judge import extract_answer
 import vllm_manager
 import benchmark_viz
@@ -57,15 +57,6 @@ The answer between <<<FINAL>>> and <<<END>>> must be self-contained.\
 """
 
 
-def _build_prompt(question: str, choices: list[str] | None) -> str:
-    parts = [question]
-    if choices:
-        parts.append("\nCHOICES:")
-        for i, ch in enumerate(choices):
-            parts.append(f"  ({chr(ord('A') + i)}) {ch}")
-    return "\n".join(parts)
-
-
 async def _run_batch(questions: list[dict], ports: list[int], concurrency: int = 32):
     import httpx
     from config import MODEL_NAME
@@ -77,7 +68,7 @@ async def _run_batch(questions: list[dict], ports: list[int], concurrency: int =
         async with semaphore:
             choices = q.get("choices")
             system = BASELINE_SYSTEM_PROMPT if choices else BASELINE_SYSTEM_PROMPT_OPEN
-            user_msg = _build_prompt(q["question"], choices)
+            user_msg = build_prompt(q["question"], choices)
 
             try:
                 resp = await client.post(

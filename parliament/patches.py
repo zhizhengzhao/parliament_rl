@@ -150,7 +150,6 @@ SocialAgent.perform_action_by_data = _patched_perform_action_by_data
 # ---------------------------------------------------------------------------
 
 _agent_log = logging.getLogger("social.agent")
-_ALL_SOCIAL_ACTIONS = [action.value for action in ActionType]
 
 # Per-round failure tracking — session.py reads and resets these each round.
 round_fail_count = 0

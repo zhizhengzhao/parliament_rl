@@ -25,7 +25,6 @@ def _is_ready(port: int) -> bool:
 def start(gpu_ids: list[int], model_path: str | None = None):
     """Launch one vLLM instance per GPU.  Skips GPUs whose port is already serving."""
     model = model_path or MODEL_NAME
-    pids = []
     for gid in gpu_ids:
         port = _port_for(gid)
         if _is_ready(port):

@@ -118,11 +118,11 @@ python run_baseline_tools.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,1,
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `MODEL_NAME` | `"Qwen/Qwen3-8B"` | 模型路径 |
-| `DEFAULT_NUM_AGENTS` | `20` | 科学家数量 |
-| `NUM_ROUNDS` | `20` | 最大讨论轮数 |
+| `DEFAULT_NUM_AGENTS` | `5` | 科学家数量 |
+| `NUM_ROUNDS` | `10` | 最大讨论轮数 |
 | `MAX_ITERATION` | `10` | 每 agent 每轮最多工具调用次数 |
 | `LLM_CONCURRENCY` | `5` | 每轮并发请求数 |
-| `VLLM_MAX_MODEL_LEN` | `131072` | vLLM context 长度（128K） |
+| `VLLM_MAX_MODEL_LEN` | `65536` | vLLM context 长度（64K） |
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.90` | vLLM GPU 显存占用比例 |
 | `TOOL_SETS` | `["sympy", "python"]` | 科学家可用工具包：`"sympy"` 符号计算、`"python"` 代码执行 |
 | `EXPERIENCE_ENABLED` | `False` | 经验闭环（预留） |

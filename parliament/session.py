@@ -11,7 +11,6 @@ See run_parliament.py for demo usage, or judgement/run_benchmark.py for batch us
 
 import json
 import os
-import shutil
 import sqlite3
 import time
 
@@ -245,7 +244,7 @@ async def run_session(
         reset as ctx_reset, compress_posts, rollback_to,
         build_context, context_overflows,
     )
-    from patches import ContextOverflowError, reset_round_stats, round_fail_count, round_agent_count
+    from patches import ContextOverflowError
     import patches as _patches
 
     if num_agents is None:

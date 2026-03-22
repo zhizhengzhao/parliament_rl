@@ -14,8 +14,11 @@ Also handles compression when context overflows.
 import asyncio
 import json
 import os
+import re
 import sqlite3
 from datetime import date, timedelta
+
+from prompts import ROUND_GUIDANCE, LATE_ROUND_NUDGE, COMPRESS_SYSTEM, COMPRESS_USER
 
 from config import VLLM_MAX_MODEL_LEN
 
@@ -295,13 +298,11 @@ def build_context(agent_id: int, agent_name: str, system_content: str) -> list[d
     except Exception:
         pass
 
-    import re as _re
-    q_match = _re.search(r"--- PROBLEM ---\s*(.+?)\s*--- END PROBLEM ---", system_content, _re.DOTALL)
+    q_match = re.search(r"--- PROBLEM ---\s*(.+?)\s*--- END PROBLEM ---", system_content, re.DOTALL)
     if q_match:
         q_reminder = q_match.group(1).strip()[:300]
         parts.append(f"REMINDER — The problem you are solving: {q_reminder}{'...' if len(q_match.group(1).strip()) > 300 else ''}\n")
 
-    from prompts import ROUND_GUIDANCE, LATE_ROUND_NUDGE
     parts.append(ROUND_GUIDANCE)
 
     round_info = os.environ.get("PARLIAMENT_ROUND", "")
@@ -333,9 +334,6 @@ def context_overflows(messages: list[dict]) -> bool:
 # ---------------------------------------------------------------------------
 # Compression — triggered only on context overflow
 # ---------------------------------------------------------------------------
-
-from prompts import COMPRESS_SYSTEM, COMPRESS_USER
-
 
 async def compress_posts(output_dir: str):
     """Compress all uncompressed posts/comments individually via batch HTTP requests."""
@@ -414,7 +412,7 @@ def rollback_to(db_path: str, snap: dict):
               max_follow_rowid, max_like_rowid, max_dislike_rowid,
               max_comment_like_rowid, max_comment_dislike_rowid.
     """
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=3)
     c = conn.cursor()
     c.execute("DELETE FROM post WHERE post_id > ?", (snap["max_post_id"],))
     c.execute("DELETE FROM comment WHERE comment_id > ?", (snap["max_comment_id"],))

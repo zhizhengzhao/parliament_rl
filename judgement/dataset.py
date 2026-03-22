@@ -6,12 +6,12 @@ Supports CSV, TSV, and JSONL formats.
 
 import csv
 import json
+import os
 import random
 
 
 def load_dataset(path: str) -> list[dict]:
     """Load and normalize a dataset file into a list of question dicts."""
-    import os
     ext = os.path.splitext(path)[1].lower()
     if ext == ".jsonl":
         with open(path, "r", encoding="utf-8") as f:
@@ -51,6 +51,16 @@ def _normalize(raw: dict) -> dict:
 
     return {"question": question, "choices": None,
             "ground_truth": raw.get("answer") or raw.get("Answer")}
+
+
+def build_prompt(question: str, choices: list[str] | None) -> str:
+    """Format a question + choices for model input."""
+    parts = [question]
+    if choices:
+        parts.append("\nCHOICES:")
+        for i, ch in enumerate(choices):
+            parts.append(f"  ({chr(ord('A') + i)}) {ch}")
+    return "\n".join(parts)
 
 
 def parse_gpu_ids(s: str) -> list[int]:

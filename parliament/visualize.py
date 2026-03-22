@@ -234,7 +234,8 @@ def _build_html(data, question, current_round, num_rounds):
     forum = _forum_html(data)
     scientists = _scientists_html(data)
     network = _network_html(data)
-    pjson = json.dumps(_profile_data(data), ensure_ascii=False)
+    pjson = json.dumps(_profile_data(data), ensure_ascii=False).replace("</", "<\\/")
+
 
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
