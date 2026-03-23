@@ -205,6 +205,7 @@ async def _infer_one(
             "rounds_completed": tool_rounds,
             "early_stopped": False,
             "gpu": port,
+            "raw_response": final_text,
         }
 
 

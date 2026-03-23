@@ -107,6 +107,7 @@ async def _run_batch(questions: list[dict], ports: list[int], concurrency: int =
                 "rounds_completed": 0,
                 "early_stopped": False,
                 "gpu": port,
+                "raw_response": raw_text,
             }
 
             status = "ok" if is_correct else ("WRONG" if is_correct is False else "?")
