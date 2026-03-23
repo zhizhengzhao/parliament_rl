@@ -79,7 +79,7 @@ async def _run_batch(questions: list[dict], ports: list[int], concurrency: int =
                             {"role": "system", "content": system},
                             {"role": "user", "content": user_msg},
                         ],
-                        "max_tokens": 4096,
+                        "max_tokens": 16384,
                     },
                     timeout=300,
                 )

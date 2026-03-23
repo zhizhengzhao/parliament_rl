@@ -140,7 +140,7 @@ async def _infer_one(
                         "model": model_name,
                         "messages": messages,
                         "tools": TOOLS_SCHEMA,
-                        "max_tokens": 4096,
+                        "max_tokens": 16384,
                     },
                     timeout=300,
                 )
@@ -174,7 +174,7 @@ async def _infer_one(
                     json={
                         "model": model_name,
                         "messages": messages,
-                        "max_tokens": 4096,
+                        "max_tokens": 16384,
                     },
                     timeout=300,
                 )
