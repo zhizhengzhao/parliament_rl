@@ -152,7 +152,7 @@ async def _infer_one(
 
                 tool_calls = msg.get("tool_calls")
                 if not tool_calls:
-                    final_text = msg.get("content", "")
+                    final_text = (msg.get("content") or "") + (msg.get("reasoning") or "")
                     break
 
                 tool_rounds += 1
@@ -179,7 +179,8 @@ async def _infer_one(
                     timeout=300,
                 )
                 data = resp.json()
-                final_text = data["choices"][0]["message"].get("content", "")
+                _msg = data["choices"][0]["message"]
+                final_text = (_msg.get("content") or "") + (_msg.get("reasoning") or "")
 
         except Exception as e:
             print(f"  Question {idx} error: {e}")
