@@ -28,11 +28,8 @@ judgement/               # Judge + Benchmark
 ├── vllm_manager.py      # vLLM 生命周期管理
 └── benchmark_viz.py     # 生成总览 HTML
 
-baseline/                # 对照组 1：单 agent，无工具，单轮推理
+baseline/                # 对照组：单 agent，无工具，单轮推理
 └── run_baseline.py
-
-baseline_tools/          # 对照组 2：单 agent，有工具（python），多轮推理
-└── run_baseline_tools.py
 
 benchmark/               # 数据集
 ├── gpqa_diamond.csv     # GPQA Diamond（198 题）
@@ -89,7 +86,7 @@ python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv                #
 
 自动完成：启动 vLLM → 跑 parliament + judge → 生成结果页面 → 启动 HTTP 服务器。
 
-**Baseline（直接模型做题，对照组 1）：**
+**Baseline（直接模型做题，对照组）：**
 
 ```bash
 cd baseline
@@ -98,16 +95,6 @@ python run_baseline.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,1,2     
 ```
 
 无工具、单轮推理。async batch，速度最快。
-
-**Baseline + Tools（单 agent + 工具，对照组 2）：**
-
-```bash
-cd baseline_tools
-python run_baseline_tools.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0
-python run_baseline_tools.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,1,2 --limit 20
-```
-
-单 agent 带 Python 代码执行工具，多轮 tool-calling（最多 10 轮）。证明工具本身的增益。
 
 ---
 
