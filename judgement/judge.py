@@ -154,6 +154,8 @@ def extract_answer(response_text: str) -> str | None:
     (A)/(B)/(C)/(D) from it.  Falls back to the last choice letter
     anywhere in the full response.
     """
+    if not response_text:
+        return None
     block = None
     for pattern in (
         r"[<>]{3}\s*FINAL\s*[<>]{3}\s*(.+?)\s*[<>]{3}\s*END\s*[<>]{3}",

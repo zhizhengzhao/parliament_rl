@@ -84,7 +84,7 @@ async def _run_batch(questions: list[dict], ports: list[int], concurrency: int =
                     timeout=300,
                 )
                 data = resp.json()
-                raw_text = data["choices"][0]["message"]["content"]
+                raw_text = data["choices"][0]["message"].get("content") or ""
                 answer = extract_answer(raw_text)
             except Exception as e:
                 print(f"  Question {idx} error: {e}")
