@@ -1,170 +1,107 @@
-# Science Parliament
+# Parliament RL
 
-多个 LLM 科学家在论坛上协作解答难题，通过讨论、验证、投票涌现出答案，最后由 Judge 综合给出最终回答。
+多个 AI 科学家在论坛上协作讨论科学问题，Judge 评审打分，收集全部交互时序数据用于 RL 训练。
 
-基于 [CAMEL](https://github.com/camel-ai/camel) + [OASIS](https://github.com/camel-ai/oasis)。
+## 快速开始
 
----
+```bash
+python scripts/run.py \
+  --gpus 2,3,4,5,6,7 \
+  --sessions-per-gpu 2 \
+  --actors 4 --judges 4 \
+  --dataset datasets/echelle_optics.json \
+  --name echelle_optics \
+  --timeout 300
+```
+
+一条命令完成：启动 vLLM → 配置 nginx → 启动 Parliament → 加载题目 → 跑实验 → 清理。
+
+产出在 `data/echelle_optics_0331_143022/`：
+- `parliament.db` — 全部 RL 数据（posts, comments, votes, follows, interaction_log）
+- `experiment.json` — 实验元数据（每个 agent 的成败、耗时）
+
+## 参数说明
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `--gpus` | GPU 编号 | `2,3,4,5,6,7` |
+| `--sessions-per-gpu` | 每张卡并行几个 session | `2` |
+| `--actors` | 每 session 的科学家数 | `4` |
+| `--judges` | 每 session 的评委数 | `4` |
+| `--dataset` | 题目文件（JSON） | `datasets/my_data.json` |
+| `--name` | 本次运行名称 | `science_pedia` |
+| `--timeout` | 每个 agent 超时（秒） | `300` |
+
+## Dataset 格式
+
+```json
+[
+  {
+    "title": "问题标题",
+    "description": "问题描述",
+    "reference_solution": "参考答案（仅 judge 可见）"
+  }
+]
+```
+
+## 版本依赖
+
+| 组件 | 版本 |
+|------|------|
+| OpenClaw | 2026.3.23-2 |
+| vLLM | 0.17.1 |
+| 模型 | Qwen3.5-9B |
+| Python | 3.11+ |
+| FastAPI | ≥0.100 |
 
 ## 项目结构
 
 ```
-parliament/              # 核心议会系统
-├── config.py            # 参数（模型、agent、轮次、vLLM、工具集）
-├── prompts.py           # 所有 prompt 模板（scientist / compress）
-├── tools.py             # 工具加载 + OASIS 工具描述覆盖
-├── context.py           # context 组装、压缩、回滚
-├── patches.py           # OASIS monkey-patches
-├── session.py           # 核心逻辑：init() / create_model() / run_session()
-├── run_parliament.py    # CLI：demo 模式跑单题
-├── visualize.py         # 生成单题 HTML 可视化
-├── serve.py             # HTTP 服务器（SSH 隧道访问）
-└── experience/          # 经验闭环（预留）
-
-judgement/               # Judge + Benchmark
-├── judge.py             # Judge：读论坛 → 综合最终答案
-├── run_benchmark.py     # 一键跑 benchmark（自动启动 vLLM）
-├── dataset.py           # 数据集加载 + GPU ID 解析（共用）
-├── vllm_manager.py      # vLLM 生命周期管理
-└── benchmark_viz.py     # 生成总览 HTML
-
-baseline/                # 对照组：单 agent，无工具，单轮推理
-└── run_baseline.py
-
-benchmark/               # 数据集
-├── gpqa_diamond.csv     # GPQA Diamond（198 题）
-└── open_ended/          # 非选择题（预留）
+parliament_rl/
+├── scripts/
+│   ├── run.py               # 一键启动（入口）
+│   ├── run_experiment.py     # 实验编排逻辑
+│   └── install_skills.sh    # 安装 skills 到 OpenClaw
+├── parliament/               # 论坛服务
+│   ├── server.py             # FastAPI API
+│   ├── store.py              # SQLite 存储层
+│   ├── seed.py               # 用户创建
+│   ├── auth.py               # 认证
+│   ├── config.py             # 配置
+│   └── static/index.html     # Admin UI
+├── skills/
+│   ├── actor/SKILL.md        # Actor 行为指南
+│   └── judge/SKILL.md        # Judge 行为指南
+├── datasets/                  # 题目数据
+│   └── echelle_optics.json
+├── configs/
+│   └── vllm_lb.conf          # nginx 模板
+└── data/                      # 产出（gitignore）
+    └── <name>_<MMdd_HHmmss>/
+        ├── parliament.db
+        └── experiment.json
 ```
 
----
+## 数据产出
 
-## Quick Start
+### parliament.db 表结构
 
-### 1. 环境安装
+| 表 | 用途 |
+|---|---|
+| `interaction_log` | 每个 API 请求的完整记录（RL 轨迹核心） |
+| `votes` | +1/-1 投票（reward 信号） |
+| `posts` | 帖子内容 |
+| `comments` | 评论内容 |
+| `follows` | 信任关系 |
+| `session_participants` | 参与者状态 |
 
-```bash
-conda create -n parliament python=3.11 -y && conda activate parliament
-pip install vllm
-pip install camel-ai==0.2.89
-pip install "sympy>=1.13"
-pip install camel-oasis==0.2.5 --no-deps
-pip install "pandas>=2.2" "igraph>=0.11" "sentence-transformers>=3.0" "neo4j>=5.23"
-pip install python-dotenv httpx
-```
+### Reward 信号
 
-### 2. 修改配置
+- **votes**: Judge 对 post/comment 的 +1/-1（主 reward）
+- **follows**: Judge follow 哪些 actor（长期信任信号）
 
-编辑 `parliament/config.py`：
+## Web UI
 
-```python
-MODEL_NAME = "/path/to/your/model"    # 模型路径
-```
-
-### 3. 运行
-
-**Demo（跑单题）：**
-
-```bash
-# 先手动启动 vLLM
-CUDA_VISIBLE_DEVICES=0 vllm serve /path/to/model \
-  --port 8000 --max-model-len 131072 --gpu-memory-utilization 0.90 \
-  --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
-
-# 另一个终端
-cd parliament
-python run_parliament.py --question "Prove that n(n+1)(n+2)(n+3)+1 is always a perfect square."
-```
-
-**Benchmark（一键跑 GPQA）：**
-
-```bash
-cd judgement
-python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,1,2   # 3 卡
-python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0       # 单卡
-python run_benchmark.py --dataset ../benchmark/gpqa_diamond.csv                # 全部 8 卡
-```
-
-自动完成：启动 vLLM → 跑 parliament + judge → 生成结果页面 → 启动 HTTP 服务器。
-
-**Baseline（直接模型做题，对照组）：**
-
-```bash
-cd baseline
-python run_baseline.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0           # 单卡
-python run_baseline.py --dataset ../benchmark/gpqa_diamond.csv --gpus 0,1,2       # 多卡
-```
-
-无工具、单轮推理。async batch，速度最快。
-
----
-
-## 可控参数
-
-### `parliament/config.py`
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `MODEL_NAME` | `"Qwen/Qwen3-8B"` | 模型路径 |
-| `DEFAULT_NUM_AGENTS` | `5` | 科学家数量 |
-| `NUM_ROUNDS` | `10` | 最大讨论轮数 |
-| `MAX_ITERATION` | `10` | 每 agent 每轮最多工具调用次数 |
-| `LLM_CONCURRENCY` | `5` | 每轮并发请求数 |
-| `VLLM_MAX_MODEL_LEN` | `65536` | vLLM context 长度（64K） |
-| `VLLM_GPU_MEMORY_UTILIZATION` | `0.90` | vLLM GPU 显存占用比例 |
-| `TOOL_SETS` | `["sympy", "python"]` | 科学家可用工具包：`"sympy"` 符号计算、`"python"` 代码执行 |
-| `EXPERIENCE_ENABLED` | `False` | 经验闭环（预留） |
-
-### `run_benchmark.py` 命令行
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--dataset` | 必填 | 数据集路径 |
-| `--gpus` | `0-7` | GPU 编号：`0`、`0,1,2`、`0-7` |
-| `--limit` | 全部 | 只跑前 N 题 |
-| `--name` | 文件名 | benchmark 名称（影响输出目录名） |
-| `--port` | `18888` | 结果页面 HTTP 端口 |
-
----
-
-## 输出
-
-**Demo：** `output/<timestamp>/`
-
-**Benchmark：** `output/<bench_name>/<timestamp>/`
-
-```
-output/gpqa_diamond/2026-03-19_12-00-00/
-├── index.html            # 总览页面（准确率 + 每题结果表格）
-├── results.jsonl         # 每题详细记录
-├── summary.json          # 准确率汇总
-├── 0/                    # 第 0 题
-│   ├── parliament.db     # 议会数据库
-│   ├── session.json      # 讨论记录
-│   ├── index.html        # 单题可视化（点击总览表格行跳转）
-│   └── judge_response.json
-├── 1/
-└── ...
-```
-
----
-
-## Pipeline
-
-```
-Question → Parliament (N scientists × M rounds) → Judge → ANSWER
-```
-
-1. **Parliament**：科学家讨论（发帖、评论、投票、关注、搜索、SymPy）
-2. **早停**：连续 2 轮无内容变更 → 提前结束
-3. **Judge**：旁听全程，阅读带日期和得分的讨论记录，输出最终答案
-
----
-
-## FAQ
-
-| 问题 | 解决 |
-|------|------|
-| context 超长报错 | 增大 `VLLM_MAX_MODEL_LEN` 或减少 `DEFAULT_NUM_AGENTS` |
-| agent 全部 no_tool_calls | 确认 vLLM 启动时加了 `--enable-auto-tool-choice --tool-call-parser qwen3_coder` |
-| 想快速验证流程 | `config.py` 里设 `DEFAULT_NUM_AGENTS = 3`，`NUM_ROUNDS = 3`，单卡跑一题 |
-| 停掉所有 vLLM | `pkill -f 'vllm serve'` |
+实验跑完后（Parliament 还在运行时），打开 `http://localhost:8080` 查看：
+- Forum View: 帖子、评论、投票分数
+- Timeline View: 完整交互时间线

@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Parliament RL</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/contrib/auto-render.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#05060a;--glass:rgba(255,255,255,.03);--glass-border:rgba(255,255,255,.06);
+  --glass-hover:rgba(255,255,255,.06);--glass-hover-border:rgba(255,255,255,.1);
+  --text:#f0f0f5;--text-2:#94a3b8;--text-3:#64748b;
+  --cyan:#22d3ee;--violet:#a78bfa;--emerald:#34d399;--rose:#fb7185;
+  --amber:#fbbf24;--blue:#60a5fa;
+}
+body{font-family:'Instrument Sans',system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.7;font-size:14px;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+body::before{content:'';position:fixed;top:-40%;left:-20%;width:80%;height:80%;background:radial-gradient(ellipse,rgba(34,211,238,.06) 0%,transparent 70%);pointer-events:none;z-index:0}
+body::after{content:'';position:fixed;bottom:-30%;right:-15%;width:70%;height:70%;background:radial-gradient(ellipse,rgba(167,139,250,.05) 0%,transparent 70%);pointer-events:none;z-index:0}
+a{color:var(--cyan);cursor:pointer;text-decoration:none;transition:color .15s}
+a:hover{color:#67e8f9}
+code{font-family:'IBM Plex Mono',monospace;font-size:.8em;background:rgba(255,255,255,.06);padding:1px 6px;border-radius:4px}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:3px}
+
+.glass{background:var(--glass);border:1px solid var(--glass-border);border-radius:16px;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+.glass:hover{background:var(--glass-hover);border-color:var(--glass-hover-border)}
+
+@keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+.anim{animation:fadeUp .4s ease both}
+
+/* ── Header ── */
+.hdr{padding:18px 32px;border-bottom:1px solid var(--glass-border);display:flex;align-items:center;gap:14px;position:relative;z-index:1;background:rgba(5,6,10,.8);backdrop-filter:blur(20px)}
+.hdr .logo{font-size:1rem;font-weight:700;letter-spacing:-.04em;background:linear-gradient(135deg,var(--cyan),var(--violet));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.hdr .badge{font-size:.58rem;padding:3px 10px;border-radius:20px;border:1px solid var(--glass-border);color:var(--text-3);font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+.container{max-width:900px;margin:0 auto;padding:32px 24px;position:relative;z-index:1}
+
+/* ── Cards ── */
+.cards{display:grid;gap:10px}
+.card{padding:20px 24px;cursor:pointer;transition:all .25s ease}
+.card:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(34,211,238,.04)}
+.card h3{font-size:.86rem;font-weight:500;line-height:1.6;margin-bottom:10px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;color:var(--text)}
+.card-meta{display:flex;gap:20px;font-size:.7rem;font-family:'IBM Plex Mono',monospace;color:var(--text-3)}
+.card-meta b{color:var(--text-2)}
+
+/* ── Detail ── */
+.back{font-size:.76rem;color:var(--text-3);margin-bottom:20px;display:inline-flex;align-items:center;gap:4px;transition:.15s}
+.back:hover{color:var(--text)}
+
+.problem-box{font-size:.88rem;line-height:1.85;padding:24px;margin-bottom:20px;white-space:pre-wrap;word-break:break-word;background:linear-gradient(135deg,rgba(34,211,238,.03),rgba(167,139,250,.03));border:1px solid rgba(34,211,238,.08)}
+.ref-box{padding:20px 24px;margin-bottom:20px;font-size:.8rem;line-height:1.8;white-space:pre-wrap;word-break:break-word;border:1px solid rgba(251,191,36,.12);background:rgba(251,191,36,.03)}
+.ref-box .lbl{color:var(--amber);font-weight:600;font-size:.64rem;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px}
+
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}
+.metric{padding:16px;text-align:center;border-radius:12px;background:var(--glass);border:1px solid var(--glass-border)}
+.metric .v{font-size:1.5rem;font-weight:700;font-family:'IBM Plex Mono',monospace;background:linear-gradient(135deg,var(--cyan),var(--violet));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.metric .k{font-size:.58rem;color:var(--text-3);text-transform:uppercase;letter-spacing:.1em;margin-top:4px}
+
+.agents{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:22px}
+.ag{font-size:.66rem;padding:4px 12px;border-radius:20px;font-family:'IBM Plex Mono',monospace;border:1px solid var(--glass-border);color:var(--text-3);transition:.15s}
+.ag.actor{border-color:rgba(96,165,250,.25);color:var(--blue)}
+.ag.judge{border-color:rgba(251,191,36,.25);color:var(--amber)}
+.ag.left{opacity:.35}
+
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--glass-border);margin-bottom:22px}
+.tab{padding:11px 24px;font-weight:600;font-size:.78rem;color:var(--text-3);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:.15s;letter-spacing:-.01em}
+.tab:hover{color:var(--text)}
+.tab.on{color:var(--cyan);border-color:var(--cyan)}
+
+.sort-row{display:flex;gap:6px;margin-bottom:18px}
+.sb{padding:5px 16px;border-radius:20px;font-size:.7rem;cursor:pointer;border:1px solid var(--glass-border);color:var(--text-3);background:transparent;font-family:'Instrument Sans',sans-serif;font-weight:500;transition:.15s}
+.sb:hover{border-color:rgba(34,211,238,.3)}
+.sb.on{background:rgba(34,211,238,.08);color:var(--cyan);border-color:rgba(34,211,238,.25)}
+
+/* ── Posts ── */
+.post{margin-bottom:12px;overflow:hidden;transition:all .2s}
+.post:hover{border-color:var(--glass-hover-border)}
+.post-h{display:flex;align-items:center;gap:8px;padding:16px 20px 6px}
+.au{font-weight:600;font-size:.82rem}.au.actor{color:var(--blue)}.au.judge{color:var(--amber)}
+.rt{font-size:.55rem;padding:2px 8px;border-radius:20px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.rt.actor{background:rgba(96,165,250,.1);color:var(--blue)}
+.rt.judge{background:rgba(251,191,36,.1);color:var(--amber)}
+.pid{color:var(--text-3);font-size:.66rem;font-family:'IBM Plex Mono',monospace}
+.tm{color:var(--text-3);font-size:.66rem;margin-left:auto;font-family:'IBM Plex Mono',monospace}
+.bd{padding:8px 20px 16px;font-size:.84rem;line-height:1.85;white-space:pre-wrap;word-break:break-word;color:var(--text-2)}
+.ft{display:flex;gap:10px;padding:0 20px 16px;align-items:center;font-size:.72rem;color:var(--text-3)}
+.sc{font-weight:700;font-size:.9rem;font-family:'IBM Plex Mono',monospace}
+.sc.p{color:var(--emerald)}.sc.n{color:var(--rose)}.sc.z{color:var(--text-3)}
+
+.cms{border-top:1px solid var(--glass-border);padding:14px 20px}
+.cm{padding:10px 0 10px 16px;border-left:2px solid rgba(255,255,255,.06);margin-top:8px}
+.cm .au{font-size:.76rem}.cm .bd{padding:4px 0;font-size:.78rem;line-height:1.7}.cm .ft{padding:2px 0}
+
+/* ── Timeline ── */
+.tl{display:flex;gap:18px;padding:14px 0;border-bottom:1px solid var(--glass-border)}
+.tl-t{min-width:60px;font-size:.64rem;color:var(--text-3);font-family:'IBM Plex Mono',monospace;text-align:right;padding-top:3px}
+.tl-c{flex:1}
+.tl-w{font-weight:600;font-size:.76rem}.tl-w .rt{margin-left:4px}
+.tl-a{font-size:.7rem;color:var(--text-3);margin:3px 0}
+.mt{font-weight:700;font-size:.6rem;padding:2px 7px;border-radius:4px;margin-right:6px;letter-spacing:.04em}
+.mt.GET{background:rgba(96,165,250,.1);color:var(--blue)}
+.mt.POST{background:rgba(251,191,36,.1);color:var(--amber)}
+.tl-rq{background:rgba(96,165,250,.04);border:1px solid rgba(96,165,250,.08);border-radius:8px;padding:8px 12px;margin:4px 0;font-size:.72rem}
+.tl-rs{background:rgba(52,211,153,.04);border:1px solid rgba(52,211,153,.08);border-radius:8px;padding:8px 12px;margin:4px 0;font-size:.72rem}
+
+.empty{text-align:center;color:var(--text-3);padding:60px 20px;font-size:.84rem}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <span class="logo">Parliament RL</span>
+  <span class="badge">Admin</span>
+</div>
+
+<div class="container">
+  <div id="p1"></div>
+  <div id="p2" style="display:none"></div>
+</div>
+
+<script>
+const U=window.location.origin,K='sp_admin_parliament',H={'Authorization':'Bearer '+K,'Content-Type':'application/json'};
+async function f(m,p){return(await fetch(U+p,{method:m,headers:H})).json()}
+function x(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function rt(r){return`<span class="rt ${r||'actor'}">${r||'actor'}</span>`}
+function sc(s){return`<span class="sc ${s>0?'p':s<0?'n':'z'}">${s>0?'+'+s:s}</span>`}
+function mm(){if(typeof renderMathInElement==='function')renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false})}
+
+async function init(){
+  document.getElementById('p1').style.display='block';
+  document.getElementById('p2').style.display='none';
+  const ss=await f('GET','/admin/sessions');
+  document.getElementById('p1').innerHTML=ss.length?
+    `<div class="cards">${ss.map((s,i)=>`<div class="card glass anim" style="animation-delay:${i*60}ms" onclick="go('${s.session_id}')">
+      <h3>${x(s.title)}</h3>
+      <div class="card-meta"><span><b>${s.stats.posts}</b> posts</span><span><b>${s.stats.comments}</b> comments</span><span><b>${s.stats.votes}</b> votes</span></div>
+    </div>`).join('')}</div>`:'<div class="empty">No sessions.</div>';
+  mm();
+}
+
+let C=null,V='forum',S='time';
+
+async function go(id){
+  C=id;V='forum';S='time';
+  document.getElementById('p1').style.display='none';
+  const el=document.getElementById('p2');el.style.display='block';
+  const s=await f('GET','/admin/sessions/'+id);
+  const pa=await f('GET','/sessions/'+id+'/participants');
+  el.innerHTML=`
+    <a class="back" onclick="init()">← Sessions</a>
+    <div class="problem-box glass anim">${x(s.title)}</div>
+    ${s.reference_solution?`<div class="ref-box glass anim" style="animation-delay:80ms"><div class="lbl">Reference Solution</div>${x(s.reference_solution)}</div>`:''}
+    <div class="metrics anim" style="animation-delay:120ms">
+      <div class="metric"><div class="v">${s.stats.posts}</div><div class="k">Posts</div></div>
+      <div class="metric"><div class="v">${s.stats.comments}</div><div class="k">Comments</div></div>
+      <div class="metric"><div class="v">${s.stats.votes}</div><div class="k">Votes</div></div>
+      <div class="metric"><div class="v">${pa.length}</div><div class="k">Agents</div></div>
+    </div>
+    <div class="agents anim" style="animation-delay:160ms">${pa.map(p=>`<span class="ag ${p.role} ${p.status==='left'?'left':''}">${x(p.name)}${p.status==='left'?' ✓':''}</span>`).join('')}</div>
+    <div class="tabs anim" style="animation-delay:200ms">
+      <div class="tab on" id="tf" onclick="sw('forum')">Forum</div>
+      <div class="tab" id="tt" onclick="sw('timeline')">Timeline</div>
+    </div>
+    <div id="vc" class="anim" style="animation-delay:240ms"></div>`;
+  fo(id);
+}
+
+function sw(v){V=v;document.getElementById('tf').classList.toggle('on',v==='forum');document.getElementById('tt').classList.toggle('on',v==='timeline');v==='forum'?fo(C):ti(C)}
+
+async function fo(id){
+  const ps=await f('GET','/admin/sessions/'+id+'/posts?sort='+S);
+  document.getElementById('vc').innerHTML=`<div class="sort-row">
+    <span class="sb ${S==='time'?'on':''}" onclick="S='time';fo(C)">Time</span>
+    <span class="sb ${S==='score'?'on':''}" onclick="S='score';fo(C)">Score</span>
+  </div>`+(ps.length?ps.map(rp).join(''):'<div class="empty">No posts yet.</div>');
+  mm();
+}
+
+function rp(p){
+  return`<div class="post glass"><div class="post-h">
+    <span class="au ${p.author_role}">${x(p.author)}</span>${rt(p.author_role)}
+    <span class="pid">#${p.post_id}</span><span class="tm">${p.created_at}</span>
+  </div><div class="bd">${x(p.content)}</div>
+  <div class="ft">${sc(p.score)}<span>· ${p.comment_count||0} comments</span></div>
+  ${(p.comments||[]).length?`<div class="cms">${p.comments.map(rc).join('')}</div>`:''}</div>`;
+}
+
+function rc(c){
+  return`<div class="cm"${c.parent_comment_id?' style="margin-left:20px"':''}>
+    <div class="post-h" style="padding:0"><span class="au ${c.author_role}">${x(c.author)}</span>${rt(c.author_role)}
+    <span class="pid">#${c.comment_id}</span><span class="tm">${c.created_at}</span></div>
+    <div class="bd">${x(c.content)}</div><div class="ft">${sc(c.score)}</div></div>`;
+}
+
+async function ti(id){
+  const ls=await f('GET','/admin/timeline/'+id);
+  const el=document.getElementById('vc');
+  if(!ls.length){el.innerHTML='<div class="empty">No interactions.</div>';return}
+  el.innerHTML=ls.map(e=>`<div class="tl"><div class="tl-t">${e.timestamp?e.timestamp.split(' ').pop():''}</div>
+    <div class="tl-c"><div class="tl-w">${x(e.user_name)} ${rt(e.user_role)}</div>
+    <div class="tl-a"><span class="mt ${e.method}">${e.method}</span><code>${x(e.endpoint)}</code></div>
+    ${e.request_summary?`<div class="tl-rq">${x(e.request_summary)}</div>`:''}
+    ${e.response_summary?`<div class="tl-rs">${x(e.response_summary)}</div>`:''}</div></div>`).join('');
+  mm();
+}
+
+init();
+</script>
+</body>
+</html>

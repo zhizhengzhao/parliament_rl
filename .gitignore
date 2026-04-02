@@ -1,7 +1,8 @@
-.DS_Store
-*.pyc
+# Runtime data
+data/
+agents/workspace/
+.openclaw/
+
+# Python
 __pycache__/
-.env
-output/
-log/
-vllm_gpu*.log
+*.pyc
