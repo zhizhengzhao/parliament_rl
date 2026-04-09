@@ -196,12 +196,14 @@ async def run_session(
         idle_rounds = 0
         actor_name_set = {a["name"] for a in actors}
         judge_name_set = {j["name"] for j in judges}
+        processing: set[str] = set()
 
         for round_num in range(max_rounds * 3):
             done_tasks = [t for t in agent_tasks.values() if t.done()]
             if len(done_tasks) == len(agent_tasks):
                 break
 
+            # Wait for any agent alarm (submit_event)
             pending_events = [e for e in agent_events.values()
                               if not e.is_set()]
             if pending_events:
@@ -220,12 +222,21 @@ async def run_session(
 
             await asyncio.sleep(2)
 
+            # Mark finished agents as no longer processing
+            for name in list(processing):
+                if agent_events[name].is_set() or agent_tasks[name].done():
+                    processing.discard(name)
+
+            # Clear all events (alarm only, not activity tracking)
+            for e in agent_events.values():
+                e.clear()
+
+            # Fetch new content
             posts, comments, actor_votes, judge_votes, \
                 new_pid, new_cid, new_vid = await _fetch_new_content(
                     http, parliament_url, admin_key, sid,
                     last_post_id, last_comment_id, last_vote_id)
 
-            # Determine what's available (mode-dependent)
             if judge_votes_visible:
                 whether_empty = not (posts or comments
                                      or actor_votes or judge_votes)
@@ -233,7 +244,6 @@ async def run_session(
                 whether_empty = not (posts or comments or actor_votes)
 
             if not whether_empty:
-                # Distribute content to each agent
                 for name in all_names:
                     if agent_tasks[name].done():
                         continue
@@ -250,6 +260,7 @@ async def run_session(
                     if to_push:
                         to_push.sort(key=lambda x: x["id"])
                         agent_queues[name].put_nowait(to_push)
+                        processing.add(name)
 
                 last_post_id = new_pid
                 last_comment_id = new_cid
@@ -261,25 +272,17 @@ async def run_session(
             else:
                 last_vote_id = new_vid
 
-                # Determine whether_active (mode-dependent)
+                # whether_active: anyone actually processing content?
                 if judge_votes_visible:
-                    active_names = [
-                        n for n in (actor_name_set | judge_name_set)
-                        if not agent_tasks[n].done()]
+                    relevant = processing & (
+                        actor_name_set | judge_name_set)
                 else:
-                    active_names = [
-                        n for n in actor_name_set
-                        if not agent_tasks[n].done()]
+                    relevant = processing & actor_name_set
 
-                whether_active = any(
-                    not agent_events[n].is_set() for n in active_names
-                ) if active_names else False
-
-                if whether_active:
+                if relevant:
                     pass  # someone still working, wait
                 else:
                     idle_rounds += 1
-                    # Nudge active actors
                     active_actors = [n for n in actor_name_set
                                      if not agent_tasks[n].done()]
                     if idle_rounds <= 2 and active_actors:
@@ -289,21 +292,19 @@ async def run_session(
                                 "All scientists are waiting. Break the "
                                 "silence \u2014 post your next analysis "
                                 "step.")
+                            processing.add(aname)
                         ts = datetime.now().strftime("%H:%M:%S")
                         print(f"  [{ts}] Session {sid[:8]} "
                               f"round={round_num} nudged actors "
                               f"(idle={idle_rounds})", flush=True)
                     elif idle_rounds >= 3:
                         if not active_actors:
-                            # All actors left — wait for judges
                             active_judges = [
                                 n for n in judge_name_set
                                 if not agent_tasks[n].done()]
-                            all_judges_done = all(
-                                agent_events[n].is_set()
-                                for n in active_judges
-                            ) if active_judges else True
-                            if all_judges_done:
+                            judges_busy = bool(
+                                processing & set(active_judges))
+                            if not judges_busy:
                                 for q in agent_queues.values():
                                     q.put_nowait(None)
                                 break
@@ -311,9 +312,6 @@ async def run_session(
                             for q in agent_queues.values():
                                 q.put_nowait(None)
                             break
-
-            for e in agent_events.values():
-                e.clear()
 
         # Signal remaining agents to stop
         for q in agent_queues.values():

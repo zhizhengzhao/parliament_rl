@@ -147,6 +147,15 @@ datasets/           # 题库
 - context_config 的 prompt 模板用 `{name}` 不是 `{{name}}`——Python str.format()
 - vLLM 的 model name 是完整路径 `/root/zhizheng/models/Qwen3.5-9B`
 
+## 部署信息
+
+- **GitHub repo**：https://github.com/zhizhengzhao/parliament_rl
+- **中转服务器**（用于 push，因本机无法直连 GitHub）：
+  - host: `gvym1445879.bohrium.tech`
+  - user: `root`
+  - password: `4L5jbHptwK7gONmk`
+  - 用法：scp 打包文件到中转 → ssh 进去 clone repo → 解压覆盖 → commit + push
+
 ## 下一步方向
 
 1. **RL 数据构建**：从 interaction_log 重构 context → (context, action, reward) 三元组
