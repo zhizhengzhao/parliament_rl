@@ -1,0 +1,12 @@
+[
+  {
+    "title": "Calculate the blaze angle for an echelle grating (52.5 grooves/mm) observing H-alpha at order m=50 in Littrow configuration.",
+    "description": "An echelle grating with 52.5 grooves/mm is used to observe the hydrogen-alpha line (lambda = 656.28 nm) in the 50th diffraction order. The grating operates in Littrow configuration where the incidence angle equals the diffraction angle equals the blaze angle. Calculate the required blaze angle in degrees (4 significant figures).",
+    "reference_solution": "Littrow condition: m*lambda = 2d*sin(theta_B). d = 1/(52.5e3) = 1.9047619e-5 m. sin(theta_B) = m*lambda/(2d) = 50*656.28e-9/(2*1.9047619e-5) = 0.8613675. theta_B = arcsin(0.8613675) = 59.47 degrees."
+  },
+  {
+    "title": "Find the minimum number of illuminated grooves N for an echelle grating (order m=100) to detect a stellar radial velocity of 1.5 m/s.",
+    "description": "An astronomer needs a spectrograph to detect a stellar radial velocity variation of v = 1.5 m/s using the Doppler shift method. The echelle grating operates in order m = 100. Given c = 3.0e8 m/s, find the minimum number of grooves N that must be illuminated to achieve the necessary resolving power.",
+    "reference_solution": "Required resolving power: R = c/v = 3.0e8/1.5 = 2.0e8. For a grating: R = m*N. So N_min = R/m = 2.0e8/100 = 2.0e6. At least 2,000,000 grooves must be illuminated."
+  }
+]

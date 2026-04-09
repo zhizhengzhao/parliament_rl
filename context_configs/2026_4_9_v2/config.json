@@ -1,0 +1,11 @@
+{
+  "_version": "2026_4_9_v2",
+  "_description": "Improved prompts: explicit submit rules, voting guidance, round mechanics",
+
+  "agent": {
+    "max_rounds": 10,
+    "timeout_s": 600,
+    "max_consecutive_errors": 5,
+    "llm_timeout_s": 120
+  }
+}

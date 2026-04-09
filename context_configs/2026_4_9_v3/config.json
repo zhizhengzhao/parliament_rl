@@ -1,0 +1,13 @@
+{
+  "_version": "2026_4_9_v3",
+  "_description": "wait/leave tools, vote distribution with anonymous judge votes, idle fix, fallback parser, resample, no follow",
+
+  "agent": {
+    "max_rounds": 20,
+    "timeout_s": 600,
+    "max_consecutive_errors": 3,
+    "llm_timeout_s": 120
+  },
+
+  "judge_votes_visible": true
+}
