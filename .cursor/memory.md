@@ -23,25 +23,21 @@
 - `python_exec`：验算
 - `submit`：投票 +1/-1（不能发帖/评论，投票对 actor 不可见）
 
-### 轮询协议
+### 轮询协议（纯轮询，无 event）
 1. Round 0: Actor 收到 "Parliament is empty. Begin." → 计算 → submit
 2. Judge 不启动直到有内容
-3. Harness 收集新内容分四类：post / comment / actor_vote / judge_vote
-4. **全局 high-water mark 追踪**（last_post_id / last_comment_id / last_vote_id）
-5. **推送规则**：
+3. Runner 等 `processing` 集合清空（所有 agent 做完当前轮）→ 然后分发
+4. Agent 调 submit/wait/leave → 从 `processing` 移除
+5. **分发规则**：
    - Judge 只收 post + comment（不收任何 vote）
    - Actor 收 post + comment + actor_vote + judge_vote（`judge_votes_visible=true` 时）
    - Actor 收 post + comment + actor_vote（`judge_votes_visible=false` 时）
    - Judge vote 匿名化（署名 "Anonymous Scientist"）
-   - 过滤自己的内容
-6. **idle 检测**（whether_empty + whether_active）：
-   - `true` 模式：whether_empty 看四个 list，whether_active 看所有 agent（actor + judge）
-   - `false` 模式：whether_empty 看三个 list（不含 judge_vote），whether_active 只看 actor
-   - 有内容 → 推送 → idle=0
-   - 没内容 + 有人还在跑 → 继续等
-   - 没内容 + 相关 agent 都完成 → idle++
-7. idle=1,2 → nudge actors："All scientists are waiting. Break the silence."
-8. idle≥3 → session 结束（`false` 模式下先等 judge 完成当前轮）
+   - 收到内容的 agent 加入 `processing`
+6. **idle 只看 post + comment**（vote 不影响 idle）
+7. idle=1,2 → nudge actors
+8. idle≥3 → session 结束
+9. 所有 actor 都 leave/done → session 立即结束
 
 ### Context 管理
 1. Assistant thinking（content 字段）每轮清空为 null（和 tool_calls 同级的 content）
@@ -130,9 +126,10 @@ datasets/           # 题库
 - **Parliament 是纯 API 服务**——不要在 Parliament 里放 harness 逻辑
 - **assistant 的 content 和 tool_calls 是同级的**——content 是 thinking，清空不影响 tool_calls
 - **submit 的 arguments 保留原文**——post/comments 不 strip，因为 agent 的帖子不会通过 queue 推回给自己，arguments 是唯一的自我记忆
-- **全局 high-water mark 追踪**——last_post_id / last_comment_id / last_vote_id 会话级共享
+- **纯轮询，无 event**——runner 等 `processing` 集合清空再分发，60s 保底
 - **Judge 的 vote 匿名推送给 actor**——受 `judge_votes_visible` 开关控制
-- **idle 检测按模式区分**——true 模式看所有 agent，false 模式只看 actor
+- **idle 只看 post + comment**——vote 不影响 idle 计数
+- **所有 actor done → session 立即结束**——不等 judge
 
 ### 用户偏好
 - **代码精简高效稳定**——不接受凑合

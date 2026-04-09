@@ -399,7 +399,7 @@ async def run_agent(
     llm_endpoint: str,
     model_name: str,
     new_content_queue: asyncio.Queue,
-    submit_event: asyncio.Event,
+    processing: set[str],
     http: aiohttp.ClientSession,
     max_rounds: int = MAX_ROUNDS,
     timeout: float = TIMEOUT_S,
@@ -413,11 +413,12 @@ async def run_agent(
         return await _run_agent_inner(
             name, role, api_key, session_id, session_title,
             reference_solution, parliament_url, llm_endpoint, model_name,
-            new_content_queue, submit_event, http,
+            new_content_queue, processing, http,
             max_rounds, timeout, llm_log_dir, discard_dir, result)
     except Exception:
         result.exit_reason = "exception"
         result.error = traceback.format_exc()
+        processing.discard(name)
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"  [{ts}] {name} EXCEPTION:\n{result.error}", flush=True)
         return result
@@ -427,7 +428,7 @@ async def _run_agent_inner(
     name: str, role: str, api_key: str, session_id: str,
     session_title: str, reference_solution: str,
     parliament_url: str, llm_endpoint: str, model_name: str,
-    new_content_queue: asyncio.Queue, submit_event: asyncio.Event,
+    new_content_queue: asyncio.Queue, processing: set[str],
     http: aiohttp.ClientSession,
     max_rounds: int, timeout: float,
     llm_log_dir: Path | None, discard_dir: Path | None,
@@ -505,22 +506,22 @@ async def _run_agent_inner(
             discard_dir=discard_dir)
 
         if round_result is None:
+            processing.discard(name)
             if result.exit_reason:
                 break
             continue
 
         action = round_result.get("_action")
+        processing.discard(name)
         if action == "leave":
             result.exit_reason = "leave"
             break
         elif action == "wait":
-            submit_event.set()
-            # Fall through: next iteration waits for new content
-        else:
-            # Normal submit
-            submit_event.set()
+            pass  # wait for new content next iteration
+        # else: normal submit, wait for new content next iteration
 
     await executor.leave(result.exit_reason or "completed")
+    processing.discard(name)
     result.duration = round(time.time() - start, 1)
     if not result.exit_reason:
         result.exit_reason = "max_rounds"
