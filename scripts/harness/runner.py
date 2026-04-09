@@ -196,7 +196,7 @@ async def run_session(
         idle_rounds = 0
         actor_name_set = {a["name"] for a in actors}
         judge_name_set = {j["name"] for j in judges}
-        processing: set[str] = set()
+        processing: set[str] = set(actor_name_set)
 
         for round_num in range(max_rounds * 3):
             done_tasks = [t for t in agent_tasks.values() if t.done()]
