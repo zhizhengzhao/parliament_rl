@@ -114,15 +114,21 @@ def format_new_content(items: list[dict]) -> str:
                          f'by {item["author"]}:\n{item["content"]}')
         elif item["type"] == "vote":
             tt = "P" if item["target_type"] == "post" else "C"
-            val = f'+{item["value"]}' if item["value"] > 0 else str(item["value"])
+            direction = "positive" if item["value"] > 0 else "negative"
+            score = item.get("target_score", 0)
+            score_str = f'+{score}' if score > 0 else str(score)
             prev = item.get("previous_value")
             if prev is not None:
-                pv = f'+{prev}' if prev > 0 else str(prev)
+                prev_dir = "positive" if prev > 0 else "negative"
                 parts.append(f'[V on {tt}_{item["target_id"]}] '
-                             f'by {item["author"]}: changed {pv} → {val}')
+                             f'by {item["author"]}: changed {prev_dir} → '
+                             f'{direction} vote, current score of '
+                             f'{tt}_{item["target_id"]}: {score_str}')
             else:
                 parts.append(f'[V on {tt}_{item["target_id"]}] '
-                             f'by {item["author"]}: {val}')
+                             f'by {item["author"]}: {direction} vote, '
+                             f'current score of '
+                             f'{tt}_{item["target_id"]}: {score_str}')
     return "\n\n".join(parts)
 
 
@@ -173,26 +179,6 @@ def _parse_tool_call_from_content(content: str) -> dict | None:
     return {"name": fn_name, "arguments": args}
 
 
-def _try_get_new_content(queue: asyncio.Queue,
-                         messages: list[dict]) -> bool:
-    """Non-blocking check for new content in the queue. Appends to messages
-    if found. Returns True if session is ending (None received)."""
-    try:
-        item = queue.get_nowait()
-    except asyncio.QueueEmpty:
-        return False
-    if item is None:
-        queue.put_nowait(None)
-        return True
-    if isinstance(item, str):
-        messages.append({"role": "user", "content": item})
-    elif item:
-        text = format_new_content(item)
-        messages.append({"role": "user",
-                         "content": f"New content:\n\n{text}"})
-    return False
-
-
 MAX_NO_TOOL_RETRIES = 3
 
 
@@ -217,7 +203,6 @@ async def run_agent_round(
     model_name: str,
     http: aiohttp.ClientSession,
     result: AgentResult,
-    new_content_queue: asyncio.Queue,
     llm_log_dir: Path | None = None,
     discard_dir: Path | None = None,
 ) -> dict | None:
@@ -297,11 +282,6 @@ async def run_agent_round(
                 _save_discard_streak(discard_dir, name, no_tool_streak)
                 result.exit_reason = "no_tool"
                 return None
-            # Check for new content and resample
-            if _try_get_new_content(new_content_queue, messages):
-                _save_discard_streak(discard_dir, name, no_tool_streak)
-                result.exit_reason = "session_end"
-                return None
             continue
 
         # Tool call succeeded — flush any pending streak
@@ -325,7 +305,16 @@ async def run_agent_round(
                 "response": llm_response,
             })
 
+        _TOOL_PRIORITY = {"python_exec": 0, "submit": 1, "wait": 2, "leave": 3}
+        tool_calls = sorted(
+            tool_calls,
+            key=lambda tc: _TOOL_PRIORITY.get(tc["function"]["name"], 99),
+        )
+        assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
+
+        end_action = None
+        end_args = None
 
         for tc in tool_calls:
             fn_name = tc["function"]["name"]
@@ -348,7 +337,9 @@ async def run_agent_round(
                     submit_result.get("comments", []))
                 result.votes_cast += len(
                     submit_result.get("votes", []))
-                return fn_args
+                if end_action is None:
+                    end_action = "submit"
+                    end_args = fn_args
 
             elif fn_name == "wait":
                 messages.append({
@@ -356,7 +347,8 @@ async def run_agent_round(
                     "tool_call_id": tc["id"],
                     "content": "Waiting for new content.",
                 })
-                return {"_action": "wait"}
+                if end_action is None:
+                    end_action = "wait"
 
             elif fn_name == "leave":
                 messages.append({
@@ -364,7 +356,8 @@ async def run_agent_round(
                     "tool_call_id": tc["id"],
                     "content": "Leaving session.",
                 })
-                return {"_action": "leave"}
+                if end_action is None:
+                    end_action = "leave"
 
             elif fn_name == "python_exec":
                 output = ToolExecutor.python_exec(fn_args.get("code", ""))
@@ -381,6 +374,13 @@ async def run_agent_round(
                     "content": (f"Error: unknown tool '{fn_name}'. "
                                 "Use python_exec, submit, wait, or leave."),
                 })
+
+        if end_action == "submit":
+            return end_args
+        elif end_action == "wait":
+            return {"_action": "wait"}
+        elif end_action == "leave":
+            return {"_action": "leave"}
 
     result.exit_reason = "step_limit"
     return None
@@ -451,9 +451,9 @@ async def _run_agent_inner(
 
         result.rounds = round_num + 1
 
-        # Wait for new content (or start immediately on round 0 for actors)
         if round_num == 0:
             if role == "actor":
+                processing.add(name)
                 messages.append({
                     "role": "user",
                     "content": "Parliament is empty. No one has posted yet. Begin.",
@@ -469,8 +469,10 @@ async def _run_agent_inner(
                     result.exit_reason = "session_end"
                     break
                 if isinstance(new_items, str):
+                    processing.add(name)
                     messages.append({"role": "user", "content": new_items})
                 else:
+                    processing.add(name)
                     text = format_new_content(new_items)
                     messages.append({
                         "role": "user",
@@ -487,8 +489,10 @@ async def _run_agent_inner(
                 result.exit_reason = "session_end"
                 break
             if isinstance(new_items, str):
+                processing.add(name)
                 messages.append({"role": "user", "content": new_items})
             elif new_items:
+                processing.add(name)
                 text = format_new_content(new_items)
                 messages.append({
                     "role": "user",
@@ -502,8 +506,7 @@ async def _run_agent_inner(
         round_result = await run_agent_round(
             messages, role, name, executor,
             llm_endpoint, model_name, http, result,
-            new_content_queue, llm_log_dir=llm_log_dir,
-            discard_dir=discard_dir)
+            llm_log_dir=llm_log_dir, discard_dir=discard_dir)
 
         if round_result is None:
             processing.discard(name)

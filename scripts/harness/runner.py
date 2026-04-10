@@ -91,6 +91,13 @@ async def _fetch_new_content(
     ) as resp:
         all_votes = await resp.json() if resp.status == 200 else []
 
+    post_scores = {}
+    comment_scores = {}
+    for p in all_posts:
+        post_scores[p.get("post_id")] = p.get("score", 0)
+        for c in p.get("comments", []):
+            comment_scores[c.get("comment_id")] = c.get("score", 0)
+
     actor_votes, judge_votes = [], []
     for v in all_votes:
         vid = v.get("vote_id") or 0
@@ -98,12 +105,17 @@ async def _fetch_new_content(
             continue
         target_type = "post" if v.get("post_id") else "comment"
         target_id = v.get("post_id") or v.get("comment_id")
+        if target_type == "post":
+            target_score = post_scores.get(target_id, 0)
+        else:
+            target_score = comment_scores.get(target_id, 0)
         item = {
             "type": "vote", "id": vid,
             "target_type": target_type, "target_id": target_id,
             "value": v.get("value", 0),
             "previous_value": v.get("previous_value"),
             "author": v.get("author", "?"),
+            "target_score": target_score,
         }
         if v.get("role") == "judge":
             judge_votes.append(item)
@@ -200,6 +212,10 @@ async def run_session(
                     break
                 await asyncio.sleep(1)
             else:
+                ts = datetime.now().strftime("%H:%M:%S")
+                print(f"  [{ts}] Session {sid[:8]} "
+                      f"processing timeout, stuck agents: "
+                      f"{processing}", flush=True)
                 processing.clear()
 
             # All actors left → session ends
@@ -233,7 +249,9 @@ async def run_session(
                 to_push = [i for i in to_push
                            if i.get("author") != name]
                 if to_push:
-                    to_push.sort(key=lambda x: x["id"])
+                    type_order = {"post": 0, "comment": 1, "vote": 2}
+                    to_push.sort(key=lambda x: (
+                        type_order.get(x["type"], 9), x["id"]))
                     agent_queues[name].put_nowait(to_push)
                     processing.add(name)
 
