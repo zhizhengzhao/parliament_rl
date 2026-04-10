@@ -1,6 +1,6 @@
 {
-  "_version": "2026_4_10_v1",
-  "_description": "Event-driven polling, N-sec collection window, no leave, anonymous judge votes",
+  "_version": "2026_4_10_v2",
+  "_description": "Independent vote tool, actor-only event driving, no collection window",
 
   "agent": {
     "max_rounds": 20,

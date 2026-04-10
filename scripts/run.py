@@ -264,11 +264,10 @@ def main():
 
     # Auto-launch inside tmux if not already there
     if not args.in_tmux:
-        subprocess.run(["tmux", "kill-session", "-t", EXPERIMENT_TMUX],
-                       capture_output=True)
-        # Ensure tmux server is running
         subprocess.run(["tmux", "start-server"], capture_output=True)
         time.sleep(1)
+        subprocess.run(["tmux", "kill-session", "-t", EXPERIMENT_TMUX],
+                       capture_output=True)
         cmd_args = sys.argv + ["--in-tmux"]
         tmux_cmd = f"{shlex.quote(sys.executable)} {shlex.join(cmd_args)}"
         r = subprocess.run(["tmux", "new-session", "-d", "-s",

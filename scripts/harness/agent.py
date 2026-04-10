@@ -1,10 +1,13 @@
-"""Single agent loop — polling mode with N-second collection window.
+"""Single agent loop — event-driven polling mode.
 
 Each agent runs in rounds. Within a round, the LLM can call python_exec
-any number of times. The round ends when the agent calls submit or wait.
-Between rounds, the agent waits for new content via a collection window:
-poll queue every 1s, on first content start N-second timer, collect all
-content during the window, then start next round.
+and vote (actor) any number of times. The round ends when:
+  - Actor calls submit or wait  →  set_event (wakes runner)
+  - Judge calls vote            →  no set_event (silent)
+
+Between rounds, the agent waits for new content via its queue.
+The queue only receives posts/comments (never vote-only), so there
+is no collection window needed.
 """
 
 from __future__ import annotations
@@ -24,8 +27,6 @@ import aiohttp
 from .tools import ToolExecutor, get_tools
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-
-COLLECT_WINDOW_S = 10
 
 
 # ── Config loading ────────────────────────────────────────
@@ -187,7 +188,7 @@ MAX_NO_TOOL_RETRIES = 3
 
 
 def _save_discard_streak(discard_dir: Path, name: str, streak: list[dict]):
-    """Save a streak of discarded no-tool responses, filed by streak length."""
+    """Save a streak of discarded no-tool responses."""
     if not discard_dir or not streak:
         return
     n = len(streak)
@@ -196,56 +197,21 @@ def _save_discard_streak(discard_dir: Path, name: str, streak: list[dict]):
         f.write(json.dumps(streak, ensure_ascii=False, default=str) + "\n")
 
 
-# ── Collection window ─────────────────────────────────────
+# ── Queue wait (simplified — no collection window) ────────
 
-async def _collect_from_queue(
+async def _wait_for_content(
     queue: asyncio.Queue,
-    window_s: float = COLLECT_WINDOW_S,
 ) -> list | str | None:
-    """Wait for queue content, then collect for up to window_s seconds.
-
-    Returns collected items (list[dict]), a nudge string, or None (session end).
-    Ends early if a post or comment arrives.
-    """
-    # Phase 1: poll until queue has something
+    """Wait for queue content. Returns items, nudge string, or None."""
     try:
-        first = await asyncio.wait_for(queue.get(), timeout=300)
+        first = await asyncio.wait_for(queue.get(), timeout=61)
     except asyncio.TimeoutError:
         return None
     if first is None:
         return None
     if isinstance(first, str):
         return first
-
-    collected = list(first)
-    has_post_or_comment = any(
-        i["type"] in ("post", "comment") for i in collected)
-
-    if has_post_or_comment:
-        return collected
-
-    # Phase 2: only votes so far — wait up to window_s for posts/comments
-    deadline = time.time() + window_s
-    while time.time() < deadline:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        try:
-            item = await asyncio.wait_for(
-                queue.get(), timeout=min(remaining, 1.0))
-        except asyncio.TimeoutError:
-            continue
-        if item is None:
-            return None
-        if isinstance(item, str):
-            # Nudge during collection — treat as end of collection
-            collected.append({"type": "nudge", "content": item})
-            return collected
-        collected.extend(item)
-        if any(i["type"] in ("post", "comment") for i in item):
-            break
-
-    return collected
+    return list(first)
 
 
 # ── Single agent round ────────────────────────────────────
@@ -262,10 +228,17 @@ async def run_agent_round(
     llm_log_dir: Path | None = None,
     discard_dir: Path | None = None,
 ) -> dict | None:
-    """Run one round: LLM loops on python_exec until it calls submit/wait.
+    """Run one round: LLM loops until it calls a round-ending tool.
+
+    Round-ending tools:
+      Actor: submit, wait
+      Judge: vote
 
     Returns:
-        dict with submit args, or {"_action": "wait"}, or None on failure.
+      - dict with submit args (actor submit)
+      - {"_action": "wait"} (actor wait)
+      - {"_action": "vote"} (judge vote)
+      - None on failure
     """
     tools = get_tools(role)
     gpu_port = llm_endpoint.split(":")[2].split("/")[0]
@@ -391,7 +364,7 @@ async def run_agent_round(
                 "response": llm_response,
             })
 
-        _TOOL_PRIORITY = {"python_exec": 0, "submit": 1, "wait": 2}
+        _TOOL_PRIORITY = {"python_exec": 0, "vote": 1, "submit": 2, "wait": 3}
         tool_calls = sorted(
             tool_calls,
             key=lambda tc: _TOOL_PRIORITY.get(tc["function"]["name"], 99),
@@ -409,8 +382,30 @@ async def run_agent_round(
             except (json.JSONDecodeError, TypeError):
                 fn_args = {}
 
-            if fn_name == "submit":
-                submit_result = await executor.execute_submit(fn_args, role)
+            if fn_name == "python_exec":
+                output = ToolExecutor.python_exec(fn_args.get("code", ""))
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": output,
+                })
+
+            elif fn_name == "vote":
+                vote_result = await executor.execute_votes(
+                    fn_args.get("votes", []))
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": json.dumps(
+                        vote_result, ensure_ascii=False),
+                })
+                result.votes_cast += len(vote_result.get("votes", []))
+                result.api_errors += len(vote_result.get("errors", []))
+                if role == "judge" and end_action is None:
+                    end_action = "vote"
+
+            elif fn_name == "submit":
+                submit_result = await executor.execute_submit(fn_args)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
@@ -421,8 +416,6 @@ async def run_agent_round(
                     result.posts_created += 1
                 result.comments_created += len(
                     submit_result.get("comments", []))
-                result.votes_cast += len(
-                    submit_result.get("votes", []))
                 result.api_errors += len(
                     submit_result.get("errors", []))
                 if end_action is None:
@@ -438,26 +431,20 @@ async def run_agent_round(
                 if end_action is None:
                     end_action = "wait"
 
-            elif fn_name == "python_exec":
-                output = ToolExecutor.python_exec(fn_args.get("code", ""))
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": output,
-                })
-
             else:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "content": (f"Error: unknown tool '{fn_name}'. "
-                                "Use python_exec, submit, or wait."),
+                                "Available: python_exec, vote, submit, wait."),
                 })
 
         if end_action == "submit":
             return end_args
         elif end_action == "wait":
             return {"_action": "wait"}
+        elif end_action == "vote":
+            return {"_action": "vote"}
 
     result.exit_reason = "step_limit"
     return None
@@ -497,7 +484,8 @@ async def run_agent(
         result.exit_reason = "exception"
         result.error = traceback.format_exc()
         processing.discard(name)
-        submit_event.set()
+        if role != "judge":
+            submit_event.set()
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"  [{ts}] {name} EXCEPTION:\n{result.error}", flush=True)
         return result
@@ -540,7 +528,7 @@ async def _run_agent_inner(
                 })
             else:
                 wait_start = time.time()
-                collected = await _collect_from_queue(new_content_queue)
+                collected = await _wait_for_content(new_content_queue)
                 result.wait_time += time.time() - wait_start
                 if collected is None:
                     result.exit_reason = "session_end"
@@ -549,15 +537,14 @@ async def _run_agent_inner(
                 if isinstance(collected, str):
                     messages.append({"role": "user", "content": collected})
                 else:
-                    items = [i for i in collected if i.get("type") != "nudge"]
-                    text = format_new_content(items)
+                    text = format_new_content(collected)
                     messages.append({
                         "role": "user",
                         "content": f"New content to evaluate:\n\n{text}",
                     })
         else:
             wait_start = time.time()
-            collected = await _collect_from_queue(new_content_queue)
+            collected = await _wait_for_content(new_content_queue)
             result.wait_time += time.time() - wait_start
             if collected is None:
                 result.exit_reason = "session_end"
@@ -566,37 +553,32 @@ async def _run_agent_inner(
             if isinstance(collected, str):
                 messages.append({"role": "user", "content": collected})
             else:
-                nudges = [i for i in collected
-                          if i.get("type") == "nudge"]
-                items = [i for i in collected
-                         if i.get("type") != "nudge"]
-                parts = []
-                if items:
-                    parts.append(format_new_content(items))
-                for n in nudges:
-                    parts.append(n["content"])
                 messages.append({
                     "role": "user",
-                    "content": "\n\n".join(parts) if parts
-                    else "No new content.",
+                    "content": format_new_content(collected)
+                    or "No new content.",
                 })
 
-        # Run the round
         round_result = await run_agent_round(
             messages, role, name, executor,
             llm_endpoint, model_name, http, result,
             llm_log_dir=llm_log_dir, discard_dir=discard_dir)
 
-        processing.discard(name)
-        submit_event.set()
-
         if round_result is None:
+            processing.discard(name)
+            if role != "judge":
+                submit_event.set()
             if result.exit_reason:
                 break
             continue
 
-        if round_result.get("_action") == "wait":
-            pass
+        action = round_result.get("_action")
+
+        if action == "vote":
+            processing.discard(name)
+        else:
+            processing.discard(name)
+            submit_event.set()
 
     await executor.leave(result.exit_reason or "completed")
     processing.discard(name)
