@@ -244,6 +244,7 @@ async def run_agent_round(
     gpu_port = llm_endpoint.split(":")[2].split("/")[0]
     consecutive_errors = 0
     no_tool_streak: list[dict] = []
+    tool_priority = {"python_exec": 0, "vote": 1, "submit": 2, "wait": 3}
 
     for step in range(20):
         for m in messages:
@@ -269,6 +270,7 @@ async def run_agent_round(
                     "status": "error",
                     "context_msgs": context_msgs,
                     "error": str(e),
+                    "messages": messages,
                 })
             consecutive_errors += 1
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
@@ -364,10 +366,9 @@ async def run_agent_round(
                 "response": llm_response,
             })
 
-        _TOOL_PRIORITY = {"python_exec": 0, "vote": 1, "submit": 2, "wait": 3}
         tool_calls = sorted(
             tool_calls,
-            key=lambda tc: _TOOL_PRIORITY.get(tc["function"]["name"], 99),
+            key=lambda tc: tool_priority.get(tc["function"]["name"], 99),
         )
         assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
@@ -377,13 +378,20 @@ async def run_agent_round(
 
         for tc in tool_calls:
             fn_name = tc["function"]["name"]
+            raw_args = tc["function"].get("arguments", "{}")
             try:
-                fn_args = json.loads(tc["function"]["arguments"])
+                fn_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             except (json.JSONDecodeError, TypeError):
-                fn_args = {}
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": f"Error: could not parse arguments: {str(raw_args)[:200]}",
+                })
+                continue
 
             if fn_name == "python_exec":
-                output = ToolExecutor.python_exec(fn_args.get("code", ""))
+                code = fn_args.get("code", "") if isinstance(fn_args, dict) else str(fn_args)
+                output = await ToolExecutor.python_exec(code)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
@@ -391,8 +399,8 @@ async def run_agent_round(
                 })
 
             elif fn_name == "vote":
-                vote_result = await executor.execute_votes(
-                    fn_args.get("votes", []))
+                votes_arg = fn_args.get("votes", fn_args) if isinstance(fn_args, dict) else fn_args
+                vote_result = await executor.execute_votes(votes_arg)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
@@ -405,6 +413,11 @@ async def run_agent_round(
                     end_action = "vote"
 
             elif fn_name == "submit":
+                if isinstance(fn_args, dict) and fn_args.get("votes"):
+                    v_result = await executor.execute_votes(
+                        fn_args.pop("votes"))
+                    result.votes_cast += len(v_result.get("votes", []))
+                    result.api_errors += len(v_result.get("errors", []))
                 submit_result = await executor.execute_submit(fn_args)
                 messages.append({
                     "role": "tool",
@@ -519,29 +532,12 @@ async def _run_agent_inner(
 
         result.rounds = round_num + 1
 
-        if round_num == 0:
-            if role == "actor":
-                processing.add(name)
-                messages.append({
-                    "role": "user",
-                    "content": "Parliament is empty. No one has posted yet. Begin.",
-                })
-            else:
-                wait_start = time.time()
-                collected = await _wait_for_content(new_content_queue)
-                result.wait_time += time.time() - wait_start
-                if collected is None:
-                    result.exit_reason = "session_end"
-                    break
-                processing.add(name)
-                if isinstance(collected, str):
-                    messages.append({"role": "user", "content": collected})
-                else:
-                    text = format_new_content(collected)
-                    messages.append({
-                        "role": "user",
-                        "content": f"New content to evaluate:\n\n{text}",
-                    })
+        if round_num == 0 and role == "actor":
+            processing.add(name)
+            messages.append({
+                "role": "user",
+                "content": "Parliament is empty. No one has posted yet. Begin.",
+            })
         else:
             wait_start = time.time()
             collected = await _wait_for_content(new_content_queue)

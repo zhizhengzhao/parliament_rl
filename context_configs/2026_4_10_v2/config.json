@@ -6,7 +6,7 @@
     "max_rounds": 20,
     "timeout_s": 600,
     "max_consecutive_errors": 3,
-    "llm_timeout_s": 120
+    "llm_timeout_s": 60
   },
 
   "judge_votes_visible": true

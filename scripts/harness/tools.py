@@ -13,9 +13,9 @@ Session ID and API key are injected automatically; the LLM never sees them.
 
 from __future__ import annotations
 
-import io
+import asyncio
 import json
-import contextlib
+import sys
 from typing import Any
 
 import aiohttp
@@ -188,21 +188,73 @@ class ToolExecutor:
             except json.JSONDecodeError:
                 return text
 
-    async def execute_votes(self, votes: list[dict]) -> dict:
-        """Execute vote calls. Used by both actor and judge."""
+    @staticmethod
+    def _to_int(v) -> int | None:
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float):
+            return int(v)
+        if isinstance(v, str):
+            try:
+                return int(v.strip().lstrip("+"))
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _to_str(v) -> str:
+        if isinstance(v, str):
+            return v.strip()
+        if isinstance(v, dict):
+            return json.dumps(v, ensure_ascii=False)
+        if v is not None:
+            return str(v).strip()
+        return ""
+
+    async def execute_votes(self, votes) -> dict:
+        """Execute vote calls with broad format matching."""
         results: dict[str, list] = {"votes": [], "errors": [], "skipped": []}
+
+        if isinstance(votes, str):
+            try:
+                votes = json.loads(votes)
+            except (json.JSONDecodeError, ValueError):
+                results["errors"].append(f"could not parse votes: {votes[:200]}")
+                return results
+        if not isinstance(votes, list):
+            votes = [votes] if isinstance(votes, dict) else []
+        if not votes:
+            return results
+
         for v in votes:
-            ttype = v.get("target_type", "post")
-            tid = v.get("target_id")
-            value = v.get("value")
-            if tid is None or value is None:
+            if not isinstance(v, dict):
+                results["errors"].append(f"invalid vote format: {str(v)[:100]}")
                 continue
+
+            ttype = v.get("target_type") or v.get("type", "post")
+            if "comment_id" in v and "target_id" not in v:
+                ttype = "comment"
+            ttype = "comment" if "comment" in str(ttype).lower() else "post"
+
+            tid = self._to_int(
+                v.get("target_id") or v.get("id")
+                or v.get("post_id") or v.get("comment_id"))
+            value = self._to_int(
+                v.get("value") or v.get("vote") or v.get("score"))
+
+            if tid is None or value is None:
+                results["errors"].append(f"missing target_id or value: {v}")
+                continue
+            if value not in (1, -1):
+                value = 1 if value > 0 else -1
+
             own = (ttype == "post" and tid in self._my_posts) or \
                   (ttype == "comment" and tid in self._my_comments)
             if own:
                 results["skipped"].append(
                     f"Cannot vote on your own {ttype} {ttype[0].upper()}_{tid}")
                 continue
+
             if ttype == "comment":
                 path = f"/sessions/{self.sid}/comments/{tid}/vote"
             else:
@@ -216,10 +268,13 @@ class ToolExecutor:
         return results
 
     async def execute_submit(self, args: dict) -> dict:
-        """Execute submit (post + comments). Actor only."""
+        """Execute submit (post + comments) with broad format matching."""
+        if not isinstance(args, dict):
+            return {"post_id": None, "comments": [],
+                    "errors": [f"invalid arguments type: {type(args).__name__}"]}
         results: dict = {"post_id": None, "comments": [], "errors": []}
 
-        post_content = args.get("post", "")
+        post_content = self._to_str(args.get("post", ""))
         if post_content:
             resp = await self._api("POST", f"/sessions/{self.sid}/posts",
                                    {"content": post_content})
@@ -229,18 +284,58 @@ class ToolExecutor:
             else:
                 results["errors"].append(f"post: {resp}")
 
-        for cm in args.get("comments", []):
-            pid = cm.get("post_id")
-            content = cm.get("content", "")
-            if pid and content:
-                resp = await self._api(
-                    "POST", f"/sessions/{self.sid}/posts/{pid}/comments",
-                    {"content": content})
-                if isinstance(resp, dict) and "comment_id" in resp:
-                    results["comments"].append(resp["comment_id"])
-                    self._my_comments.add(resp["comment_id"])
-                else:
-                    results["errors"].append(f"comment on {pid}: {resp}")
+        comments_raw = (args.get("comments")
+                        or args.get("comment")
+                        or [])
+
+        if isinstance(comments_raw, str):
+            try:
+                comments_raw = json.loads(comments_raw)
+            except (json.JSONDecodeError, ValueError):
+                comments_raw = [comments_raw]
+        if not isinstance(comments_raw, list):
+            comments_raw = [comments_raw]
+
+        if not comments_raw and ("post_id" in args or "content" in args):
+            comments_raw = [args]
+
+        for cm in comments_raw:
+            if isinstance(cm, str):
+                results["errors"].append(
+                    f"comment needs post_id: \"{cm[:80]}\" — "
+                    f"use {{\"post_id\": N, \"content\": \"...\"}}")
+                continue
+            if not isinstance(cm, dict):
+                results["errors"].append(f"invalid comment format: {str(cm)[:100]}")
+                continue
+
+            pid = self._to_int(
+                cm.get("post_id") or cm.get("id") or cm.get("pid"))
+            content = self._to_str(
+                cm.get("content") or cm.get("text")
+                or cm.get("body") or cm.get("message") or "")
+
+            if not pid:
+                results["errors"].append(
+                    f"comment missing post_id: {str(cm)[:100]}")
+                continue
+            if not content:
+                results["errors"].append(
+                    f"comment on P_{pid} has empty content")
+                continue
+
+            resp = await self._api(
+                "POST", f"/sessions/{self.sid}/posts/{pid}/comments",
+                {"content": content})
+            if isinstance(resp, dict) and "comment_id" in resp:
+                results["comments"].append(resp["comment_id"])
+                self._my_comments.add(resp["comment_id"])
+            else:
+                results["errors"].append(f"comment on {pid}: {resp}")
+
+        if not results["post_id"] and not results["comments"] and not results["errors"]:
+            results["errors"].append(
+                "Nothing submitted. Include a post or comments to contribute.")
 
         return results
 
@@ -252,15 +347,25 @@ class ToolExecutor:
                                {"reason": reason})
 
     @staticmethod
-    def python_exec(code: str) -> str:
+    async def python_exec(code: str, timeout: float = 10) -> str:
         if not code:
             return "Error: code is required"
-        buf = io.StringIO()
-        restricted_globals = {"__builtins__": __builtins__}
         try:
-            with contextlib.redirect_stdout(buf):
-                exec(code, restricted_globals)  # noqa: S102
-            output = buf.getvalue()
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", code,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return "Error: execution timed out (10s limit)"
+            output = stdout.decode(errors="replace").strip()
+            if proc.returncode != 0:
+                return f"Error: {output}" if output else "Error: non-zero exit code"
             return output if output else "(no output)"
         except Exception as e:
             return f"Error: {type(e).__name__}: {e}"
