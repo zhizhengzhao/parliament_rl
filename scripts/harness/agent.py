@@ -88,6 +88,13 @@ class AgentResult:
     posts_created: int = 0
     comments_created: int = 0
     votes_cast: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    fallback_parses: int = 0
+    api_errors: int = 0
+    llm_errors: int = 0
+    no_tool_responses: int = 0
+    wait_time: float = 0
 
 
 # ── Prompt building ───────────────────────────────────────
@@ -200,15 +207,11 @@ async def _collect_from_queue(
     Returns collected items (list[dict]), a nudge string, or None (session end).
     Ends early if a post or comment arrives.
     """
-    # Phase 1: poll until queue has something (1s interval)
-    while True:
-        try:
-            first = await asyncio.wait_for(queue.get(), timeout=300)
-        except asyncio.TimeoutError:
-            return None
-        if first is not None:
-            break
-    # first could be None (session end), str (nudge), or list (content)
+    # Phase 1: poll until queue has something
+    try:
+        first = await asyncio.wait_for(queue.get(), timeout=300)
+    except asyncio.TimeoutError:
+        return None
     if first is None:
         return None
     if isinstance(first, str):
@@ -233,7 +236,7 @@ async def _collect_from_queue(
         except asyncio.TimeoutError:
             continue
         if item is None:
-            return collected if collected else None
+            return None
         if isinstance(item, str):
             # Nudge during collection — treat as end of collection
             collected.append({"type": "nudge", "content": item})
@@ -281,9 +284,19 @@ async def run_agent_round(
                 http, llm_endpoint, model_name, messages, tools)
         except Exception as e:
             llm_dur = time.time() - llm_start
+            result.llm_errors += 1
             ts = datetime.now().strftime("%H:%M:%S")
             print(f"  [{ts}] {name} step={step} LLM ERROR {llm_dur:.1f}s "
                   f"ctx={context_msgs}msgs: {e}", flush=True)
+            if llm_log_dir:
+                _save_llm_log(llm_log_dir / f"{name}.jsonl", {
+                    "round": result.rounds, "step": step,
+                    "timestamp": datetime.now().isoformat(),
+                    "duration_s": round(llm_dur, 2),
+                    "status": "error",
+                    "context_msgs": context_msgs,
+                    "error": str(e),
+                })
             consecutive_errors += 1
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 result.exit_reason = "llm_errors"
@@ -298,8 +311,13 @@ async def run_agent_round(
 
         assistant_msg = llm_response["choices"][0]["message"]
         usage = llm_response.get("usage", {})
+        prompt_tok = usage.get("prompt_tokens", 0)
+        completion_tok = usage.get("completion_tokens", 0)
+        result.total_prompt_tokens += prompt_tok
+        result.total_completion_tokens += completion_tok
         tool_calls = assistant_msg.get("tool_calls")
 
+        fallback_used = False
         if not tool_calls:
             content = assistant_msg.get("content") or ""
             parsed = _parse_tool_call_from_content(content)
@@ -314,21 +332,36 @@ async def run_agent_round(
                     },
                 }]
                 assistant_msg["tool_calls"] = tool_calls
+                fallback_used = True
+                result.fallback_parses += 1
 
         tool_names = [tc["function"]["name"] for tc in (tool_calls or [])]
 
         ts = datetime.now().strftime("%H:%M:%S")
+        fb_tag = " [fallback]" if fallback_used else ""
         print(f"  [{ts}] {name} step={step} LLM {llm_dur:.1f}s "
-              f"prompt={usage.get('prompt_tokens',0)} "
+              f"prompt={prompt_tok} comp={completion_tok} "
               f"ctx={context_msgs}msgs gpu=:{gpu_port} "
-              f"tools={tool_names or 'no_tool'}", flush=True)
+              f"tools={tool_names or 'no_tool'}{fb_tag}", flush=True)
 
         if not tool_calls:
+            result.no_tool_responses += 1
             no_tool_streak.append({
                 "round": result.rounds, "step": step,
                 "timestamp": datetime.now().isoformat(),
                 "response": llm_response,
             })
+            if llm_log_dir:
+                _save_llm_log(llm_log_dir / f"{name}.jsonl", {
+                    "round": result.rounds, "step": step,
+                    "timestamp": datetime.now().isoformat(),
+                    "duration_s": round(llm_dur, 2),
+                    "status": "no_tool",
+                    "prompt_tokens": prompt_tok,
+                    "completion_tokens": completion_tok,
+                    "context_msgs": context_msgs,
+                    "content_preview": (assistant_msg.get("content") or "")[:500],
+                })
             if len(no_tool_streak) >= MAX_NO_TOOL_RETRIES:
                 _save_discard_streak(discard_dir, name, no_tool_streak)
                 result.exit_reason = "no_tool"
@@ -340,17 +373,21 @@ async def run_agent_round(
             no_tool_streak = []
 
         if llm_log_dir:
+            last_user_msg = None
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    last_user_msg = m.get("content", "")
+                    break
             _save_llm_log(llm_log_dir / f"{name}.jsonl", {
                 "round": result.rounds, "step": step,
                 "timestamp": datetime.now().isoformat(),
                 "duration_s": round(llm_dur, 2),
-                "request": {
-                    "model": model_name,
-                    "messages": messages,
-                    "tools": tools,
-                    "tool_choice": "auto",
-                    "max_tokens": 4096,
-                },
+                "status": "fallback" if fallback_used else "ok",
+                "prompt_tokens": prompt_tok,
+                "completion_tokens": completion_tok,
+                "context_msgs": context_msgs,
+                "tool_calls": tool_names,
+                "last_user_message": (last_user_msg or "")[:1000],
                 "response": llm_response,
             })
 
@@ -386,6 +423,8 @@ async def run_agent_round(
                     submit_result.get("comments", []))
                 result.votes_cast += len(
                     submit_result.get("votes", []))
+                result.api_errors += len(
+                    submit_result.get("errors", []))
                 if end_action is None:
                     end_action = "submit"
                     end_args = fn_args
@@ -458,6 +497,7 @@ async def run_agent(
         result.exit_reason = "exception"
         result.error = traceback.format_exc()
         processing.discard(name)
+        submit_event.set()
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"  [{ts}] {name} EXCEPTION:\n{result.error}", flush=True)
         return result
@@ -499,8 +539,9 @@ async def _run_agent_inner(
                     "content": "Parliament is empty. No one has posted yet. Begin.",
                 })
             else:
-                # Judge waits for first content via collection window
+                wait_start = time.time()
                 collected = await _collect_from_queue(new_content_queue)
+                result.wait_time += time.time() - wait_start
                 if collected is None:
                     result.exit_reason = "session_end"
                     break
@@ -515,8 +556,9 @@ async def _run_agent_inner(
                         "content": f"New content to evaluate:\n\n{text}",
                     })
         else:
-            # Collection window: wait for content, collect for N seconds
+            wait_start = time.time()
             collected = await _collect_from_queue(new_content_queue)
+            result.wait_time += time.time() - wait_start
             if collected is None:
                 result.exit_reason = "session_end"
                 break
@@ -546,18 +588,15 @@ async def _run_agent_inner(
             llm_log_dir=llm_log_dir, discard_dir=discard_dir)
 
         processing.discard(name)
+        submit_event.set()
 
         if round_result is None:
             if result.exit_reason:
                 break
-            submit_event.set()
             continue
 
-        action = round_result.get("_action")
-        submit_event.set()
-        if action == "wait":
+        if round_result.get("_action") == "wait":
             pass
-        # else: normal submit
 
     await executor.leave(result.exit_reason or "completed")
     processing.discard(name)

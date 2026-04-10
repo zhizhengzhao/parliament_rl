@@ -151,6 +151,7 @@ async def run_session(
         session_discard_dir = discard_dir / sid[:8]
         session_discard_dir.mkdir(parents=True, exist_ok=True)
 
+    _sess_t0 = time.time()
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"\n  [{ts}] Session {sid[:8]} starting on :{gpu_port}", flush=True)
 
@@ -208,7 +209,8 @@ async def run_session(
         last_vote_id = 0
         idle_rounds = 0
 
-        for round_num in range(max_rounds * 3):
+        round_num = 0
+        while True:
             if all(t.done() for t in agent_tasks.values()):
                 break
 
@@ -305,6 +307,8 @@ async def run_session(
                                 await asyncio.sleep(1)
                         break
 
+            round_num += 1
+
         # Signal remaining agents to stop
         for q in agent_queues.values():
             try:
@@ -324,6 +328,7 @@ async def run_session(
                 name="?", role="?", session_id=sid,
                 exit_reason="exception", error=str(r)))
 
+    session_dur = time.time() - _sess_t0
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"  [{ts}] Session {sid[:8]} done on :{gpu_port}", flush=True)
     for r in session_results:
@@ -334,7 +339,22 @@ async def run_session(
         print(f"    [{icon}] {r.name:15s} {r.role:6s} "
               f"{r.exit_reason:15s} {r.rounds:2d}r {r.llm_calls:2d}llm "
               f"{r.posts_created}p {r.comments_created}c {r.votes_cast}v "
-              f"{r.duration:.0f}s", flush=True)
+              f"{r.duration:.0f}s tok={r.total_prompt_tokens}+{r.total_completion_tokens} "
+              f"fb={r.fallback_parses} err={r.api_errors},{r.llm_errors} "
+              f"wait={r.wait_time:.0f}s", flush=True)
+
+    if session_llm_dir:
+        summary = {
+            "session_id": sid,
+            "title": session.get("title", ""),
+            "gpu_port": gpu_port,
+            "timestamp": datetime.now().isoformat(),
+            "rounds": round_num,
+            "agents": [asdict(r) for r in session_results],
+        }
+        summary_path = session_llm_dir / "session_summary.json"
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
 
     return session_results
 
@@ -438,6 +458,15 @@ async def run_experiment(
     total_posts = sum(r.posts_created for r in all_results)
     total_comments = sum(r.comments_created for r in all_results)
     total_votes = sum(r.votes_cast for r in all_results)
+    total_prompt_tok = sum(r.total_prompt_tokens for r in all_results)
+    total_comp_tok = sum(r.total_completion_tokens for r in all_results)
+    total_fallbacks = sum(r.fallback_parses for r in all_results)
+    total_api_err = sum(r.api_errors for r in all_results)
+    total_llm_err = sum(r.llm_errors for r in all_results)
+    total_no_tool = sum(r.no_tool_responses for r in all_results)
+
+    from collections import Counter
+    exit_counts = dict(Counter(r.exit_reason for r in all_results))
 
     print(f"\n{'='*70}", flush=True)
     print(f"Experiment complete!", flush=True)
@@ -447,6 +476,10 @@ async def run_experiment(
     print(f"  Posts:       {total_posts}", flush=True)
     print(f"  Comments:    {total_comments}", flush=True)
     print(f"  Votes:       {total_votes}", flush=True)
+    print(f"  Tokens:      {total_prompt_tok} prompt + {total_comp_tok} completion", flush=True)
+    print(f"  Errors:      {total_llm_err} LLM, {total_api_err} API, "
+          f"{total_no_tool} no_tool, {total_fallbacks} fallback", flush=True)
+    print(f"  Exit reasons:{exit_counts}", flush=True)
     print(f"  View:        {parliament_url}", flush=True)
     print(f"{'='*70}", flush=True)
 
@@ -456,10 +489,24 @@ async def run_experiment(
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     record = {
         "timestamp": datetime.now().isoformat(),
-        "mode": "polling",
+        "mode": "event-driven",
         "config": get_config(),
         "duration_seconds": round(duration, 1),
         "sessions": [s["session_id"] for s in open_sessions],
+        "summary": {
+            "agents_ok": done,
+            "agents_total": total,
+            "posts": total_posts,
+            "comments": total_comments,
+            "votes": total_votes,
+            "prompt_tokens": total_prompt_tok,
+            "completion_tokens": total_comp_tok,
+            "llm_errors": total_llm_err,
+            "api_errors": total_api_err,
+            "no_tool_responses": total_no_tool,
+            "fallback_parses": total_fallbacks,
+            "exit_reasons": exit_counts,
+        },
         "results": [asdict(r) for r in all_results],
     }
     with open(output_path, "w") as f:
