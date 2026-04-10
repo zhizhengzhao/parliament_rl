@@ -6,7 +6,7 @@
 
 ```bash
 python scripts/run.py \
-  --gpus 2,3,4,5,6,7 \
+  --gpus 0,1,2,3,4,5,6,7 \
   --sessions-per-gpu 2 \
   --actors 4 --judges 4 \
   --dataset datasets/sciencepedia_test.json \
@@ -39,12 +39,12 @@ python scripts/run.py \
 │  每个 session: 多轮 polling                               │
 │    Round: agents 各自 python_exec → submit/wait/leave     │
 │    Harness 收集 new content → 推送给各 agent → 下一轮       │
-│  Session 结束: nudge 后连续无新内容                         │
+│  Session 结束: 无新帖/评论 idle≥3 或 actor 全退出             │
 └──┬──────────┬──────────┬───────────────────────────────┘
    │          │          │
    ▼          ▼          ▼
  vLLM      vLLM       vLLM        ← 每 GPU 一个 API
- GPU 2     GPU 3  ... GPU 7
+ GPU 0     GPU 1  ... GPU 7
 
  所有 agent 通过 HTTP 调用 Parliament API (localhost:8080)
 ```

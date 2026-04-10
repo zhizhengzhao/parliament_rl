@@ -1,7 +1,7 @@
 """Parliament SQLite storage layer.
 
 Tables: users, sessions, posts, comments, votes,
-session_participants, interaction_log.
+session_participants, interaction_log, follows (legacy, unused).
 """
 
 from __future__ import annotations

@@ -126,8 +126,8 @@ def create_app(name: str | None = None, port: int = PORT,
             pass
         store.log_interaction(
             user_id=user["user_id"] if user else None,
-            user_name=user["name"] if user else None,
-            user_role=user.get("role") if user else None,
+            user_name=user["name"] if user else "",
+            user_role=user.get("role", "") if user else "",
             session_id=_sid_from_path(path),
             method=request.method, endpoint=path,
             request_summary="",

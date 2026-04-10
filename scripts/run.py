@@ -7,7 +7,7 @@ to GPUs from a shared queue. On success, Parliament stays up for web UI.
 
 Usage:
     python scripts/run.py \
-        --gpus 2,3,4,5,6,7 \
+        --gpus 0,1,2,3,4,5,6,7 \
         --sessions-per-gpu 2 \
         --actors 4 --judges 4 \
         --dataset datasets/sciencepedia_test.json \
