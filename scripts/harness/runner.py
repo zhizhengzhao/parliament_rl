@@ -1,8 +1,9 @@
-"""Global experiment scheduler — polling mode.
+"""Global experiment scheduler — event-driven polling mode.
 
-Pure polling: runner waits for all agents to finish their round (processing
-set empties), then fetches new content and distributes. No event-based
-signaling. Idle detection based on posts + comments only.
+Runner wakes on agent submit_event, immediately fetches and distributes
+new content. Idle detection based on whether new posts/comments exist.
+Two processing sets: processing (actors, or actors+judges in visible mode)
+and judge_processing (judges in not-visible mode).
 """
 
 from __future__ import annotations
@@ -46,12 +47,7 @@ async def _fetch_new_content(
     after_comment_id: int,
     after_vote_id: int,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict], int, int, int]:
-    """Fetch all new posts, comments, and votes from Parliament DB.
-
-    Returns four separate lists + updated high-water marks:
-        posts, comments, actor_votes, judge_votes,
-        max_post_id, max_comment_id, max_vote_id
-    """
+    """Fetch all new posts, comments, and votes from Parliament DB."""
     headers = {"Authorization": f"Bearer {admin_key}",
                "Content-Type": "application/json"}
 
@@ -159,14 +155,21 @@ async def run_session(
     print(f"\n  [{ts}] Session {sid[:8]} starting on :{gpu_port}", flush=True)
 
     agent_queues: dict[str, asyncio.Queue] = {}
+    agent_events: dict[str, asyncio.Event] = {}
     all_names = [a["name"] for a in actors] + [j["name"] for j in judges]
     for name in all_names:
         agent_queues[name] = asyncio.Queue()
+        agent_events[name] = asyncio.Event()
 
     actor_name_set = {a["name"] for a in actors}
     judge_name_set = {j["name"] for j in judges}
-    processing: set[str] = set(actor_name_set)
     judge_votes_visible = get_config().get("judge_votes_visible", True)
+
+    # Two processing sets:
+    # processing: actors always; + judges if visible
+    # judge_processing: judges if NOT visible (for end-of-session wait)
+    processing: set[str] = set(actor_name_set)
+    judge_processing: set[str] = set()
 
     async with aiohttp.ClientSession() as http:
         agent_tasks = {}
@@ -178,12 +181,14 @@ async def run_session(
                 parliament_url=parliament_url, llm_endpoint=endpoint,
                 model_name=model_name,
                 new_content_queue=agent_queues[a["name"]],
+                submit_event=agent_events[a["name"]],
                 processing=processing,
                 http=http, max_rounds=max_rounds, timeout=timeout,
                 llm_log_dir=session_llm_dir,
                 discard_dir=session_discard_dir,
             ))
         for j in judges:
+            jp = processing if judge_votes_visible else judge_processing
             agent_tasks[j["name"]] = asyncio.create_task(run_agent(
                 name=j["name"], role="judge", api_key=j["api_key"],
                 session_id=sid, session_title=session["title"],
@@ -191,7 +196,8 @@ async def run_session(
                 parliament_url=parliament_url, llm_endpoint=endpoint,
                 model_name=model_name,
                 new_content_queue=agent_queues[j["name"]],
-                processing=processing,
+                submit_event=agent_events[j["name"]],
+                processing=jp,
                 http=http, max_rounds=max_rounds, timeout=timeout,
                 llm_log_dir=session_llm_dir,
                 discard_dir=session_discard_dir,
@@ -206,24 +212,23 @@ async def run_session(
             if all(t.done() for t in agent_tasks.values()):
                 break
 
-            # Poll: wait until processing is empty (all agents idle)
-            for _ in range(60):
-                if not processing:
-                    break
-                await asyncio.sleep(1)
-            else:
-                ts = datetime.now().strftime("%H:%M:%S")
-                print(f"  [{ts}] Session {sid[:8]} "
-                      f"processing timeout, stuck agents: "
-                      f"{processing}", flush=True)
-                processing.clear()
+            # Wait for any agent event (or 60s timeout)
+            pending = [e for e in agent_events.values()
+                        if not e.is_set()]
+            if pending:
+                waits = [asyncio.create_task(e.wait()) for e in pending]
+                try:
+                    await asyncio.wait_for(
+                        asyncio.wait(waits,
+                                     return_when=asyncio.FIRST_COMPLETED),
+                        timeout=60)
+                except asyncio.TimeoutError:
+                    pass
+                for w in waits:
+                    w.cancel()
 
-            # All actors left → session ends
-            if all(agent_tasks[n].done() for n in actor_name_set):
-                ts = datetime.now().strftime("%H:%M:%S")
-                print(f"  [{ts}] Session {sid[:8]} "
-                      f"all actors done, ending", flush=True)
-                break
+            for e in agent_events.values():
+                e.clear()
 
             # Fetch new content
             posts, comments, actor_votes, judge_votes, \
@@ -253,38 +258,52 @@ async def run_session(
                     to_push.sort(key=lambda x: (
                         type_order.get(x["type"], 9), x["id"]))
                     agent_queues[name].put_nowait(to_push)
-                    processing.add(name)
 
-            # Idle: only posts + comments count as discussion progress
-            has_discussion = bool(posts or comments)
-
-            if has_discussion:
-                idle_rounds = 0
-                ts = datetime.now().strftime("%H:%M:%S")
-                print(f"  [{ts}] Session {sid[:8]} round={round_num} "
-                      f"distributed new content", flush=True)
-            elif actor_votes or (judge_votes_visible and judge_votes):
-                ts = datetime.now().strftime("%H:%M:%S")
-                print(f"  [{ts}] Session {sid[:8]} round={round_num} "
-                      f"distributed votes only", flush=True)
+            # Determine if there's meaningful content
+            if judge_votes_visible:
+                has_content = bool(posts or comments
+                                   or actor_votes or judge_votes)
             else:
-                idle_rounds += 1
-                active_actors = [n for n in actor_name_set
-                                 if not agent_tasks[n].done()]
-                if idle_rounds <= 2 and active_actors:
-                    for aname in active_actors:
-                        agent_queues[aname].put_nowait(
-                            "No new posts or comments from anyone. "
-                            "All scientists are waiting. Break the "
-                            "silence \u2014 post your next analysis "
-                            "step.")
-                        processing.add(aname)
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    print(f"  [{ts}] Session {sid[:8]} "
-                          f"round={round_num} nudged actors "
-                          f"(idle={idle_rounds})", flush=True)
-                elif idle_rounds >= 3:
-                    break
+                has_content = bool(posts or comments or actor_votes)
+
+            if has_content:
+                idle_rounds = 0
+                has_disc = bool(posts or comments)
+                ts = datetime.now().strftime("%H:%M:%S")
+                label = "new content" if has_disc else "votes only"
+                print(f"  [{ts}] Session {sid[:8]} round={round_num} "
+                      f"distributed {label}", flush=True)
+            else:
+                # No content — check processing
+                if processing:
+                    pass  # agents still working
+                else:
+                    idle_rounds += 1
+                    active_actors = [n for n in actor_name_set
+                                     if not agent_tasks[n].done()]
+                    if idle_rounds <= 1 and active_actors:
+                        for aname in active_actors:
+                            agent_queues[aname].put_nowait(
+                                "No new posts or comments from anyone. "
+                                "All scientists are waiting. Break the "
+                                "silence \u2014 post your next analysis "
+                                "step or summarize the final answer.")
+                        ts = datetime.now().strftime("%H:%M:%S")
+                        print(f"  [{ts}] Session {sid[:8]} "
+                              f"round={round_num} nudged actors "
+                              f"(idle={idle_rounds})", flush=True)
+                    elif idle_rounds > 1:
+                        # Session ending — wait for judge_processing
+                        if judge_processing:
+                            ts = datetime.now().strftime("%H:%M:%S")
+                            print(f"  [{ts}] Session {sid[:8]} "
+                                  f"waiting for judges to finish",
+                                  flush=True)
+                            for _ in range(120):
+                                if not judge_processing:
+                                    break
+                                await asyncio.sleep(1)
+                        break
 
         # Signal remaining agents to stop
         for q in agent_queues.values():
@@ -309,8 +328,8 @@ async def run_session(
     print(f"  [{ts}] Session {sid[:8]} done on :{gpu_port}", flush=True)
     for r in session_results:
         icon = {"session_end": "+", "no_new_content": "+", "max_rounds": "M",
-                "timeout": "T", "llm_errors": "!", "leave": "L",
-                "step_limit": "S", "no_tool": "N",
+                "timeout": "T", "llm_errors": "!", "step_limit": "S",
+                "no_tool": "N",
                 }.get(r.exit_reason, "?")
         print(f"    [{icon}] {r.name:15s} {r.role:6s} "
               f"{r.exit_reason:15s} {r.rounds:2d}r {r.llm_calls:2d}llm "
@@ -352,8 +371,8 @@ async def run_experiment(
         return 1
 
     all_users = _api_sync(parliament_url, "GET", "/admin/users", admin_key)
-    actors = [u for u in all_users if u.get("role") == "actor"][:num_actors]
-    judges = [u for u in all_users if u.get("role") == "judge"][:num_judges]
+    actors_list = [u for u in all_users if u.get("role") == "actor"][:num_actors]
+    judges_list = [u for u in all_users if u.get("role") == "judge"][:num_judges]
 
     session_details: dict[str, dict] = {}
     for s in open_sessions:
@@ -390,7 +409,7 @@ async def run_experiment(
             sid = session["session_id"]
             detail = session_details.get(sid, {})
             results = await run_session(
-                session, detail, actors, judges,
+                session, detail, actors_list, judges_list,
                 parliament_url, admin_key, ep, model_name,
                 max_rounds, timeout,
                 llm_log_dir=llm_log_dir, discard_dir=discard_dir)
@@ -414,7 +433,7 @@ async def run_experiment(
 
     done = sum(1 for r in all_results
                if r.exit_reason in ("session_end", "no_new_content",
-                                    "max_rounds", "leave"))
+                                    "max_rounds"))
     total = len(all_results)
     total_posts = sum(r.posts_created for r in all_results)
     total_comments = sum(r.comments_created for r in all_results)

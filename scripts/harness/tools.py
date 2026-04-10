@@ -1,6 +1,6 @@
 """Tool definitions and execution for Parliament agents (polling mode).
 
-Actor tools: python_exec, submit, wait, leave
+Actor tools: python_exec, submit, wait
 Judge tools: python_exec, submit
 
 Session ID and API key are injected automatically; the LLM never sees them.
@@ -94,21 +94,6 @@ ACTOR_TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "leave",
-            "description": (
-                "Leave the session permanently. This is IRREVERSIBLE. "
-                "Only use when ALL of these are true: "
-                "(1) a correct, complete answer has been clearly established, "
-                "(2) you have voted on every post and comment you have read, "
-                "(3) your continued participation would add no value. "
-                "If in doubt, use 'wait' instead."
-            ),
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
 ]
 
 JUDGE_TOOLS = [
@@ -171,7 +156,6 @@ class ToolExecutor:
         """Execute a submit tool call. Returns summary of what was done."""
         results = {"post_id": None, "comments": [], "votes": [], "errors": []}
 
-        # Post (actor only)
         post_content = args.get("post", "")
         if post_content and role == "actor":
             resp = await self._api("POST", f"/sessions/{self.sid}/posts",
@@ -181,7 +165,6 @@ class ToolExecutor:
             else:
                 results["errors"].append(f"post: {resp}")
 
-        # Comments (actor only)
         for cm in args.get("comments", []):
             if role != "actor":
                 continue
@@ -196,7 +179,6 @@ class ToolExecutor:
                 else:
                     results["errors"].append(f"comment on {pid}: {resp}")
 
-        # Votes
         for v in args.get("votes", []):
             ttype = v.get("target_type", "post")
             tid = v.get("target_id")

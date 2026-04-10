@@ -1,8 +1,10 @@
-"""Single agent loop — polling mode.
+"""Single agent loop — polling mode with N-second collection window.
 
 Each agent runs in rounds. Within a round, the LLM can call python_exec
-any number of times. The round ends when the agent calls submit, wait,
-or leave. Between rounds, the harness pushes new content.
+any number of times. The round ends when the agent calls submit or wait.
+Between rounds, the agent waits for new content via a collection window:
+poll queue every 1s, on first content start N-second timer, collect all
+content during the window, then start next round.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ import aiohttp
 from .tools import ToolExecutor, get_tools
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
+
+COLLECT_WINDOW_S = 10
 
 
 # ── Config loading ────────────────────────────────────────
@@ -64,7 +68,7 @@ def _defaults() -> tuple:
         return (c["max_rounds"], c["timeout_s"],
                 c["max_consecutive_errors"], c["llm_timeout_s"])
     except Exception:
-        return (10, 600, 5, 120)
+        return (20, 600, 3, 120)
 
 MAX_ROUNDS, TIMEOUT_S, MAX_CONSECUTIVE_ERRORS, LLM_TIMEOUT_S = _defaults()
 
@@ -99,10 +103,7 @@ def build_system_prompt(name: str, role: str, session_title: str,
 
 
 def format_new_content(items: list[dict]) -> str:
-    """Format new posts/comments/votes for injection into context.
-
-    Uses P_xxx for posts, C_xxx for comments, V for votes.
-    """
+    """Format new posts/comments/votes for injection into context."""
     if not items:
         return ""
     parts = []
@@ -143,11 +144,7 @@ def _save_llm_log(path: Path, entry: dict):
 # ── Fallback tool call parser ─────────────────────────────
 
 def _parse_tool_call_from_content(content: str) -> dict | None:
-    """Extract tool call from content when vLLM's parser misses it.
-
-    Qwen models sometimes emit <tool_call><function=NAME><parameter=...>
-    as plain text that vLLM's qwen3_coder parser fails to recognize.
-    """
+    """Extract tool call from content when vLLM's parser misses it."""
     tc_match = re.search(
         r'<tool_call>(.*?)(?:</tool_call>|$)', content, re.DOTALL)
     if not tc_match:
@@ -192,6 +189,62 @@ def _save_discard_streak(discard_dir: Path, name: str, streak: list[dict]):
         f.write(json.dumps(streak, ensure_ascii=False, default=str) + "\n")
 
 
+# ── Collection window ─────────────────────────────────────
+
+async def _collect_from_queue(
+    queue: asyncio.Queue,
+    window_s: float = COLLECT_WINDOW_S,
+) -> list | str | None:
+    """Wait for queue content, then collect for up to window_s seconds.
+
+    Returns collected items (list[dict]), a nudge string, or None (session end).
+    Ends early if a post or comment arrives.
+    """
+    # Phase 1: poll until queue has something (1s interval)
+    while True:
+        try:
+            first = await asyncio.wait_for(queue.get(), timeout=300)
+        except asyncio.TimeoutError:
+            return None
+        if first is not None:
+            break
+    # first could be None (session end), str (nudge), or list (content)
+    if first is None:
+        return None
+    if isinstance(first, str):
+        return first
+
+    collected = list(first)
+    has_post_or_comment = any(
+        i["type"] in ("post", "comment") for i in collected)
+
+    if has_post_or_comment:
+        return collected
+
+    # Phase 2: only votes so far — wait up to window_s for posts/comments
+    deadline = time.time() + window_s
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        try:
+            item = await asyncio.wait_for(
+                queue.get(), timeout=min(remaining, 1.0))
+        except asyncio.TimeoutError:
+            continue
+        if item is None:
+            return collected if collected else None
+        if isinstance(item, str):
+            # Nudge during collection — treat as end of collection
+            collected.append({"type": "nudge", "content": item})
+            return collected
+        collected.extend(item)
+        if any(i["type"] in ("post", "comment") for i in item):
+            break
+
+    return collected
+
+
 # ── Single agent round ────────────────────────────────────
 
 async def run_agent_round(
@@ -206,10 +259,10 @@ async def run_agent_round(
     llm_log_dir: Path | None = None,
     discard_dir: Path | None = None,
 ) -> dict | None:
-    """Run one round: LLM loops on python_exec until it calls submit/wait/leave.
+    """Run one round: LLM loops on python_exec until it calls submit/wait.
 
     Returns:
-        dict with submit args, or {"_action": "wait"/"leave"}, or None on failure.
+        dict with submit args, or {"_action": "wait"}, or None on failure.
     """
     tools = get_tools(role)
     gpu_port = llm_endpoint.split(":")[2].split("/")[0]
@@ -247,7 +300,6 @@ async def run_agent_round(
         usage = llm_response.get("usage", {})
         tool_calls = assistant_msg.get("tool_calls")
 
-        # Fallback: parse tool calls from content when vLLM misses them
         if not tool_calls:
             content = assistant_msg.get("content") or ""
             parsed = _parse_tool_call_from_content(content)
@@ -272,7 +324,6 @@ async def run_agent_round(
               f"tools={tool_names or 'no_tool'}", flush=True)
 
         if not tool_calls:
-            # Buffer the discarded response
             no_tool_streak.append({
                 "round": result.rounds, "step": step,
                 "timestamp": datetime.now().isoformat(),
@@ -284,12 +335,10 @@ async def run_agent_round(
                 return None
             continue
 
-        # Tool call succeeded — flush any pending streak
         if no_tool_streak:
             _save_discard_streak(discard_dir, name, no_tool_streak)
             no_tool_streak = []
 
-        # Log successful calls only
         if llm_log_dir:
             _save_llm_log(llm_log_dir / f"{name}.jsonl", {
                 "round": result.rounds, "step": step,
@@ -305,7 +354,7 @@ async def run_agent_round(
                 "response": llm_response,
             })
 
-        _TOOL_PRIORITY = {"python_exec": 0, "submit": 1, "wait": 2, "leave": 3}
+        _TOOL_PRIORITY = {"python_exec": 0, "submit": 1, "wait": 2}
         tool_calls = sorted(
             tool_calls,
             key=lambda tc: _TOOL_PRIORITY.get(tc["function"]["name"], 99),
@@ -350,15 +399,6 @@ async def run_agent_round(
                 if end_action is None:
                     end_action = "wait"
 
-            elif fn_name == "leave":
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": "Leaving session.",
-                })
-                if end_action is None:
-                    end_action = "leave"
-
             elif fn_name == "python_exec":
                 output = ToolExecutor.python_exec(fn_args.get("code", ""))
                 messages.append({
@@ -372,15 +412,13 @@ async def run_agent_round(
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "content": (f"Error: unknown tool '{fn_name}'. "
-                                "Use python_exec, submit, wait, or leave."),
+                                "Use python_exec, submit, or wait."),
                 })
 
         if end_action == "submit":
             return end_args
         elif end_action == "wait":
             return {"_action": "wait"}
-        elif end_action == "leave":
-            return {"_action": "leave"}
 
     result.exit_reason = "step_limit"
     return None
@@ -399,6 +437,7 @@ async def run_agent(
     llm_endpoint: str,
     model_name: str,
     new_content_queue: asyncio.Queue,
+    submit_event: asyncio.Event,
     processing: set[str],
     http: aiohttp.ClientSession,
     max_rounds: int = MAX_ROUNDS,
@@ -413,7 +452,7 @@ async def run_agent(
         return await _run_agent_inner(
             name, role, api_key, session_id, session_title,
             reference_solution, parliament_url, llm_endpoint, model_name,
-            new_content_queue, processing, http,
+            new_content_queue, submit_event, processing, http,
             max_rounds, timeout, llm_log_dir, discard_dir, result)
     except Exception:
         result.exit_reason = "exception"
@@ -428,7 +467,8 @@ async def _run_agent_inner(
     name: str, role: str, api_key: str, session_id: str,
     session_title: str, reference_solution: str,
     parliament_url: str, llm_endpoint: str, model_name: str,
-    new_content_queue: asyncio.Queue, processing: set[str],
+    new_content_queue: asyncio.Queue, submit_event: asyncio.Event,
+    processing: set[str],
     http: aiohttp.ClientSession,
     max_rounds: int, timeout: float,
     llm_log_dir: Path | None, discard_dir: Path | None,
@@ -459,48 +499,45 @@ async def _run_agent_inner(
                     "content": "Parliament is empty. No one has posted yet. Begin.",
                 })
             else:
-                try:
-                    new_items = await asyncio.wait_for(
-                        new_content_queue.get(), timeout=300)
-                except asyncio.TimeoutError:
-                    result.exit_reason = "no_new_content"
-                    break
-                if new_items is None:
+                # Judge waits for first content via collection window
+                collected = await _collect_from_queue(new_content_queue)
+                if collected is None:
                     result.exit_reason = "session_end"
                     break
-                if isinstance(new_items, str):
-                    processing.add(name)
-                    messages.append({"role": "user", "content": new_items})
+                processing.add(name)
+                if isinstance(collected, str):
+                    messages.append({"role": "user", "content": collected})
                 else:
-                    processing.add(name)
-                    text = format_new_content(new_items)
+                    items = [i for i in collected if i.get("type") != "nudge"]
+                    text = format_new_content(items)
                     messages.append({
                         "role": "user",
                         "content": f"New content to evaluate:\n\n{text}",
                     })
         else:
-            try:
-                new_items = await asyncio.wait_for(
-                    new_content_queue.get(), timeout=300)
-            except asyncio.TimeoutError:
-                result.exit_reason = "no_new_content"
-                break
-            if new_items is None:
+            # Collection window: wait for content, collect for N seconds
+            collected = await _collect_from_queue(new_content_queue)
+            if collected is None:
                 result.exit_reason = "session_end"
                 break
-            if isinstance(new_items, str):
-                processing.add(name)
-                messages.append({"role": "user", "content": new_items})
-            elif new_items:
-                processing.add(name)
-                text = format_new_content(new_items)
+            processing.add(name)
+            if isinstance(collected, str):
+                messages.append({"role": "user", "content": collected})
+            else:
+                nudges = [i for i in collected
+                          if i.get("type") == "nudge"]
+                items = [i for i in collected
+                         if i.get("type") != "nudge"]
+                parts = []
+                if items:
+                    parts.append(format_new_content(items))
+                for n in nudges:
+                    parts.append(n["content"])
                 messages.append({
                     "role": "user",
-                    "content": f"New content since your last submission:\n\n{text}",
+                    "content": "\n\n".join(parts) if parts
+                    else "No new content.",
                 })
-            else:
-                result.exit_reason = "no_new_content"
-                break
 
         # Run the round
         round_result = await run_agent_round(
@@ -508,20 +545,19 @@ async def _run_agent_inner(
             llm_endpoint, model_name, http, result,
             llm_log_dir=llm_log_dir, discard_dir=discard_dir)
 
+        processing.discard(name)
+
         if round_result is None:
-            processing.discard(name)
             if result.exit_reason:
                 break
+            submit_event.set()
             continue
 
         action = round_result.get("_action")
-        processing.discard(name)
-        if action == "leave":
-            result.exit_reason = "leave"
-            break
-        elif action == "wait":
-            pass  # wait for new content next iteration
-        # else: normal submit, wait for new content next iteration
+        submit_event.set()
+        if action == "wait":
+            pass
+        # else: normal submit
 
     await executor.leave(result.exit_reason or "completed")
     processing.discard(name)
