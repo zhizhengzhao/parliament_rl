@@ -15,6 +15,7 @@ import asyncio
 import json
 import time
 import urllib.request
+from collections import Counter
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -35,7 +36,7 @@ def _api_sync(base_url: str, method: str, path: str, key: str) -> dict | list:
         return json.loads(urllib.request.urlopen(req, timeout=30).read())
     except Exception as e:
         print(f"  API error: {method} {path}: {e}")
-        return {} if method != "GET" else []
+        return {}
 
 
 ANONYMOUS_VOTER = "Anonymous Scientist"
@@ -58,7 +59,12 @@ async def _fetch_new_content(
         f"{parliament_url}/admin/sessions/{session_id}/posts",
         headers=headers,
     ) as resp:
-        all_posts = await resp.json() if resp.status == 200 else []
+        if resp.status == 200:
+            all_posts = await resp.json()
+        else:
+            print(f"  Warning: fetch posts failed ({resp.status}) "
+                  f"for session {session_id[:8]}", flush=True)
+            all_posts = []
 
     posts, comments = [], []
     max_post_id = after_post_id
@@ -88,7 +94,12 @@ async def _fetch_new_content(
         f"{parliament_url}/admin/sessions/{session_id}/votes",
         headers=headers,
     ) as resp:
-        all_votes = await resp.json() if resp.status == 200 else []
+        if resp.status == 200:
+            all_votes = await resp.json()
+        else:
+            print(f"  Warning: fetch votes failed ({resp.status}) "
+                  f"for session {session_id[:8]}", flush=True)
+            all_votes = []
 
     post_scores = {}
     comment_scores = {}
@@ -313,6 +324,15 @@ async def run_session(
         results = await asyncio.gather(*agent_tasks.values(),
                                        return_exceptions=True)
 
+        headers = {"Authorization": f"Bearer {admin_key}",
+                   "Content-Type": "application/json"}
+        async with http.post(
+            f"{parliament_url}/sessions/{sid}/close", headers=headers,
+        ) as resp:
+            if resp.status >= 400:
+                print(f"  Warning: failed to close session {sid[:8]}",
+                      flush=True)
+
     session_results: list[AgentResult] = []
     for r in results:
         if isinstance(r, AgentResult):
@@ -389,6 +409,11 @@ async def run_experiment(
     actors_list = [u for u in all_users if u.get("role") == "actor"][:num_actors]
     judges_list = [u for u in all_users if u.get("role") == "judge"][:num_judges]
 
+    if not actors_list or not judges_list:
+        print(f"ERROR: No agents found ({len(actors_list)} actors, "
+              f"{len(judges_list)} judges).")
+        return 1
+
     session_details: dict[str, dict] = {}
     for s in open_sessions:
         detail = _api_sync(parliament_url, "GET",
@@ -460,7 +485,6 @@ async def run_experiment(
     total_llm_err = sum(r.llm_errors for r in all_results)
     total_no_tool = sum(r.no_tool_responses for r in all_results)
 
-    from collections import Counter
     exit_counts = dict(Counter(r.exit_reason for r in all_results))
 
     print(f"\n{'='*70}", flush=True)

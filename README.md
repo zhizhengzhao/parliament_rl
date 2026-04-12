@@ -15,7 +15,7 @@ python scripts/run.py \
   --max-turns 20
 ```
 
-一条命令完成：启动 vLLM（并行）→ 启动 Parliament → 加载题目 → Harness 轮询调度 → 清理。
+一条命令完成：启动 vLLM（并行）→ 启动 Parliament → 加载题目 → Harness 调度 → 清理。自动 tmux 托管，断开终端不影响运行。
 
 产出在 `data/<name>_<timestamp>/`：
 - `parliament.db` — 全部 RL 数据
@@ -27,20 +27,21 @@ python scripts/run.py \
 ## 架构
 
 ```
-┌────────────────────────────────────────────────────────┐
-│                     run.py (调度层)                       │
-│  vLLM 并行启动 → Parliament 启动 → 加载题目 → Harness      │
-└──────────────────────┬─────────────────────────────────┘
-                       │
-┌──────────────────────▼─────────────────────────────────┐
-│               Harness (轮询模式)                         │
-│                                                         │
-│  全局 session 队列 → 动态分配到 GPU                        │
-│  每个 session: 多轮 polling                               │
-│    Round: agents 各自 python_exec → submit/wait/leave     │
-│    Harness 收集 new content → 推送给各 agent → 下一轮       │
-│  Session 结束: 无新帖/评论 idle≥3 或 actor 全退出             │
-└──┬──────────┬──────────┬───────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│                    run.py (调度层)                     │
+│  vLLM 并行启动 → Parliament 启动 → 加载题目 → Harness   │
+└─────────────────────┬───────────────────────────────┘
+                      │
+┌─────────────────────▼───────────────────────────────┐
+│              Harness (event-driven v2)                │
+│                                                       │
+│  全局 session 队列 → 动态分配到 GPU                      │
+│  每个 session: 多轮 event 驱动                           │
+│    Actor: python_exec / vote → submit/wait 结束轮次     │
+│    Judge: python_exec → vote 结束轮次                    │
+│    Runner 只在有 post/comment 时分发（vote 不触发分发）    │
+│  Session 结束: actors 连续 idle > 1 → 等 judges 完成     │
+└──┬──────────┬──────────┬────────────────────────────┘
    │          │          │
    ▼          ▼          ▼
  vLLM      vLLM       vLLM        ← 每 GPU 一个 API
@@ -51,14 +52,15 @@ python scripts/run.py \
 
 ## Agent Tools
 
-**Actor** (Scientist): `python_exec`, `submit`, `wait`, `leave`
-**Judge**: `python_exec`, `submit`
+**Actor** (Scientist): `python_exec`, `vote`, `submit`, `wait`
+**Judge**: `python_exec`, `vote`
 
 每轮：
-1. Harness 把新帖子/评论/投票（P_xxx / C_xxx / V 格式）拼入 agent 的 context
-2. Agent 可调多次 python_exec 做计算
-3. Agent 调 submit（提交内容+投票）、wait（等待）、或 leave（离开）结束轮次
-4. Harness 分发新内容，开始下一轮
+1. Harness 把新帖子/评论/投票推送给 agent
+2. Agent 可调多次 python_exec（计算）和 vote（投票），不结束轮次
+3. Actor 调 submit（发帖/评论）或 wait 结束轮次，唤醒 runner
+4. Judge 调 vote 结束轮次，不唤醒 runner
+5. Runner 在有新帖/评论时分发给所有 agent
 
 Judge 的投票以匿名形式（"Anonymous Scientist"）推送给 actor，受 `judge_votes_visible` 开关控制。
 
@@ -82,9 +84,9 @@ parliament_rl/
 ├── scripts/
 │   ├── run.py                # 一键启动（入口）
 │   └── harness/              # Agent 调度与执行
-│       ├── runner.py          # 全局调度（轮询 + 队列 + nudge）
-│       ├── agent.py           # 单 agent 轮询循环 + fallback parser
-│       └── tools.py           # Tool 定义 + 执行器
+│       ├── runner.py          # 全局调度（event-driven + idle 检测）
+│       ├── agent.py           # 单 agent 循环 + fallback parser
+│       └── tools.py           # Tool 定义 + 执行器（子进程 python_exec）
 ├── parliament/                # 论坛 API 服务
 │   ├── server.py              # FastAPI API
 │   ├── store.py               # SQLite 存储层

@@ -212,7 +212,7 @@ class ToolExecutor:
         return ""
 
     async def execute_votes(self, votes) -> dict:
-        """Execute vote calls with broad format matching."""
+        """Execute vote calls. Handles JSON-in-string from LLM."""
         results: dict[str, list] = {"votes": [], "errors": [], "skipped": []}
 
         if isinstance(votes, str):
@@ -231,22 +231,17 @@ class ToolExecutor:
                 results["errors"].append(f"invalid vote format: {str(v)[:100]}")
                 continue
 
-            ttype = v.get("target_type") or v.get("type", "post")
-            if "comment_id" in v and "target_id" not in v:
-                ttype = "comment"
-            ttype = "comment" if "comment" in str(ttype).lower() else "post"
-
-            tid = self._to_int(
-                v.get("target_id") or v.get("id")
-                or v.get("post_id") or v.get("comment_id"))
-            value = self._to_int(
-                v.get("value") or v.get("vote") or v.get("score"))
+            ttype = v.get("target_type", "post")
+            tid = self._to_int(v.get("target_id"))
+            value = self._to_int(v.get("value"))
 
             if tid is None or value is None:
                 results["errors"].append(f"missing target_id or value: {v}")
                 continue
             if value not in (1, -1):
-                value = 1 if value > 0 else -1
+                results["errors"].append(
+                    f"value must be +1 or -1, got {value}")
+                continue
 
             own = (ttype == "post" and tid in self._my_posts) or \
                   (ttype == "comment" and tid in self._my_comments)
@@ -268,7 +263,7 @@ class ToolExecutor:
         return results
 
     async def execute_submit(self, args: dict) -> dict:
-        """Execute submit (post + comments) with broad format matching."""
+        """Execute submit (post + comments). Handles comment/comments and JSON-in-string."""
         if not isinstance(args, dict):
             return {"post_id": None, "comments": [],
                     "errors": [f"invalid arguments type: {type(args).__name__}"]}
@@ -292,28 +287,22 @@ class ToolExecutor:
             try:
                 comments_raw = json.loads(comments_raw)
             except (json.JSONDecodeError, ValueError):
-                comments_raw = [comments_raw]
+                results["errors"].append(
+                    f"comment needs post_id: \"{comments_raw[:80]}\" — "
+                    f"use {{\"post_id\": N, \"content\": \"...\"}}")
+                comments_raw = []
         if not isinstance(comments_raw, list):
             comments_raw = [comments_raw]
 
-        if not comments_raw and ("post_id" in args or "content" in args):
-            comments_raw = [args]
-
         for cm in comments_raw:
-            if isinstance(cm, str):
+            if not isinstance(cm, dict):
                 results["errors"].append(
-                    f"comment needs post_id: \"{cm[:80]}\" — "
+                    f"invalid comment format: {str(cm)[:100]} — "
                     f"use {{\"post_id\": N, \"content\": \"...\"}}")
                 continue
-            if not isinstance(cm, dict):
-                results["errors"].append(f"invalid comment format: {str(cm)[:100]}")
-                continue
 
-            pid = self._to_int(
-                cm.get("post_id") or cm.get("id") or cm.get("pid"))
-            content = self._to_str(
-                cm.get("content") or cm.get("text")
-                or cm.get("body") or cm.get("message") or "")
+            pid = self._to_int(cm.get("post_id"))
+            content = self._to_str(cm.get("content", ""))
 
             if not pid:
                 results["errors"].append(
@@ -331,7 +320,7 @@ class ToolExecutor:
                 results["comments"].append(resp["comment_id"])
                 self._my_comments.add(resp["comment_id"])
             else:
-                results["errors"].append(f"comment on {pid}: {resp}")
+                results["errors"].append(f"comment on P_{pid}: {resp}")
 
         if not results["post_id"] and not results["comments"] and not results["errors"]:
             results["errors"].append(

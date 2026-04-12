@@ -179,14 +179,17 @@ def create_app(name: str | None = None, port: int = PORT,
         return {"db_path": db_path, "run_dir": os.path.dirname(db_path)}
 
     @app.get("/admin/sessions/{session_id}/posts")
-    def admin_posts(session_id: str,
+    def admin_posts(session_id: str, sort: str = "time",
                     user: dict = Depends(require_admin)):
-        return store.get_all_posts(session_id)
+        posts = store.get_all_posts(session_id)
+        if sort == "score":
+            posts.sort(key=lambda p: p.get("score", 0), reverse=True)
+        return posts
 
     @app.get("/admin/sessions/{session_id}/votes")
     def admin_votes(session_id: str,
                     user: dict = Depends(require_admin)):
-        rows = store.conn.execute(
+        rows = store._fetchall(
             "SELECT v.vote_id, v.user_id, v.post_id, v.comment_id, "
             "v.value, v.previous_value, u.name AS author, u.role "
             "FROM votes v JOIN users u ON v.user_id = u.user_id "
@@ -195,8 +198,7 @@ def create_app(name: str | None = None, port: int = PORT,
             "LEFT JOIN posts p2 ON c.post_id = p2.post_id "
             "WHERE COALESCE(p.session_id, p2.session_id) = ? "
             "ORDER BY v.vote_id",
-            (session_id,),
-        ).fetchall()
+            (session_id,))
         return [dict(r) for r in rows]
 
     # ── Sessions ──────────────────────────────────────────────
@@ -209,6 +211,16 @@ def create_app(name: str | None = None, port: int = PORT,
         _log(user, sid, "POST", "/sessions",
              f"title={_truncate(req.title)}", f"session_id={sid}")
         return result
+
+    @app.post("/sessions/{session_id}/close")
+    def close_session(session_id: str, user: dict = Depends(require_admin)):
+        session = store.get_session(session_id)
+        if not session:
+            raise HTTPException(404, "Session not found")
+        store.close_session(session_id)
+        _log(user, session_id, "POST", f"/sessions/{session_id}/close",
+             "", "closed")
+        return {"session_id": session_id, "status": "closed"}
 
     @app.get("/sessions")
     def list_sessions(user: dict = Depends(get_current_user)):
@@ -319,11 +331,10 @@ def create_app(name: str | None = None, port: int = PORT,
         value = _get_int(body, "value", "vote", "score", "rating")
         if value not in (1, -1):
             raise HTTPException(400, "value must be +1 or -1")
-        comment = store.conn.execute(
+        comment = store._fetchone(
             "SELECT c.comment_id, c.user_id, p.session_id FROM comments c "
             "JOIN posts p ON c.post_id = p.post_id "
-            "WHERE c.comment_id = ?", (comment_id,)
-        ).fetchone()
+            "WHERE c.comment_id = ?", (comment_id,))
         if not comment or comment["session_id"] != session_id:
             raise HTTPException(404, "Comment not found in this session")
         if comment["user_id"] == user["user_id"]:

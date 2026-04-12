@@ -119,11 +119,23 @@ class Store:
     def close(self):
         self.conn.close()
 
+    def _exec(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        with self._lock:
+            return self.conn.execute(sql, params)
+
     def _write(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
             cur = self.conn.execute(sql, params)
             self.conn.commit()
             return cur
+
+    def _fetchone(self, sql: str, params: tuple = ()) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute(sql, params).fetchone()
+
+    def _fetchall(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return self.conn.execute(sql, params).fetchall()
 
     # ── Interaction log ───────────────────────────────────────
 
@@ -142,10 +154,9 @@ class Store:
         )
 
     def get_timeline(self, session_id: str) -> list[dict]:
-        rows = self.conn.execute(
+        rows = self._fetchall(
             "SELECT * FROM interaction_log WHERE session_id = ? "
-            "ORDER BY log_id ASC", (session_id,)
-        ).fetchall()
+            "ORDER BY log_id ASC", (session_id,))
         return [dict(r) for r in rows]
 
     # ── Session participation ────────────────────────────────
@@ -171,12 +182,11 @@ class Store:
                 "status": "left", "reason": reason}
 
     def get_session_participants(self, session_id: str) -> list[dict]:
-        rows = self.conn.execute(
+        rows = self._fetchall(
             "SELECT sp.*, u.name, u.role FROM session_participants sp "
             "JOIN users u ON sp.user_id = u.user_id "
             "WHERE sp.session_id = ? ORDER BY sp.joined_at",
-            (session_id,),
-        ).fetchall()
+            (session_id,))
         return [dict(r) for r in rows]
 
     # ── Users ─────────────────────────────────────────────────
@@ -190,26 +200,22 @@ class Store:
         return self.get_user_by_key(key)
 
     def get_user_by_key(self, api_key: str) -> dict | None:
-        row = self.conn.execute(
-            "SELECT * FROM users WHERE api_key = ?", (api_key,)
-        ).fetchone()
+        row = self._fetchone(
+            "SELECT * FROM users WHERE api_key = ?", (api_key,))
         return dict(row) if row else None
 
     def get_user(self, user_id: int) -> dict | None:
-        row = self.conn.execute(
-            "SELECT * FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone()
+        row = self._fetchone(
+            "SELECT * FROM users WHERE user_id = ?", (user_id,))
         return dict(row) if row else None
 
     def list_users(self, include_keys: bool = False) -> list[dict]:
         if include_keys:
-            rows = self.conn.execute(
-                "SELECT user_id, name, api_key, role, bio, created_at FROM users"
-            ).fetchall()
+            rows = self._fetchall(
+                "SELECT user_id, name, api_key, role, bio, created_at FROM users")
         else:
-            rows = self.conn.execute(
-                "SELECT user_id, name, role, bio, created_at FROM users"
-            ).fetchall()
+            rows = self._fetchall(
+                "SELECT user_id, name, role, bio, created_at FROM users")
         return [dict(r) for r in rows]
 
     # ── Sessions ──────────────────────────────────────────────
@@ -226,40 +232,42 @@ class Store:
         return self.get_session(session_id)
 
     def get_session(self, session_id: str) -> dict | None:
-        row = self.conn.execute(
+        row = self._fetchone(
             "SELECT session_id, title, description, status, created_by, created_at "
-            "FROM sessions WHERE session_id = ?", (session_id,)
-        ).fetchone()
+            "FROM sessions WHERE session_id = ?", (session_id,))
         return dict(row) if row else None
 
     def get_session_with_solution(self, session_id: str) -> dict | None:
-        row = self.conn.execute(
-            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
-        ).fetchone()
+        row = self._fetchone(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,))
         return dict(row) if row else None
 
+    def close_session(self, session_id: str) -> None:
+        self._write(
+            "UPDATE sessions SET status = 'closed' WHERE session_id = ?",
+            (session_id,),
+        )
+
     def list_sessions(self) -> list[dict]:
-        rows = self.conn.execute(
+        rows = self._fetchall(
             "SELECT session_id, title, status, created_at "
-            "FROM sessions ORDER BY created_at DESC"
-        ).fetchall()
+            "FROM sessions ORDER BY created_at DESC")
         return [dict(r) for r in rows]
 
     def session_stats(self, session_id: str) -> dict:
-        n_posts = self.conn.execute(
-            "SELECT COUNT(*) FROM posts WHERE session_id = ?", (session_id,)
-        ).fetchone()[0]
-        n_comments = self.conn.execute(
+        n_posts = self._fetchone(
+            "SELECT COUNT(*) FROM posts WHERE session_id = ?",
+            (session_id,))[0]
+        n_comments = self._fetchone(
             "SELECT COUNT(*) FROM comments c JOIN posts p ON c.post_id = p.post_id "
-            "WHERE p.session_id = ?", (session_id,)
-        ).fetchone()[0]
-        n_votes = self.conn.execute(
+            "WHERE p.session_id = ?", (session_id,))[0]
+        n_votes = self._fetchone(
             "SELECT COUNT(*) FROM votes v "
             "LEFT JOIN posts p ON v.post_id = p.post_id "
             "LEFT JOIN comments c ON v.comment_id = c.comment_id "
             "LEFT JOIN posts p2 ON c.post_id = p2.post_id "
-            "WHERE COALESCE(p.session_id, p2.session_id) = ?", (session_id,)
-        ).fetchone()[0]
+            "WHERE COALESCE(p.session_id, p2.session_id) = ?",
+            (session_id,))[0]
         return {"posts": n_posts, "comments": n_comments, "votes": n_votes}
 
     # ── Posts ─────────────────────────────────────────────────
@@ -273,55 +281,52 @@ class Store:
         return self.get_post(cur.lastrowid)
 
     def get_post(self, post_id: int) -> dict | None:
-        row = self.conn.execute(
+        row = self._fetchone(
             "SELECT p.*, u.name AS author, u.role AS author_role "
             "FROM posts p JOIN users u ON p.user_id = u.user_id "
-            "WHERE p.post_id = ?", (post_id,)
-        ).fetchone()
+            "WHERE p.post_id = ?", (post_id,))
         if not row:
             return None
         post = dict(row)
         post["score"] = self._score("post", post_id)
-        post["comment_count"] = self.conn.execute(
-            "SELECT COUNT(*) FROM comments WHERE post_id = ?", (post_id,)
-        ).fetchone()[0]
+        post["comment_count"] = self._fetchone(
+            "SELECT COUNT(*) FROM comments WHERE post_id = ?",
+            (post_id,))[0]
         post["comments"] = self._comments(post_id)
         return post
 
     def get_all_posts(self, session_id: str) -> list[dict]:
         """Get all posts with comments for admin/harness use."""
-        rows = self.conn.execute(
+        rows = self._fetchall(
             "SELECT p.*, u.name AS author, u.role AS author_role "
             "FROM posts p JOIN users u ON p.user_id = u.user_id "
             "WHERE p.session_id = ? ORDER BY p.post_id",
-            (session_id,),
-        ).fetchall()
+            (session_id,))
         result = []
         for r in rows:
             p = dict(r)
             p["score"] = self._score("post", p["post_id"])
             p["comments"] = self._comments(p["post_id"])
+            p["comment_count"] = len(p["comments"])
             result.append(p)
         return result
 
     def _score(self, target_type: str, target_id: int) -> int:
         col = "post_id" if target_type == "post" else "comment_id"
-        row = self.conn.execute(
+        row = self._fetchone(
             f"SELECT COALESCE(SUM("
             f"  CASE WHEN u.role='judge' THEN v.value*3 ELSE v.value END"
             f"), 0) FROM votes v JOIN users u ON v.user_id = u.user_id "
             f"WHERE v.{col} = ?",
-            (target_id,),
-        ).fetchone()
+            (target_id,))
         return row[0]
 
     def _comments(self, post_id: int) -> list[dict]:
-        rows = self.conn.execute(
+        rows = self._fetchall(
             "SELECT c.*, u.name AS author, u.role AS author_role "
             "FROM comments c JOIN users u ON c.user_id = u.user_id "
             "WHERE c.post_id = ? ORDER BY c.comment_id ASC",
-            (post_id,),
-        ).fetchall()
+            (post_id,))
         return [{"score": self._score("comment", r["comment_id"]), **dict(r)}
                 for r in rows]
 
@@ -334,11 +339,10 @@ class Store:
             "VALUES (?, ?, ?)",
             (post_id, user_id, content),
         )
-        row = self.conn.execute(
+        row = self._fetchone(
             "SELECT c.*, u.name AS author FROM comments c "
             "JOIN users u ON c.user_id = u.user_id WHERE c.comment_id = ?",
-            (cur.lastrowid,),
-        ).fetchone()
+            (cur.lastrowid,))
         cm = dict(row)
         cm["score"] = self._score("comment", cm["comment_id"])
         return cm
@@ -389,34 +393,30 @@ class Store:
 
     def get_user_votes(self, session_id: str, user_id: int) -> dict:
         post_votes = {}
-        for r in self.conn.execute(
+        for r in self._fetchall(
             "SELECT v.post_id, v.value FROM votes v "
             "JOIN posts p ON v.post_id = p.post_id "
             "WHERE p.session_id = ? AND v.user_id = ? AND v.post_id IS NOT NULL",
-            (session_id, user_id),
-        ).fetchall():
+            (session_id, user_id)):
             post_votes[r[0]] = r[1]
         comment_votes = {}
-        for r in self.conn.execute(
+        for r in self._fetchall(
             "SELECT v.comment_id, v.value FROM votes v "
             "JOIN comments c ON v.comment_id = c.comment_id "
             "JOIN posts p ON c.post_id = p.post_id "
             "WHERE p.session_id = ? AND v.user_id = ? AND v.comment_id IS NOT NULL",
-            (session_id, user_id),
-        ).fetchall():
+            (session_id, user_id)):
             comment_votes[r[0]] = r[1]
         return {"posts": post_votes, "comments": comment_votes}
 
     def get_user_content_ids(self, session_id: str, user_id: int) -> dict:
-        my_posts = [r[0] for r in self.conn.execute(
+        my_posts = [r[0] for r in self._fetchall(
             "SELECT post_id FROM posts WHERE session_id = ? AND user_id = ?",
-            (session_id, user_id),
-        ).fetchall()]
-        my_comments = [r[0] for r in self.conn.execute(
+            (session_id, user_id))]
+        my_comments = [r[0] for r in self._fetchall(
             "SELECT c.comment_id FROM comments c "
             "JOIN posts p ON c.post_id = p.post_id "
             "WHERE p.session_id = ? AND c.user_id = ?",
-            (session_id, user_id),
-        ).fetchall()]
+            (session_id, user_id))]
         return {"my_posts": my_posts, "my_comments": my_comments}
 

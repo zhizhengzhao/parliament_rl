@@ -33,10 +33,11 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 
 def _find_latest_config() -> Path:
     cfg_root = PROJECT_DIR / "context_configs"
-    versions = sorted(d for d in cfg_root.iterdir() if d.is_dir())
+    versions = [d for d in cfg_root.iterdir() if d.is_dir()]
     if not versions:
         raise FileNotFoundError("No versions in context_configs/")
-    return versions[-1]
+    return max(versions, key=lambda d: [
+        int(x) if x.isdigit() else x for x in re.split(r'[_/]', d.name)])
 
 
 _CFG: dict | None = None
@@ -256,6 +257,7 @@ async def run_agent_round(
         try:
             llm_response = await _call_llm(
                 http, llm_endpoint, model_name, messages, tools)
+            assistant_msg = llm_response["choices"][0]["message"]
         except Exception as e:
             llm_dur = time.time() - llm_start
             result.llm_errors += 1
@@ -283,8 +285,6 @@ async def run_agent_round(
         llm_dur = time.time() - llm_start
         consecutive_errors = 0
         result.llm_calls += 1
-
-        assistant_msg = llm_response["choices"][0]["message"]
         usage = llm_response.get("usage", {})
         prompt_tok = usage.get("prompt_tokens", 0)
         completion_tok = usage.get("completion_tokens", 0)

@@ -3,10 +3,10 @@
   "_description": "Independent vote tool, actor-only event driving, no collection window",
 
   "agent": {
-    "max_rounds": 20,
-    "timeout_s": 600,
+    "max_rounds": 45,
+    "timeout_s": 1000,
     "max_consecutive_errors": 3,
-    "llm_timeout_s": 60
+    "llm_timeout_s": 90
   },
 
   "judge_votes_visible": true
