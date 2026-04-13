@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 import time
 import traceback
@@ -24,7 +25,7 @@ from typing import Any
 
 import aiohttp
 
-from .tools import ToolExecutor, get_tools
+from .tools import IdMap, ToolExecutor, get_tools
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -101,14 +102,49 @@ class AgentResult:
 
 # ── Prompt building ───────────────────────────────────────
 
-def build_system_prompt(name: str, role: str, session_title: str,
-                        reference_solution: str = "") -> str:
+def _pick_persona(name: str, role: str, session_id: str) -> str:
+    """Pick a persona from persona_pools using session_id as seed.
+
+    For each session: shuffle which zone goes to which agent slot,
+    then pick a random variant from the assigned zone. Deterministic
+    per (session_id), so all agents in a session see consistent results
+    across calls.
+    """
     cfg = get_config()
+    pools = cfg.get("persona_pools", {})
+    role_key = "judge" if role == "judge" else "scientist"
+    zones = pools.get(role_key)
+    if not zones:
+        return cfg.get("personas", {}).get(name, "")
+
+    try:
+        slot = int(name.rsplit("_", 1)[-1]) - 1
+    except (ValueError, IndexError):
+        return ""
+    if slot < 0 or slot >= len(zones):
+        return ""
+
+    rng = random.Random(f"{session_id}:{role_key}")
+    order = list(range(len(zones)))
+    rng.shuffle(order)
+    zone = zones[order[slot]]
+    for _ in range(slot):
+        rng.random()
+    return rng.choice(zone)
+
+
+def build_system_prompt(name: str, role: str, session_title: str,
+                        reference_solution: str = "",
+                        session_id: str = "") -> str:
+    cfg = get_config()
+    persona = _pick_persona(name, role, session_id)
     if role == "judge":
         return cfg["judge_prompt"].format(
             name=name, session_title=session_title,
-            reference_solution=reference_solution)
-    return cfg["actor_prompt"].format(name=name, session_title=session_title)
+            reference_solution=reference_solution,
+            persona=persona)
+    return cfg["actor_prompt"].format(name=name, session_title=session_title,
+                                      persona=persona)
 
 
 def format_new_content(items: list[dict]) -> str:
@@ -124,19 +160,20 @@ def format_new_content(items: list[dict]) -> str:
                          f'by {item["author"]}:\n{item["content"]}')
         elif item["type"] == "vote":
             tt = "P" if item["target_type"] == "post" else "C"
-            direction = "positive" if item["value"] > 0 else "negative"
+            val = item["value"]
+            val_str = f'+{val}' if val > 0 else str(val)
             score = item.get("target_score", 0)
             score_str = f'+{score}' if score > 0 else str(score)
             prev = item.get("previous_value")
             if prev is not None:
-                prev_dir = "positive" if prev > 0 else "negative"
+                prev_str = f'+{prev}' if prev > 0 else str(prev)
                 parts.append(f'[V on {tt}_{item["target_id"]}] '
-                             f'by {item["author"]}: changed {prev_dir} → '
-                             f'{direction} vote, current score of '
+                             f'by {item["author"]}: changed {prev_str} → '
+                             f'{val_str}, current score of '
                              f'{tt}_{item["target_id"]}: {score_str}')
             else:
                 parts.append(f'[V on {tt}_{item["target_id"]}] '
-                             f'by {item["author"]}: {direction} vote, '
+                             f'by {item["author"]}: {val_str} vote, '
                              f'current score of '
                              f'{tt}_{item["target_id"]}: {score_str}')
     return "\n\n".join(parts)
@@ -452,6 +489,21 @@ async def run_agent_round(
                                 "Available: python_exec, vote, submit, wait."),
                 })
 
+            if llm_log_dir:
+                tool_content = messages[-1].get("content", "")
+                has_error = (
+                    tool_content.startswith("Error")
+                    or ('"errors": [' in tool_content
+                        and '"errors": []' not in tool_content))
+                _save_llm_log(llm_log_dir / f"{name}.jsonl", {
+                    "round": result.rounds, "step": step,
+                    "timestamp": datetime.now().isoformat(),
+                    "status": "tool_error" if has_error else "tool_ok",
+                    "tool": fn_name,
+                    "arguments": raw_args[:500] if isinstance(raw_args, str) else str(raw_args)[:500],
+                    "response": tool_content[:1000],
+                })
+
         if end_action == "submit":
             return end_args
         elif end_action == "wait":
@@ -479,6 +531,7 @@ async def run_agent(
     submit_event: asyncio.Event,
     processing: set[str],
     http: aiohttp.ClientSession,
+    id_map: IdMap,
     max_rounds: int = MAX_ROUNDS,
     timeout: float = TIMEOUT_S,
     llm_log_dir: Path | None = None,
@@ -491,7 +544,7 @@ async def run_agent(
         return await _run_agent_inner(
             name, role, api_key, session_id, session_title,
             reference_solution, parliament_url, llm_endpoint, model_name,
-            new_content_queue, submit_event, processing, http,
+            new_content_queue, submit_event, processing, http, id_map,
             max_rounds, timeout, llm_log_dir, discard_dir, result)
     except Exception:
         result.exit_reason = "exception"
@@ -510,17 +563,19 @@ async def _run_agent_inner(
     parliament_url: str, llm_endpoint: str, model_name: str,
     new_content_queue: asyncio.Queue, submit_event: asyncio.Event,
     processing: set[str],
-    http: aiohttp.ClientSession,
+    http: aiohttp.ClientSession, id_map: IdMap,
     max_rounds: int, timeout: float,
     llm_log_dir: Path | None, discard_dir: Path | None,
     result: AgentResult,
 ) -> AgentResult:
-    executor = ToolExecutor(parliament_url, session_id, api_key, http)
+    executor = ToolExecutor(parliament_url, session_id, api_key, http, id_map,
+                            role=role)
     await executor.join()
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": build_system_prompt(
-            name, role, session_title, reference_solution)},
+            name, role, session_title, reference_solution,
+            session_id=session_id)},
     ]
 
     start = time.time()

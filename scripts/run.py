@@ -9,7 +9,7 @@ Usage:
     python scripts/run.py \
         --gpus 0,1,2,3,4,5,6,7 \
         --sessions-per-gpu 2 \
-        --actors 4 --judges 4 \
+        --actors 3 --judges 3 \
         --dataset datasets/sciencepedia_test.json \
         --name sciencepedia_test \
         --timeout 600
@@ -241,8 +241,8 @@ def main():
         description="One-click Parliament RL data collection")
     parser.add_argument("--gpus", help="Comma-separated GPU IDs")
     parser.add_argument("--sessions-per-gpu", type=int, default=2)
-    parser.add_argument("--actors", type=int, default=4)
-    parser.add_argument("--judges", type=int, default=4)
+    parser.add_argument("--actors", type=int, default=3)
+    parser.add_argument("--judges", type=int, default=3)
     parser.add_argument("--dataset", help="Path to questions JSON file")
     parser.add_argument("--name", help="Run name")
     parser.add_argument("--timeout", type=int, default=600)

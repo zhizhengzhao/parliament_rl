@@ -40,7 +40,7 @@ _PYTHON_EXEC = {
     },
 }
 
-_VOTE_PARAMS = {
+_ACTOR_VOTE_PARAMS = {
     "type": "object",
     "properties": {
         "votes": {
@@ -68,6 +68,43 @@ _VOTE_PARAMS = {
     "required": ["votes"],
 }
 
+_JUDGE_VOTE_PARAMS = {
+    "type": "object",
+    "properties": {
+        "votes": {
+            "type": "array",
+            "description": (
+                "Votes on posts (P_xxx) or comments (C_xxx). "
+                "Score from -3 (fundamentally wrong) to +3 (excellent progress)."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "target_type": {
+                        "type": "string", "enum": ["post", "comment"],
+                    },
+                    "target_id": {
+                        "type": "integer",
+                        "description": "Number from P_xxx or C_xxx",
+                    },
+                    "value": {
+                        "type": "integer",
+                        "enum": [-3, -2, -1, 1, 2, 3],
+                        "description": (
+                            "+3 matches solution, +2 substantial progress, "
+                            "+1 genuine non-trivial advance, "
+                            "-1 trivial/repetitive/minor error, "
+                            "-2 misleading, -3 fundamentally wrong"
+                        ),
+                    },
+                },
+                "required": ["target_type", "target_id", "value"],
+            },
+        },
+    },
+    "required": ["votes"],
+}
+
 ACTOR_TOOLS = [
     _PYTHON_EXEC,
     {
@@ -78,7 +115,7 @@ ACTOR_TOOLS = [
                 "Cast votes on posts or comments. "
                 "Does NOT end your round — vote first, then submit or wait."
             ),
-            "parameters": _VOTE_PARAMS,
+            "parameters": _ACTOR_VOTE_PARAMS,
         },
     },
     {
@@ -142,10 +179,10 @@ JUDGE_TOOLS = [
         "function": {
             "name": "vote",
             "description": (
-                "Submit your evaluations: cast +1/-1 votes on "
+                "Submit your evaluations: cast votes (-3 to +3) on "
                 "posts and comments. This ENDS your turn."
             ),
-            "parameters": _VOTE_PARAMS,
+            "parameters": _JUDGE_VOTE_PARAMS,
         },
     },
 ]
@@ -155,17 +192,74 @@ def get_tools(role: str) -> list[dict]:
     return JUDGE_TOOLS if role == "judge" else ACTOR_TOOLS
 
 
+# ── Session-level ID mapping ─────────────────────────────
+
+class IdMap:
+    """Maps global DB IDs to session-local sequential IDs.
+
+    Shared by all agents in a session so everyone sees the same
+    P_1, P_2, P_3... for the same posts.
+    """
+
+    def __init__(self):
+        self._post_g2l: dict[int, int] = {}
+        self._post_l2g: dict[int, int] = {}
+        self._comment_g2l: dict[int, int] = {}
+        self._comment_l2g: dict[int, int] = {}
+        self._next_post: int = 1
+        self._next_comment: int = 1
+
+    def map_post(self, global_id: int) -> int:
+        if global_id not in self._post_g2l:
+            local = self._next_post
+            self._next_post += 1
+            self._post_g2l[global_id] = local
+            self._post_l2g[local] = global_id
+        return self._post_g2l[global_id]
+
+    def map_comment(self, global_id: int) -> int:
+        if global_id not in self._comment_g2l:
+            local = self._next_comment
+            self._next_comment += 1
+            self._comment_g2l[global_id] = local
+            self._comment_l2g[local] = global_id
+        return self._comment_g2l[global_id]
+
+    def resolve_post(self, local_id: int) -> int | None:
+        return self._post_l2g.get(local_id)
+
+    def resolve_comment(self, local_id: int) -> int | None:
+        return self._comment_l2g.get(local_id)
+
+    def localize_content(self, items: list[dict]) -> None:
+        """Convert global IDs to session-local IDs in-place."""
+        for item in items:
+            if item["type"] == "post":
+                item["id"] = self.map_post(item["id"])
+            elif item["type"] == "comment":
+                item["id"] = self.map_comment(item["id"])
+                item["post_id"] = self.map_post(item["post_id"])
+            elif item["type"] == "vote":
+                if item["target_type"] == "post":
+                    item["target_id"] = self.map_post(item["target_id"])
+                else:
+                    item["target_id"] = self.map_comment(item["target_id"])
+
+
 # ── Tool executor ─────────────────────────────────────────
 
 class ToolExecutor:
     """Executes tool calls against Parliament API."""
 
     def __init__(self, parliament_url: str, session_id: str,
-                 api_key: str, http: aiohttp.ClientSession):
+                 api_key: str, http: aiohttp.ClientSession,
+                 id_map: IdMap, role: str = "actor"):
         self.base = parliament_url
         self.sid = session_id
         self.key = api_key
         self.http = http
+        self.id_map = id_map
+        self._role = role
         self._headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -238,9 +332,11 @@ class ToolExecutor:
             if tid is None or value is None:
                 results["errors"].append(f"missing target_id or value: {v}")
                 continue
-            if value not in (1, -1):
+            max_val = 1 if self._role == "actor" else 3
+            if not value or abs(value) > max_val:
+                allowed = "±1" if self._role == "actor" else "±1 to ±3"
                 results["errors"].append(
-                    f"value must be +1 or -1, got {value}")
+                    f"vote value must be {allowed}, got {value}")
                 continue
 
             own = (ttype == "post" and tid in self._my_posts) or \
@@ -251,9 +347,17 @@ class ToolExecutor:
                 continue
 
             if ttype == "comment":
-                path = f"/sessions/{self.sid}/comments/{tid}/vote"
+                global_tid = self.id_map.resolve_comment(tid)
+                if global_tid is None:
+                    results["errors"].append(f"unknown comment C_{tid}")
+                    continue
+                path = f"/sessions/{self.sid}/comments/{global_tid}/vote"
             else:
-                path = f"/sessions/{self.sid}/posts/{tid}/vote"
+                global_tid = self.id_map.resolve_post(tid)
+                if global_tid is None:
+                    results["errors"].append(f"unknown post P_{tid}")
+                    continue
+                path = f"/sessions/{self.sid}/posts/{global_tid}/vote"
             resp = await self._api("POST", path, {"value": value})
             if isinstance(resp, dict):
                 results["votes"].append(
@@ -274,8 +378,9 @@ class ToolExecutor:
             resp = await self._api("POST", f"/sessions/{self.sid}/posts",
                                    {"content": post_content})
             if isinstance(resp, dict) and "post_id" in resp:
-                results["post_id"] = resp["post_id"]
-                self._my_posts.add(resp["post_id"])
+                local_pid = self.id_map.map_post(resp["post_id"])
+                results["post_id"] = local_pid
+                self._my_posts.add(local_pid)
             else:
                 results["errors"].append(f"post: {resp}")
 
@@ -301,26 +406,32 @@ class ToolExecutor:
                     f"use {{\"post_id\": N, \"content\": \"...\"}}")
                 continue
 
-            pid = self._to_int(cm.get("post_id"))
+            local_pid = self._to_int(cm.get("post_id"))
             content = self._to_str(cm.get("content", ""))
 
-            if not pid:
+            if not local_pid:
                 results["errors"].append(
                     f"comment missing post_id: {str(cm)[:100]}")
                 continue
             if not content:
                 results["errors"].append(
-                    f"comment on P_{pid} has empty content")
+                    f"comment on P_{local_pid} has empty content")
+                continue
+
+            global_pid = self.id_map.resolve_post(local_pid)
+            if global_pid is None:
+                results["errors"].append(f"unknown post P_{local_pid}")
                 continue
 
             resp = await self._api(
-                "POST", f"/sessions/{self.sid}/posts/{pid}/comments",
+                "POST", f"/sessions/{self.sid}/posts/{global_pid}/comments",
                 {"content": content})
             if isinstance(resp, dict) and "comment_id" in resp:
-                results["comments"].append(resp["comment_id"])
-                self._my_comments.add(resp["comment_id"])
+                local_cid = self.id_map.map_comment(resp["comment_id"])
+                results["comments"].append(local_cid)
+                self._my_comments.add(local_cid)
             else:
-                results["errors"].append(f"comment on P_{pid}: {resp}")
+                results["errors"].append(f"comment on P_{local_pid}: {resp}")
 
         if not results["post_id"] and not results["comments"] and not results["errors"]:
             results["errors"].append(

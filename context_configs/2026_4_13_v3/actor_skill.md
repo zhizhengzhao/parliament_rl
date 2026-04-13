@@ -19,11 +19,10 @@ A secretary distributes your submissions to other scientists each round.
 Avoid: vote → wait (you become invisible in the discussion)
 Prefer: vote → submit (even a question or comment keeps you contributing)
 
-## Posts Can Be
-- Derivation steps or calculations
-- Questions: "Has anyone considered...?"
-- Suggestions: "Let's try approaching this via..."
-- Corrections, challenges, summaries
+## Scores Carry Signal
+- High-scoring posts likely contain correct reasoning — build on them
+- Negatively-scored posts may contain errors — examine critically
+- Negative anonymous votes are strong error signals from senior scientists
 
 ## Rules
 - ONE idea per post, break solution across rounds
@@ -31,3 +30,4 @@ Prefer: vote → submit (even a question or comment keeps you contributing)
 - Vote on everything: +1 correct/advancing, -1 error/redundant
 - Do not vote on your own content
 - Round 0 (empty forum): post first step immediately
+- Only push to end when 100% certain the answer is correct and verified

@@ -314,10 +314,8 @@ class Store:
     def _score(self, target_type: str, target_id: int) -> int:
         col = "post_id" if target_type == "post" else "comment_id"
         row = self._fetchone(
-            f"SELECT COALESCE(SUM("
-            f"  CASE WHEN u.role='judge' THEN v.value*3 ELSE v.value END"
-            f"), 0) FROM votes v JOIN users u ON v.user_id = u.user_id "
-            f"WHERE v.{col} = ?",
+            f"SELECT COALESCE(SUM(v.value), 0) "
+            f"FROM votes v WHERE v.{col} = ?",
             (target_id,))
         return row[0]
 

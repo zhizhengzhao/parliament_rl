@@ -23,6 +23,7 @@ from pathlib import Path
 import aiohttp
 
 from .agent import AgentResult, run_agent, get_config
+from .tools import IdMap
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -182,6 +183,7 @@ async def run_session(
 
     actor_processing: set[str] = set(actor_name_set)
     judge_processing: set[str] = set()
+    id_map = IdMap()
 
     connector = aiohttp.TCPConnector(force_close=True)
     async with aiohttp.ClientSession(connector=connector) as http:
@@ -196,7 +198,8 @@ async def run_session(
                 new_content_queue=agent_queues[a["name"]],
                 submit_event=agent_events[a["name"]],
                 processing=actor_processing,
-                http=http, max_rounds=max_rounds, timeout=timeout,
+                http=http, id_map=id_map,
+                max_rounds=max_rounds, timeout=timeout,
                 llm_log_dir=session_llm_dir,
                 discard_dir=session_discard_dir,
             ))
@@ -210,7 +213,8 @@ async def run_session(
                 new_content_queue=agent_queues[j["name"]],
                 submit_event=agent_events[j["name"]],
                 processing=judge_processing,
-                http=http, max_rounds=max_rounds, timeout=timeout,
+                http=http, id_map=id_map,
+                max_rounds=max_rounds, timeout=timeout,
                 llm_log_dir=session_llm_dir,
                 discard_dir=session_discard_dir,
             ))
@@ -257,21 +261,36 @@ async def run_session(
                 last_comment_id = new_cid
                 last_vote_id = new_vid
 
-                for name in all_names:
+                id_map.localize_content(posts)
+                id_map.localize_content(comments)
+                id_map.localize_content(actor_votes)
+                id_map.localize_content(judge_votes)
+
+                type_order = {"post": 0, "comment": 1, "vote": 2}
+
+                for name in judge_name_set:
                     if agent_tasks[name].done():
                         continue
-                    if name in judge_name_set:
-                        to_push = posts + comments
-                    else:
-                        to_push = posts + comments + actor_votes
-                        if judge_votes_visible:
-                            anon = [{**v, "author": ANONYMOUS_VOTER}
-                                    for v in judge_votes]
-                            to_push = to_push + anon
+                    to_push = [i for i in posts + comments
+                               if i.get("author") != name]
+                    if to_push:
+                        to_push.sort(key=lambda x: (
+                            type_order.get(x["type"], 9), x["id"]))
+                        agent_queues[name].put_nowait(to_push)
+
+                await asyncio.sleep(0.1)
+
+                for name in actor_name_set:
+                    if agent_tasks[name].done():
+                        continue
+                    to_push = posts + comments + actor_votes
+                    if judge_votes_visible:
+                        anon = [{**v, "author": ANONYMOUS_VOTER}
+                                for v in judge_votes]
+                        to_push = to_push + anon
                     to_push = [i for i in to_push
                                if i.get("author") != name]
                     if to_push:
-                        type_order = {"post": 0, "comment": 1, "vote": 2}
                         to_push.sort(key=lambda x: (
                             type_order.get(x["type"], 9), x["id"]))
                         agent_queues[name].put_nowait(to_push)

@@ -8,7 +8,7 @@
 python scripts/run.py \
   --gpus 0,1,2,3,4,5,6,7 \
   --sessions-per-gpu 2 \
-  --actors 4 --judges 4 \
+  --actors 3 --judges 3 \
   --dataset datasets/sciencepedia_test.json \
   --name experiment_1 \
   --timeout 600 \
@@ -70,8 +70,8 @@ Judge 的投票以匿名形式（"Anonymous Scientist"）推送给 actor，受 `
 |------|------|------|
 | `--gpus` | GPU 编号 | 必填 |
 | `--sessions-per-gpu` | 每张卡并行 session 数 | `2` |
-| `--actors` | 每 session 的科学家数 | `4` |
-| `--judges` | 每 session 的评委数 | `4` |
+| `--actors` | 每 session 的科学家数 | `3` |
+| `--judges` | 每 session 的评委数 | `3` |
 | `--dataset` | 题目文件（JSON） | 必填 |
 | `--name` | 本次运行名称 | 必填 |
 | `--timeout` | 每个 agent 超时（秒） | `600` |
@@ -103,7 +103,7 @@ parliament_rl/
 | 表 | 用途 |
 |---|---|
 | `interaction_log` | 每个 API 请求的完整记录（RL 轨迹核心） |
-| `votes` | +1/-1 投票（reward 信号） |
+| `votes` | 投票 reward 信号（Actor ±1, Judge ±1~±3） |
 | `posts` | 帖子内容 |
 | `comments` | 评论内容（一阶，不可嵌套） |
 | `session_participants` | 参与者加入/离开记录 |
@@ -113,7 +113,7 @@ parliament_rl/
 从 interaction_log 重构每个 agent 在 create_post 时刻的 context：
 - 时间戳确定 agent 当时能看到哪些帖子
 - posts 表提供全文
-- votes 表提供 reward 信号（Judge ×3 权重）
+- votes 表提供 reward 信号（Actor ±1, Judge ±1~±3）
 - 构建 (context, action, reward) 三元组
 
 ## 版本依赖

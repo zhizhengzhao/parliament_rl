@@ -18,6 +18,11 @@
 - [x] 参数格式兜底（comment/comments、JSON-in-string、submit 内 votes 提取）
 - [x] 所有错误有 feedback（零静默丢弃）
 - [x] Prompt 优化（秘书模型、鼓励讨论、反对 vote→wait）
+- [x] Persona pool 随机采样（42 变体，3 扇区 × 8/6，每 session 随机分配）
+- [x] Actor 投票范围代码强制（±1，防 LLM 幻觉绕过 schema）
+- [x] Judge 评审标准收紧（无实质推进 = -1，"no neutral score"）
+- [x] Actor 高分信号感知 + 严格结束条件（100% 确定才结束）
+- [x] 默认 3+3（从 4 actors + 4 judges 缩减）
 
 ## RL Pipeline
 - [ ] Event export: interaction_log → 统一事件流

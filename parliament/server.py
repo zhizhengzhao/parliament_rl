@@ -310,8 +310,8 @@ def create_app(name: str | None = None, port: int = PORT,
                         user: dict = Depends(get_current_user)):
         body = await _body(request)
         value = _get_int(body, "value", "vote", "score", "rating")
-        if value not in (1, -1):
-            raise HTTPException(400, "value must be +1 or -1")
+        if not value or abs(value) > 3:
+            raise HTTPException(400, "value must be between -3 and +3 (not 0)")
         post = store.get_post(post_id)
         if not post or post["session_id"] != session_id:
             raise HTTPException(404, "Post not found")
@@ -329,8 +329,8 @@ def create_app(name: str | None = None, port: int = PORT,
                            user: dict = Depends(get_current_user)):
         body = await _body(request)
         value = _get_int(body, "value", "vote", "score", "rating")
-        if value not in (1, -1):
-            raise HTTPException(400, "value must be +1 or -1")
+        if not value or abs(value) > 3:
+            raise HTTPException(400, "value must be between -3 and +3 (not 0)")
         comment = store._fetchone(
             "SELECT c.comment_id, c.user_id, p.session_id FROM comments c "
             "JOIN posts p ON c.post_id = p.post_id "
@@ -418,8 +418,8 @@ def main():
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--seed", action="store_true",
                         help="Create users (actors + judges)")
-    parser.add_argument("--actors", type=int, default=4)
-    parser.add_argument("--judges", type=int, default=4)
+    parser.add_argument("--actors", type=int, default=3)
+    parser.add_argument("--judges", type=int, default=3)
     parser.add_argument("--db-dir", type=str, default=None,
                         help="Directory for parliament.db (overrides --name)")
     args = parser.parse_args()

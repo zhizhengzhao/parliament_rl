@@ -3,7 +3,7 @@
 from .config import ADMIN_KEY
 
 
-def seed_data(store, num_actors: int = 4, num_judges: int = 4):
+def seed_data(store, num_actors: int = 3, num_judges: int = 3):
     existing = {u["name"] for u in store.list_users()}
 
     if "Admin" not in existing:
