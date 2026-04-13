@@ -240,11 +240,12 @@ def _save_discard_streak(discard_dir: Path, name: str, streak: list[dict]):
 async def _wait_for_content(
     queue: asyncio.Queue,
 ) -> list | str | None:
-    """Wait for queue content. Returns items, nudge string, or None."""
-    try:
-        first = await asyncio.wait_for(queue.get(), timeout=61)
-    except asyncio.TimeoutError:
-        return None
+    """Wait for queue content. Returns items, nudge string, or None.
+
+    Blocks until the runner puts something in the queue. The runner
+    always sends None when the session ends, so this never hangs.
+    """
+    first = await queue.get()
     if first is None:
         return None
     if isinstance(first, str):

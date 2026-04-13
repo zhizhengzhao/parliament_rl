@@ -92,6 +92,8 @@ parliament_rl/
 │   ├── store.py               # SQLite 存储层
 │   ├── auth.py / config.py / seed.py
 │   └── static/index.html      # Web UI
+├── rl/                        # RL 训练 pipeline
+│   └── extract.py             # parliament.db → 训练数据 JSONL
 ├── context_configs/           # prompt + 参数，按版本管理
 └── datasets/                   # 题目数据
 ```
