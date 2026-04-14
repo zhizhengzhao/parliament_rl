@@ -581,7 +581,8 @@ async def _run_agent_inner(
 
     start = time.time()
 
-    for round_num in range(max_rounds):
+    effective_max = max_rounds if role == "actor" else max_rounds * 10
+    for round_num in range(effective_max):
         if time.time() - start > timeout:
             result.exit_reason = "timeout"
             break
