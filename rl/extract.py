@@ -106,7 +106,10 @@ def build_timeline(posts: list[dict], comments: list[dict]) -> list[dict]:
             "content": c["content"],
             "created_at": c["created_at"],
         })
-    timeline.sort(key=lambda x: x["created_at"])
+    type_order = {"post": 0, "comment": 1}
+    timeline.sort(key=lambda x: (x["created_at"],
+                                  type_order.get(x["type"], 9),
+                                  x["global_id"]))
     return timeline
 
 
