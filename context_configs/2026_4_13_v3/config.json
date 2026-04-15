@@ -3,8 +3,7 @@
   "_description": "Persona pools with random sampling, strict judge scoring, role-enforced vote ranges",
 
   "agent": {
-    "max_rounds": 45,
-    "timeout_s": 1200,
+    "max_rounds": 30,
     "max_consecutive_errors": 3,
     "llm_timeout_s": 90
   },

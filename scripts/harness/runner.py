@@ -148,7 +148,6 @@ async def run_session(
     endpoint: str,
     model_name: str,
     max_rounds: int,
-    timeout: float,
     llm_log_dir: Path | None = None,
     discard_dir: Path | None = None,
 ) -> list[AgentResult]:
@@ -199,7 +198,7 @@ async def run_session(
                 submit_event=agent_events[a["name"]],
                 processing=actor_processing,
                 http=http, id_map=id_map,
-                max_rounds=max_rounds, timeout=timeout,
+                max_rounds=max_rounds,
                 llm_log_dir=session_llm_dir,
                 discard_dir=session_discard_dir,
             ))
@@ -214,7 +213,7 @@ async def run_session(
                 submit_event=agent_events[j["name"]],
                 processing=judge_processing,
                 http=http, id_map=id_map,
-                max_rounds=max_rounds, timeout=timeout,
+                max_rounds=max_rounds,
                 llm_log_dir=session_llm_dir,
                 discard_dir=session_discard_dir,
             ))
@@ -367,8 +366,7 @@ async def run_session(
           f"({session_dur:.0f}s)", flush=True)
     for r in session_results:
         icon = {"session_end": "+", "no_new_content": "+", "max_rounds": "M",
-                "timeout": "T", "llm_errors": "!", "step_limit": "S",
-                "no_tool": "N",
+                "llm_errors": "!", "step_limit": "S", "no_tool": "N",
                 }.get(r.exit_reason, "?")
         print(f"    [{icon}] {r.name:15s} {r.role:6s} "
               f"{r.exit_reason:15s} {r.rounds:2d}r {r.llm_calls:2d}llm "
@@ -401,13 +399,12 @@ async def run_experiment(
     num_actors: int,
     num_judges: int,
     model_name: str,
-    timeout: float,
     max_rounds: int,
     output_path: str | None = None,
 ) -> int:
     """Run the full experiment. Returns 0 on success."""
 
-    print(f"Harness starting (event-driven v2)", flush=True)
+    print(f"Harness starting", flush=True)
     print(f"  Time:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
     print(f"  Parliament: {parliament_url}", flush=True)
     print(f"  GPUs:       {len(gpu_endpoints)}", flush=True)
@@ -416,7 +413,7 @@ async def run_experiment(
     print(f"  Concurrency:{sessions_per_gpu}/GPU × {len(gpu_endpoints)} GPUs "
           f"= {sessions_per_gpu * len(gpu_endpoints)} parallel sessions", flush=True)
     print(f"  Agents:     {num_actors} actors + {num_judges} judges per session", flush=True)
-    print(f"  Max rounds: {max_rounds}  Timeout: {timeout}s", flush=True)
+    print(f"  Max rounds: {max_rounds} (actor only, judge unlimited)", flush=True)
 
     sessions = _api_sync(parliament_url, "GET", "/admin/sessions", admin_key)
     open_sessions = [s for s in sessions if s.get("status") == "open"]
@@ -470,7 +467,7 @@ async def run_experiment(
             results = await run_session(
                 session, detail, actors_list, judges_list,
                 parliament_url, admin_key, ep, model_name,
-                max_rounds, timeout,
+                max_rounds,
                 llm_log_dir=llm_log_dir, discard_dir=discard_dir)
 
             sessions_done += 1

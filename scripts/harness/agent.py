@@ -68,12 +68,12 @@ def get_config() -> dict:
 def _defaults() -> tuple:
     try:
         c = get_config()["agent"]
-        return (c["max_rounds"], c["timeout_s"],
-                c["max_consecutive_errors"], c["llm_timeout_s"])
+        return (c["max_rounds"], c["max_consecutive_errors"],
+                c["llm_timeout_s"])
     except Exception:
-        return (20, 600, 3, 120)
+        return (30, 3, 120)
 
-MAX_ROUNDS, TIMEOUT_S, MAX_CONSECUTIVE_ERRORS, LLM_TIMEOUT_S = _defaults()
+MAX_ROUNDS, MAX_CONSECUTIVE_ERRORS, LLM_TIMEOUT_S = _defaults()
 
 
 # ── Data classes ──────────────────────────────────────────
@@ -534,7 +534,6 @@ async def run_agent(
     http: aiohttp.ClientSession,
     id_map: IdMap,
     max_rounds: int = MAX_ROUNDS,
-    timeout: float = TIMEOUT_S,
     llm_log_dir: Path | None = None,
     discard_dir: Path | None = None,
 ) -> AgentResult:
@@ -546,7 +545,7 @@ async def run_agent(
             name, role, api_key, session_id, session_title,
             reference_solution, parliament_url, llm_endpoint, model_name,
             new_content_queue, submit_event, processing, http, id_map,
-            max_rounds, timeout, llm_log_dir, discard_dir, result)
+            max_rounds, llm_log_dir, discard_dir, result)
     except Exception:
         result.exit_reason = "exception"
         result.error = traceback.format_exc()
@@ -565,7 +564,7 @@ async def _run_agent_inner(
     new_content_queue: asyncio.Queue, submit_event: asyncio.Event,
     processing: set[str],
     http: aiohttp.ClientSession, id_map: IdMap,
-    max_rounds: int, timeout: float,
+    max_rounds: int,
     llm_log_dir: Path | None, discard_dir: Path | None,
     result: AgentResult,
 ) -> AgentResult:
@@ -583,10 +582,6 @@ async def _run_agent_inner(
 
     round_num = 0
     while role != "actor" or round_num < max_rounds:
-        if time.time() - start > timeout:
-            result.exit_reason = "timeout"
-            break
-
         result.rounds = round_num + 1
 
         if round_num == 0 and role == "actor":

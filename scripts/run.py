@@ -11,8 +11,7 @@ Usage:
         --sessions-per-gpu 2 \
         --actors 3 --judges 3 \
         --dataset datasets/sciencepedia_test.json \
-        --name sciencepedia_test \
-        --timeout 600
+        --name sciencepedia_test
 
     python scripts/run.py --stop-vllm
 """
@@ -245,8 +244,7 @@ def main():
     parser.add_argument("--judges", type=int, default=3)
     parser.add_argument("--dataset", help="Path to questions JSON file")
     parser.add_argument("--name", help="Run name")
-    parser.add_argument("--timeout", type=int, default=1200)
-    parser.add_argument("--max-turns", type=int, default=45)
+    parser.add_argument("--max-turns", type=int, default=30)
     parser.add_argument("--max-questions", type=int, default=0)
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--stop-vllm", action="store_true")
@@ -309,8 +307,7 @@ def main():
     print(f"  GPUs:          {gpus}")
     print(f"  Sessions/GPU:  {args.sessions_per_gpu}")
     print(f"  Agents/session:{args.actors} actors + {args.judges} judges")
-    print(f"  Timeout:       {args.timeout}s")
-    print(f"  Max rounds:    {args.max_turns}")
+    print(f"  Max rounds:    {args.max_turns} (actor only)")
     print(f"  Dataset:       {args.dataset}")
     print(f"  Output:        {run_dir}")
     print()
@@ -348,7 +345,6 @@ def main():
             num_actors=args.actors,
             num_judges=args.judges,
             model_name=MODEL_NAME,
-            timeout=args.timeout,
             max_rounds=args.max_turns,
             output_path=str(run_dir / "experiment.json"),
         ))
