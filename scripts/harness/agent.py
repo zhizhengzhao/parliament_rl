@@ -657,7 +657,7 @@ async def _call_llm(
     async with http.post(
         f"{endpoint}/chat/completions",
         json=payload,
-        timeout=aiohttp.ClientTimeout(total=LLM_TIMEOUT_S),
+        timeout=aiohttp.ClientTimeout(connect=10, total=LLM_TIMEOUT_S),
     ) as resp:
         if resp.status != 200:
             text = await resp.text()
