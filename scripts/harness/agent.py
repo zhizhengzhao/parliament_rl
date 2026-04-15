@@ -240,17 +240,33 @@ def _save_discard_streak(discard_dir: Path, name: str, streak: list[dict]):
 async def _wait_for_content(
     queue: asyncio.Queue,
 ) -> list | str | None:
-    """Wait for queue content. Returns items, nudge string, or None.
+    """Wait for content, then drain any additional accumulated batches.
 
-    Blocks until the runner puts something in the queue. The runner
-    always sends None when the session ends, so this never hangs.
+    While the agent was busy (LLM call), the runner may have distributed
+    multiple batches. Drain them all into one list so the agent processes
+    the full current state in a single round.
     """
     first = await queue.get()
     if first is None:
         return None
     if isinstance(first, str):
-        return first
-    return list(first)
+        if queue.empty():
+            return first
+        first = None
+
+    items = list(first) if first else []
+    while not queue.empty():
+        try:
+            extra = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if extra is None:
+            queue.put_nowait(None)
+            break
+        if isinstance(extra, list):
+            items.extend(extra)
+
+    return items if items else None
 
 
 # ── Single agent round ────────────────────────────────────
