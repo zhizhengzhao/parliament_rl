@@ -626,17 +626,12 @@ async def _run_agent_inner(
             llm_endpoint, model_name, http, result,
             llm_log_dir=llm_log_dir, discard_dir=discard_dir)
 
-        if round_result is None:
-            processing.discard(name)
-            continue
-
-        action = round_result.get("_action")
-
-        if action == "vote":
-            processing.discard(name)
-        else:
-            processing.discard(name)
+        processing.discard(name)
+        if role != "judge":
             submit_event.set()
+
+        if round_result is None:
+            continue
 
         round_num += 1
 
