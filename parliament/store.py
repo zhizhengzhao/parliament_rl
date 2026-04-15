@@ -363,9 +363,10 @@ class Store:
                 "VALUES (?, ?, ?, ?)",
                 (post_id, user_id, value, old_value))
             self.conn.commit()
+            new_score = self._score("post", post_id)
         return {"post_id": post_id, "value": value,
                 "previous_value": old_value,
-                "new_score": self._score("post", post_id)}
+                "new_score": new_score}
 
     def vote_comment(self, comment_id: int, user_id: int, value: int) -> dict:
         with self._lock:
@@ -383,9 +384,10 @@ class Store:
                 "VALUES (?, ?, ?, ?)",
                 (comment_id, user_id, value, old_value))
             self.conn.commit()
+            new_score = self._score("comment", comment_id)
         return {"comment_id": comment_id, "value": value,
                 "previous_value": old_value,
-                "new_score": self._score("comment", comment_id)}
+                "new_score": new_score}
 
     # ── User state ────────────────────────────────────────────
 
