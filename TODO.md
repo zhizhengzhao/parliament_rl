@@ -23,13 +23,19 @@
 - [x] Judge 评审标准收紧（无实质推进 = -1，"no neutral score"）
 - [x] Actor 高分信号感知 + 严格结束条件（100% 确定才结束）
 - [x] 默认 3+3（从 4 actors + 4 judges 缩减）
+- [x] 删除 agent timeout（只保留 max_rounds for actor + session_end）
+- [x] Judge 无 max_rounds 限制（只由 session_end 退出）
+- [x] Queue drain（积攒多个分发 → 合并为一轮处理）
+- [x] LLM 分层超时（connect=10s 检测故障 + total=300s 兜底）
+- [x] 失败轮次静默跳过（不杀 agent，下轮重试）
+- [x] 统一 processing.discard + set_event（Actor 离开 processing 即 set_event）
+- [x] 内容全局排序（posts → comments → votes）
+- [x] extract.py 轻量级数据重建 + 稳定排序
 
 ## RL Pipeline
-- [ ] Event export: interaction_log → 统一事件流
-- [ ] State reconstruction: 重建每个 agent 的 observation
-- [ ] Reward aggregation: vote → reward（Judge ×3 权重）
-- [ ] AWBC 加权 SFT 数据生成
-- [ ] 训练 pipeline
+- [x] extract.py: parliament.db → (context, action, reward, advantage) JSONL
+- [ ] GRPO 训练脚本
+- [ ] 评估 pipeline
 
 ## 实验设计
 - [ ] Planted Expert: 注入答案的 agent 引导讨论
