@@ -151,6 +151,8 @@ def format_new_content(items: list[dict]) -> str:
     """Format new posts/comments/votes for injection into context."""
     if not items:
         return ""
+    type_order = {"post": 0, "comment": 1, "vote": 2}
+    items.sort(key=lambda x: (type_order.get(x["type"], 9), x["id"]))
     parts = []
     for item in items:
         if item["type"] == "post":
