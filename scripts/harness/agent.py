@@ -314,8 +314,6 @@ async def run_agent_round(
                 })
             consecutive_errors += 1
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                result.exit_reason = "llm_errors"
-                result.error = str(e)
                 return None
             await asyncio.sleep(2)
             continue
@@ -377,7 +375,6 @@ async def run_agent_round(
                 })
             if len(no_tool_streak) >= MAX_NO_TOOL_RETRIES:
                 _save_discard_streak(discard_dir, name, no_tool_streak)
-                result.exit_reason = "no_tool"
                 return None
             continue
 
@@ -512,7 +509,6 @@ async def run_agent_round(
         elif end_action == "vote":
             return {"_action": "vote"}
 
-    result.exit_reason = "step_limit"
     return None
 
 
@@ -614,10 +610,6 @@ async def _run_agent_inner(
 
         if round_result is None:
             processing.discard(name)
-            if role != "judge":
-                submit_event.set()
-            if result.exit_reason:
-                break
             continue
 
         action = round_result.get("_action")
