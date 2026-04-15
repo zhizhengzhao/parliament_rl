@@ -11,8 +11,8 @@ python scripts/run.py \
   --actors 3 --judges 3 \
   --dataset datasets/sciencepedia_test.json \
   --name experiment_1 \
-  --timeout 600 \
-  --max-turns 20
+  --timeout 1200 \
+  --max-turns 45
 ```
 
 一条命令完成：启动 vLLM（并行）→ 启动 Parliament → 加载题目 → Harness 调度 → 清理。自动 tmux 托管，断开终端不影响运行。
@@ -74,8 +74,8 @@ Judge 的投票以匿名形式（"Anonymous Scientist"）推送给 actor，受 `
 | `--judges` | 每 session 的评委数 | `3` |
 | `--dataset` | 题目文件（JSON） | 必填 |
 | `--name` | 本次运行名称 | 必填 |
-| `--timeout` | 每个 agent 超时（秒） | `600` |
-| `--max-turns` | 每个 agent 最大轮数 | `20` |
+| `--timeout` | 每个 agent 超时（秒） | `1200` |
+| `--max-turns` | Actor 最大轮数（Judge 不限） | `45` |
 
 ## 项目结构
 
