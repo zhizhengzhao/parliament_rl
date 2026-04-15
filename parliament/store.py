@@ -114,7 +114,7 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(_SCHEMA)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def close(self):
         self.conn.close()
