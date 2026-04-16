@@ -1,7 +1,7 @@
 """Parliament SQLite storage layer.
 
 Tables: users, sessions, posts, comments, votes,
-session_participants, interaction_log, follows (legacy, unused).
+session_participants, interaction_log.
 """
 
 from __future__ import annotations
@@ -66,15 +66,6 @@ CREATE TABLE IF NOT EXISTS votes (
     FOREIGN KEY (comment_id) REFERENCES comments(comment_id)
 );
 
-CREATE TABLE IF NOT EXISTS follows (
-    follower_id INTEGER NOT NULL,
-    followee_id INTEGER NOT NULL,
-    created_at TEXT DEFAULT (datetime('now')),
-    PRIMARY KEY (follower_id, followee_id),
-    FOREIGN KEY (follower_id) REFERENCES users(user_id),
-    FOREIGN KEY (followee_id) REFERENCES users(user_id)
-);
-
 CREATE TABLE IF NOT EXISTS session_participants (
     user_id INTEGER NOT NULL,
     session_id TEXT NOT NULL,
@@ -118,10 +109,6 @@ class Store:
 
     def close(self):
         self.conn.close()
-
-    def _exec(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
-        with self._lock:
-            return self.conn.execute(sql, params)
 
     def _write(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._lock:

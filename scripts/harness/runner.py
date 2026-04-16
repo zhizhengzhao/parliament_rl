@@ -365,7 +365,7 @@ async def run_session(
     print(f"  [{ts}] Session {sid[:8]} done on :{gpu_port} "
           f"({session_dur:.0f}s)", flush=True)
     for r in session_results:
-        icon = {"session_end": "+", "no_new_content": "+", "max_rounds": "M",
+        icon = {"session_end": "+", "max_rounds": "M",
                 "llm_errors": "!", "step_limit": "S", "no_tool": "N",
                 }.get(r.exit_reason, "?")
         print(f"    [{icon}] {r.name:15s} {r.role:6s} "
@@ -488,8 +488,7 @@ async def run_experiment(
     duration = time.time() - t0
 
     done = sum(1 for r in all_results
-               if r.exit_reason in ("session_end", "no_new_content",
-                                    "max_rounds"))
+               if r.exit_reason in ("session_end", "max_rounds"))
     total = len(all_results)
     total_posts = sum(r.posts_created for r in all_results)
     total_comments = sum(r.comments_created for r in all_results)

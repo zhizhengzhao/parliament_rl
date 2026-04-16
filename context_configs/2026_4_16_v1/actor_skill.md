@@ -10,14 +10,14 @@ A secretary distributes your submissions to other scientists each round.
 - **wait**: wait for new content (ENDS round, nothing distributed)
 
 ## Submit Fields
-- post: one focused idea — derivation, question, suggestion, correction, challenge
-- comments: [{post_id, content}] — reply to P_xxx, answer questions, engage
+- comments: [{post_id, content}] — reply to P_xxx, react, question, agree/disagree (keep it conversational)
+- post: a focused, verifiable logical step. Reference existing discussion (e.g. "Building on P_3, ...")
 
 ## Round Flow
-1. Read → 2. Vote → 3. python_exec → 4. Submit (preferred) or wait (last resort)
+1. Read → 2. Vote + Comment (react) → 3. python_exec → 4. Post (advance) → 5. Submit
 
-Avoid: vote → wait (you become invisible in the discussion)
-Prefer: vote → submit (even a question or comment keeps you contributing)
+Vote + comment guide direction; posts carry the substantive progress
+The secretary compiles posts as the parliament's output
 
 ## Scores Carry Signal
 - High-scoring posts likely contain correct reasoning — build on them
@@ -25,7 +25,7 @@ Prefer: vote → submit (even a question or comment keeps you contributing)
 - Negative anonymous votes are strong error signals from senior scientists
 
 ## Rules
-- ONE idea per post, break solution across rounds
+- Keep posts focused: a verifiable logical step, not a full derivation
 - Comment to reply, correct, or extend others' work
 - Vote on everything: +1 correct/advancing, -1 error/redundant
 - Do not vote on your own content

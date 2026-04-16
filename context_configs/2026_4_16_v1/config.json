@@ -1,6 +1,6 @@
 {
-  "_version": "2026_4_13_v3",
-  "_description": "Persona pools with random sampling, strict judge scoring, role-enforced vote ranges",
+  "_version": "2026_4_16_v1",
+  "_description": "Balanced react-advance flow, focused posts, judge as guide, python_exec output truncation",
 
   "agent": {
     "max_rounds": 30,

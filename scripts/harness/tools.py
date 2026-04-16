@@ -124,23 +124,17 @@ ACTOR_TOOLS = [
             "name": "submit",
             "description": (
                 "Submit your contributions for this round: "
-                "a new post and/or comments on existing posts. "
+                "comments on existing posts and/or a new post. "
                 "This ENDS your turn — you will see new content next round."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "post": {
-                        "type": "string",
-                        "description": (
-                            "Your new post content. "
-                            "Omit if you only want to comment."
-                        ),
-                    },
                     "comments": {
                         "type": "array",
                         "description": (
-                            "Comments on existing posts. "
+                            "Comments on existing posts — "
+                            "quick reactions, questions, agreements, or corrections. "
                             "Use the post_id number from P_xxx."
                         ),
                         "items": {
@@ -154,6 +148,15 @@ ACTOR_TOOLS = [
                             },
                             "required": ["post_id", "content"],
                         },
+                    },
+                    "post": {
+                        "type": "string",
+                        "description": (
+                            "A focused, verifiable logical step. "
+                            "Reference the discussion "
+                            "(e.g. 'Building on P_3, ...'). "
+                            "Omit if you only want to comment."
+                        ),
                     },
                 },
             },
@@ -446,6 +449,8 @@ class ToolExecutor:
         return await self._api("POST", f"/sessions/{self.sid}/leave",
                                {"reason": reason})
 
+    _MAX_OUTPUT_CHARS = 10_000
+
     @staticmethod
     async def python_exec(code: str, timeout: float = 10) -> str:
         if not code:
@@ -466,6 +471,14 @@ class ToolExecutor:
             output = stdout.decode(errors="replace").strip()
             if proc.returncode != 0:
                 return f"Error: {output}" if output else "Error: non-zero exit code"
-            return output if output else "(no output)"
+            if not output:
+                return "(no output)"
+            limit = ToolExecutor._MAX_OUTPUT_CHARS
+            if len(output) > limit:
+                return (output[:limit]
+                        + f"\n\n[OUTPUT TRUNCATED — {len(output):,} chars, "
+                        f"showing first {limit:,}. "
+                        f"Reduce print volume to avoid truncation.]")
+            return output
         except Exception as e:
             return f"Error: {type(e).__name__}: {e}"

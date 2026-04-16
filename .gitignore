@@ -5,5 +5,11 @@ data/
 __pycache__/
 *.pyc
 
+# Agent-generated artifacts
+*.npz
+
 # Cursor IDE
 .cursor/
+
+# Docs (local only)
+docs/
