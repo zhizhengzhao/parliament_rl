@@ -1,16 +1,17 @@
 """Create users for Parliament experiments."""
 
+from __future__ import annotations
+
 from .config import ADMIN_KEY
+from .store import Store
 
 
-def seed_data(store, num_actors: int = 3, num_judges: int = 3):
+def seed_data(store: Store, num_actors: int = 3, num_judges: int = 3) -> None:
     existing = {u["name"] for u in store.list_users()}
 
     if "Admin" not in existing:
-        store._write(
-            "INSERT INTO users (name, api_key, role, bio) VALUES (?,?,?,?)",
-            ("Admin", ADMIN_KEY, "admin", "Platform administrator"),
-        )
+        store.create_user("Admin", role="admin",
+                          bio="Platform administrator", api_key=ADMIN_KEY)
 
     for i in range(1, num_actors + 1):
         name = f"Scientist_{i}"
@@ -22,5 +23,5 @@ def seed_data(store, num_actors: int = 3, num_judges: int = 3):
         if name not in existing:
             store.create_user(name, role="judge")
 
-    users = store.list_users()
-    print(f"  Users: {len(users)} ({num_actors} actors, {num_judges} judges)")
+    print(f"  Users: {len(store.list_users())} "
+          f"({num_actors} actors, {num_judges} judges)")

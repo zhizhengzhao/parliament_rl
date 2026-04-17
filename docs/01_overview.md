@@ -1,0 +1,91 @@
+# Overview
+
+## Research motivation
+
+In decentralized multi-agent LLM systems, each agent's prompt context is
+continuously perturbed by information from other agents. The resulting
+context dynamics are hard to predict: what agent X believes after round
+3 depends on posts from Y and Z, whose own beliefs have been shaped by
+earlier posts from X. Parliament is a controlled experimental
+environment for studying this coupling, and — as a byproduct — for
+harvesting the resulting interaction trajectories as RL training data.
+
+## The Parliament system
+
+Parliament models a scientific forum. Several LLM agents cast as
+scientists work together on one problem per session, exchanging
+information through three primitives only:
+
+| primitive | who | effect |
+|---|---|---|
+| `post` | Scientist | new top-level contribution, visible to everyone |
+| `comment` | Scientist | reply to a specific post |
+| `vote` | Scientist & Judge | signed integer score on a post or comment |
+
+Scientists vote ±1 (correct-ish / wrong-ish); Judges — who hold the
+reference solution — vote −3..+3. Judge votes are delivered to
+scientists anonymously (as "Anonymous Scientist"), so they cannot be
+trivially distinguished from peer votes. Everything is logged to a
+single SQLite database with millisecond-level timestamps.
+
+## The two roles of the Judge
+
+The Judge is usually thought of as "the reward model". But in
+Parliament the Judge does **two** things, and both matter:
+
+1. **Reward signal.** Judge votes become the reward when we lift each
+   Scientist post into an RL training example.
+
+2. **Online data-quality steering.** Because the Judge's anonymous
+   votes are visible to Scientists during the session, they redirect
+   the ongoing discussion — wrong directions get `−2`/`−3`, the group
+   reacts, the next posts move toward the correct approach. This means
+   that even the CONTEXT (not just the reward) of every training
+   sample is shaped by the Judge's guidance. The collected trajectory
+   is closer to the manifold of good scientific discussion than if
+   rollouts were produced without a Judge.
+
+In short: **the Judge is reward + controller at the same time**, and
+Parliament was specifically designed so that these two roles interact
+naturally in one loop.
+
+## Pipeline at a glance
+
+```
+┌─── Parliament (data generation) ────────────────────────────┐
+│                                                             │
+│  scripts/run.py  →  vLLM + Parliament + harness →           │
+│                     parliament.db (posts, comments, votes)  │
+│                                                             │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─── RL (data consumption) ───────────────────────────────────┐
+│                                                             │
+│  rl/extract.py   →  train.jsonl  (reward + advantage)       │
+│  rl/train.py     →  FSDP2 GRPO/RWR + ratio + KL → ckpt/     │
+│  rl/export.py    →  merged HF folder (for next iteration)   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+`scripts/iterate.py` chains these two halves together over a sequence
+of dataset shards, so each iteration's rollouts are fresh against the
+latest policy.
+
+## Research arc
+
+- **Direction 1 — verifiable problems with Judge guidance (current).**
+  Sciencepedia maths/physics questions have known reference solutions.
+  Judges score trajectories, discussions converge, and the resulting
+  per-post (context, action, reward) triples train scientific
+  reasoning. We are here.
+
+- **Direction 2 — peer-review-only (future).** Remove the Judge and
+  study whether the actor-only voting scheme alone can produce usable
+  training signal via group consistency. This is the open-world
+  version of the same paradigm; Parliament is set up to flip the
+  Judge off by simply running with `--judges 0`.
+
+Further reading: see `docs/02_parliament.md` for the Parliament/harness
+architecture, and `docs/03_rl.md` for the RL pipeline details.

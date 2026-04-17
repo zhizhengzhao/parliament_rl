@@ -1,0 +1,24 @@
+{
+  "_description": "Templates and parameters for reconstructing RL training context from parliament.db",
+
+  "min_content_chars": 20,
+
+  "section_headers": {
+    "problem": "## Problem",
+    "discussion": "## Discussion",
+    "next_contribution": "## Your Next Contribution"
+  },
+
+  "you_marker": " [you]",
+
+  "post_header": "[P_{local_id}] by {author}{is_you}",
+  "comment_header": "[C_{local_id}] on P_{local_post_id} by {author}{is_you}",
+  "score_suffix": " (score: {score})",
+
+  "score_visibility": "auto",
+
+  "anonymize_identity": true,
+
+  "advantage_baseline": 0.0,
+  "advantage_scale": "session_std"
+}

@@ -6,15 +6,18 @@ Each GPU runs its own vLLM API. The harness dynamically assigns sessions
 to GPUs from a shared queue. On success, Parliament stays up for web UI.
 
 Usage:
-    python scripts/run.py \
-        --gpus 0,1,2,3,4,5,6,7 \
-        --sessions-per-gpu 2 \
-        --actors 3 --judges 3 \
-        --dataset datasets/sciencepedia_test.json \
-        --name sciencepedia_test
+    python scripts/run.py \\
+        --gpus 0,1,2,3,4,5,6,7 \\
+        --sessions-per-gpu 2 \\
+        --actors 3 --judges 3 \\
+        --dataset datasets/sciencepedia_test.json \\
+        --name experiment_1 \\
+        --max-turns 30
 
     python scripts/run.py --stop-vllm
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
@@ -25,34 +28,39 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 VLLM_PYTHON = "/root/miniconda3/envs/parliament/bin/python"
 MODEL_PATH = "/root/zhizheng/models/Qwen3.5-9B"
-MODEL_NAME = MODEL_PATH
-TMUX_PREFIX = "vllm-gpu"
 ADMIN_KEY = "sp_admin_parliament"
+TMUX_PREFIX = "vllm-gpu"
+EXPERIMENT_TMUX = "parliament-run"
 GPU_IDLE_MEMORY_THRESHOLD_MIB = 2048
 
+
+# ── Tee stdout/stderr to a file ──────────────────────────
 
 class Tee:
     def __init__(self, *streams):
         self.streams = streams
 
-    def write(self, data: str):
+    def write(self, data: str) -> int:
         for s in self.streams:
             s.write(data)
             s.flush()
         return len(data)
 
-    def flush(self):
+    def flush(self) -> None:
         for s in self.streams:
             s.flush()
 
 
-# ── HTTP helper ───────────────────────────────────────────
+# ── HTTP helpers ─────────────────────────────────────────
 
 def http(method: str, url: str, key: str = "", body: dict | None = None):
     data = json.dumps(body).encode() if body else None
@@ -65,10 +73,9 @@ def http(method: str, url: str, key: str = "", body: dict | None = None):
     except urllib.error.HTTPError as e:
         body_text = e.read().decode()[:500] if e.fp else ""
         print(f"  HTTP {e.code} on {method} {url}: {body_text}")
-        return None
     except Exception as e:
         print(f"  Request error {method} {url}: {e}")
-        return None
+    return None
 
 
 def wait_ready(url: str, timeout: int = 300) -> bool:
@@ -82,11 +89,12 @@ def wait_ready(url: str, timeout: int = 300) -> bool:
     return False
 
 
-# ── Cleanup ───────────────────────────────────────────────
+# ── Cleanup ──────────────────────────────────────────────
 
-def kill_port(port: int):
+def kill_port(port: int) -> None:
     try:
-        out = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True).stdout
+        out = subprocess.run(["ss", "-tlnp"],
+                             capture_output=True, text=True).stdout
         for line in out.splitlines():
             if f":{port} " in line and "pid=" in line:
                 pid = int(line.split("pid=")[1].split(",")[0])
@@ -96,7 +104,7 @@ def kill_port(port: int):
         pass
 
 
-def stop_vllm():
+def stop_vllm() -> None:
     out = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
                          capture_output=True, text=True).stdout
     killed = 0
@@ -110,12 +118,13 @@ def stop_vllm():
         time.sleep(2)
 
 
-def cleanup_all(gpus: list[int], port: int):
+def cleanup_all(gpus: list[int], port: int) -> None:
     print("[0/3] Cleanup")
     stop_vllm()
     kill_port(port)
     time.sleep(1)
 
+    busy: list[int] = []
     for _ in range(10):
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,memory.used",
@@ -124,27 +133,26 @@ def cleanup_all(gpus: list[int], port: int):
         ).stdout
         busy = []
         for line in out.strip().split("\n"):
-            parts = line.split(",")
-            idx, mem = int(parts[0].strip()), int(parts[1].strip())
+            idx_s, mem_s = line.split(",")
+            idx, mem = int(idx_s.strip()), int(mem_s.strip())
             if idx in gpus and mem > GPU_IDLE_MEMORY_THRESHOLD_MIB:
                 busy.append(idx)
         if not busy:
             break
         time.sleep(3)
-    else:
+    if busy:
         print(f"  WARNING: GPUs {busy} still have memory in use")
-
     print("  Cleanup done\n")
 
 
-# ── vLLM (parallel startup) ─────────────────────────────
+# ── vLLM ─────────────────────────────────────────────────
 
 def gpu_to_port(gpu: int) -> int:
     return 7999 + gpu
 
 
-def ensure_vllm(gpus: list[int]) -> list[int]:
-    ports = []
+def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH) -> list[int]:
+    ports: list[int] = []
     for gpu in gpus:
         port = gpu_to_port(gpu)
         ports.append(port)
@@ -154,7 +162,7 @@ def ensure_vllm(gpus: list[int]) -> list[int]:
         cmd = (
             f"CUDA_VISIBLE_DEVICES={gpu} {VLLM_PYTHON} "
             f"-m vllm.entrypoints.openai.api_server "
-            f"--model {MODEL_PATH} --port {port} "
+            f"--model {model_path} --port {port} "
             f"--max-model-len 262144 --gpu-memory-utilization 0.92 "
             f"--enable-auto-tool-choice --tool-call-parser qwen3_coder "
             f"--dtype auto 2>&1 | tee /tmp/vllm_gpu{gpu}.log"
@@ -170,7 +178,6 @@ def ensure_vllm(gpus: list[int]) -> list[int]:
             stop_vllm()
             sys.exit(1)
         print(f"  GPU {gpu} → :{port} ready")
-
     print(f"  All {len(ports)} vLLM instances ready")
     return ports
 
@@ -178,19 +185,13 @@ def ensure_vllm(gpus: list[int]) -> list[int]:
 # ── Parliament ───────────────────────────────────────────
 
 def start_parliament(name: str, num_actors: int, num_judges: int,
-                     port: int = 8080, log_path: Path | None = None,
-                     db_dir: str | None = None) -> subprocess.Popen:
-    if log_path is None:
-        log_path = PROJECT_DIR / "data" / f"parliament_{name}.log"
+                     port: int, log_path: Path,
+                     db_dir: str) -> subprocess.Popen:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = open(log_path, "w")
     cmd = [sys.executable, "-m", "parliament.server",
            "--seed", "--actors", str(num_actors), "--judges", str(num_judges),
-           "--port", str(port)]
-    if db_dir:
-        cmd.extend(["--db-dir", db_dir])
-    else:
-        cmd.extend(["--name", name])
+           "--port", str(port), "--db-dir", db_dir]
     proc = subprocess.Popen(
         cmd, cwd=str(PROJECT_DIR),
         stdout=log_file, stderr=subprocess.STDOUT,
@@ -207,8 +208,22 @@ def start_parliament(name: str, num_actors: int, num_judges: int,
     return proc
 
 
+def stop_parliament(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def load_dataset(dataset_path: str, parliament_url: str,
-                 max_questions: int = 0) -> int:
+                 max_questions: int) -> int:
     questions = json.loads(Path(dataset_path).read_text(encoding="utf-8"))
     if max_questions > 0:
         questions = questions[:max_questions]
@@ -218,72 +233,79 @@ def load_dataset(dataset_path: str, parliament_url: str,
         desc = q.get("description", "")
         solution = q.get("reference_solution") or q.get("solution") or ""
         answer = q.get("answer", "")
-        ref = f"{solution}\n\nFinal answer: {answer}".strip() if answer else solution
+        ref = (f"{solution}\n\nFinal answer: {answer}".strip()
+               if answer else solution)
         if not title:
             continue
-        result = http("POST", f"{parliament_url}/sessions", ADMIN_KEY, {
-            "title": title, "description": desc, "reference_solution": ref,
-        })
+        result = http("POST", f"{parliament_url}/sessions", ADMIN_KEY,
+                      {"title": title, "description": desc,
+                       "reference_solution": ref})
         if result and result.get("session_id"):
             loaded += 1
     print(f"  Dataset: {loaded}/{len(questions)} questions loaded")
     return loaded
 
 
+# ── tmux self-launch ─────────────────────────────────────
+
+def relaunch_in_tmux(argv: list[str], name: str) -> None:
+    subprocess.run(["tmux", "start-server"], capture_output=True)
+    time.sleep(1)
+    subprocess.run(["tmux", "kill-session", "-t", EXPERIMENT_TMUX],
+                   capture_output=True)
+    cmd = f"{shlex.quote(sys.executable)} {shlex.join(argv + ['--in-tmux'])}"
+    r = subprocess.run(
+        ["tmux", "new-session", "-d", "-s", EXPERIMENT_TMUX, cmd],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"FATAL: Failed to create tmux session: {r.stderr}")
+        sys.exit(1)
+    time.sleep(1)
+    if subprocess.run(["tmux", "has-session", "-t", EXPERIMENT_TMUX],
+                      capture_output=True).returncode != 0:
+        print(f"FATAL: tmux session '{EXPERIMENT_TMUX}' not found after creation")
+        sys.exit(1)
+    print(f"Experiment launched in tmux session '{EXPERIMENT_TMUX}'")
+    print(f"  Attach: tmux attach -t {EXPERIMENT_TMUX}")
+    print(f"  Logs:   tail -f data/{name}_*/run.log")
+
+
 # ── Main ─────────────────────────────────────────────────
 
-EXPERIMENT_TMUX = "parliament-run"
-
-
-def main():
-    parser = argparse.ArgumentParser(
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
         description="One-click Parliament RL data collection")
-    parser.add_argument("--gpus", help="Comma-separated GPU IDs")
-    parser.add_argument("--sessions-per-gpu", type=int, default=2)
-    parser.add_argument("--actors", type=int, default=3)
-    parser.add_argument("--judges", type=int, default=3)
-    parser.add_argument("--dataset", help="Path to questions JSON file")
-    parser.add_argument("--name", help="Run name")
-    parser.add_argument("--max-turns", type=int, default=30)
-    parser.add_argument("--max-questions", type=int, default=0)
-    parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--stop-vllm", action="store_true")
-    parser.add_argument("--in-tmux", action="store_true",
-                        help="Internal flag: already running inside tmux")
-    args = parser.parse_args()
+    p.add_argument("--gpus", help="Comma-separated GPU IDs")
+    p.add_argument("--sessions-per-gpu", type=int, default=2)
+    p.add_argument("--actors", type=int, default=3)
+    p.add_argument("--judges", type=int, default=3)
+    p.add_argument("--dataset", help="Path to questions JSON file")
+    p.add_argument("--name", help="Run name")
+    p.add_argument("--model", default=MODEL_PATH,
+                   help="HF model path (defaults to base Qwen3.5-9B)")
+    p.add_argument("--max-turns", type=int, default=30)
+    p.add_argument("--max-questions", type=int, default=0)
+    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--stop-vllm", action="store_true")
+    p.add_argument("--in-tmux", action="store_true",
+                   help="Internal flag: already running inside tmux")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
 
     if args.stop_vllm:
         stop_vllm()
         return
 
-    for flag in ["gpus", "dataset", "name"]:
+    for flag in ("gpus", "dataset", "name"):
         if not getattr(args, flag):
-            parser.error(f"--{flag} is required")
+            print(f"FATAL: --{flag} is required")
+            sys.exit(2)
 
-    # Auto-launch inside tmux if not already there
     if not args.in_tmux:
-        subprocess.run(["tmux", "start-server"], capture_output=True)
-        time.sleep(1)
-        subprocess.run(["tmux", "kill-session", "-t", EXPERIMENT_TMUX],
-                       capture_output=True)
-        cmd_args = sys.argv + ["--in-tmux"]
-        tmux_cmd = f"{shlex.quote(sys.executable)} {shlex.join(cmd_args)}"
-        r = subprocess.run(["tmux", "new-session", "-d", "-s",
-                            EXPERIMENT_TMUX, tmux_cmd],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            print(f"FATAL: Failed to create tmux session: {r.stderr}")
-            sys.exit(1)
-        # Verify session exists
-        time.sleep(1)
-        check = subprocess.run(["tmux", "has-session", "-t", EXPERIMENT_TMUX],
-                               capture_output=True)
-        if check.returncode != 0:
-            print(f"FATAL: tmux session '{EXPERIMENT_TMUX}' not found after creation")
-            sys.exit(1)
-        print(f"Experiment launched in tmux session '{EXPERIMENT_TMUX}'")
-        print(f"  Attach: tmux attach -t {EXPERIMENT_TMUX}")
-        print(f"  Logs:   tail -f data/run_{args.name}_*.log")
+        relaunch_in_tmux(sys.argv, args.name)
         return
 
     if not Path(args.dataset).exists():
@@ -291,42 +313,38 @@ def main():
         sys.exit(1)
 
     gpus = [int(g) for g in args.gpus.split(",")]
-
-    # Create run directory — all outputs go here
     run_dir = PROJECT_DIR / "data" / f"{args.name}_{time.strftime('%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    run_log = run_dir / "run.log"
-    log_file = open(run_log, "w", buffering=1)
+    log_file = open(run_dir / "run.log", "w", buffering=1)
     sys.stdout = Tee(sys.__stdout__, log_file)
     sys.stderr = Tee(sys.__stderr__, log_file)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Parliament RL — {args.name}")
-    print(f"{'='*60}")
-    print(f"  GPUs:          {gpus}")
-    print(f"  Sessions/GPU:  {args.sessions_per_gpu}")
-    print(f"  Agents/session:{args.actors} actors + {args.judges} judges")
-    print(f"  Max rounds:    {args.max_turns} (actor only)")
-    print(f"  Dataset:       {args.dataset}")
-    print(f"  Output:        {run_dir}")
+    print(f"{'=' * 60}")
+    print(f"  GPUs:           {gpus}")
+    print(f"  Sessions/GPU:   {args.sessions_per_gpu}")
+    print(f"  Agents/session: {args.actors} actors + {args.judges} judges")
+    print(f"  Max rounds:     {args.max_turns} (actor only)")
+    print(f"  Dataset:        {args.dataset}")
+    print(f"  Model:          {args.model}")
+    print(f"  Output:         {run_dir}")
     print()
 
     cleanup_all(gpus, args.port)
 
     print("[1/3] vLLM")
-    ports = ensure_vllm(gpus)
+    ports = ensure_vllm(gpus, args.model)
     gpu_endpoints = [f"http://127.0.0.1:{p}/v1" for p in ports]
     print()
 
     print("[2/3] Parliament")
     parliament_url = f"http://127.0.0.1:{args.port}"
-    parliament_log = run_dir / "parliament.log"
     parliament_proc = start_parliament(
         args.name, args.actors, args.judges, args.port,
-        log_path=parliament_log, db_dir=str(run_dir))
-    loaded = load_dataset(args.dataset, parliament_url, args.max_questions)
-    if loaded == 0:
+        log_path=run_dir / "parliament.log", db_dir=str(run_dir))
+    if load_dataset(args.dataset, parliament_url, args.max_questions) == 0:
         print("  FATAL: No questions loaded")
         parliament_proc.terminate()
         sys.exit(1)
@@ -344,7 +362,7 @@ def main():
             sessions_per_gpu=args.sessions_per_gpu,
             num_actors=args.actors,
             num_judges=args.judges,
-            model_name=MODEL_NAME,
+            model_name=args.model,
             max_rounds=args.max_turns,
             output_path=str(run_dir / "experiment.json"),
         ))
@@ -356,17 +374,7 @@ def main():
         if keep_parliament:
             stop_vllm()
         else:
-            try:
-                os.killpg(parliament_proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                parliament_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(parliament_proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            stop_parliament(parliament_proc)
 
     print(f"\n  Experiment finished.")
     print(f"  Web UI:        http://127.0.0.1:{args.port}")

@@ -1,3 +1,10 @@
+# Parliament server + harness (data collection)
 fastapi>=0.100
 uvicorn>=0.20
 aiohttp>=3.9
+
+# RL training (rl/train.py + rl/export.py)
+torch>=2.5
+transformers>=5.5            # Qwen3.5 support
+accelerate>=1.13             # FSDP2
+safetensors>=0.4

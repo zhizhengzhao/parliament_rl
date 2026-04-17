@@ -1,22 +1,83 @@
 #!/usr/bin/env python3
-"""Extract training data from parliament.db.
+"""Extract RL training data from parliament.db.
 
-Reconstructs lightweight scientific discussions from posts and comments,
-then builds (context, action, reward, advantage) samples for GRPO training.
+Each actor post becomes one training sample. We reconstruct the actor's
+first-person view at the moment of posting:
 
-Only Scientist posts become training samples. Comments appear in context
-but are not trained on. Advantage is computed per-session (group = session).
+  user message  = problem + full prior discussion (posts + comments,
+                  optionally annotated with cumulative scores)
+                  + [you] markers on the actor's own contributions
+  assistant msg = the actual post content
+  reward        = sum of judge votes on this post (judges only)
+  advantage     = (reward - baseline) / scale, both configurable
+
+All content is natural language — no JSON, no tool calls, no agent-specific
+formatting. The goal is to train scientific reasoning, not agent behavior.
+
+Identity is anonymized with a per-session draw from a name pool, and score
+annotations are kept only in sessions that actually meta-reference
+Parliament scoring. Both behaviors are controlled by `RL_context/config.json`.
 
 Usage:
-    python -m rl.extract --db data/train_part1_v3_.../parliament.db --output data/train.jsonl
+    python -m rl.extract --db data/run/parliament.db --output data/run/train.jsonl
 """
+
+from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
+from statistics import pstdev
 
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+RL_CONTEXT = PROJECT_DIR / "context_configs" / "RL_context"
+PARLIAMENT_CONTEXT = PROJECT_DIR / "context_configs" / "Parliament_context"
+
+# Make `harness.prompts` importable when extract.py is run as `python -m rl.extract`
+# from the project root. Parliament's session name map is the single source
+# of truth; we import it directly so every Scientist_N mapping here is
+# bit-identical to what the harness used at generation time.
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+from harness.prompts import assign_session_names  # noqa: E402
+
+TYPE_ORDER = {"post": 0, "comment": 1}
+
+# Detects whether a post's content actually meta-references Parliament scoring.
+SCORE_META_RE = re.compile(
+    r"(?i)(score\s*of|scored|\bvote[sd]?\b|high[\-]?scoring|"
+    r"negative[\-]?scoring|anonymous\s+(?:vote|scientist)|consensus)"
+)
+SCIENTIST_RE = re.compile(r"\bScientist_(\d+)\b")
+
+
+# ── Config loading ───────────────────────────────────────
+
+def load_rl_config() -> dict:
+    cfg = json.loads((RL_CONTEXT / "config.json").read_text())
+    cfg["prompt_intro"] = (RL_CONTEXT / "prompt_intro.txt").read_text().strip()
+    # The name_pool is the single source of truth for Parliament's session
+    # casting — harness uses it at runtime, we use the same pool + seed here
+    # so the mapping is identical.
+    parl_cfg = json.loads((PARLIAMENT_CONTEXT / "config.json").read_text())
+    cfg["name_pool"] = parl_cfg.get("name_pool", [])
+    return cfg
+
+
+_CFG: dict | None = None
+
+
+def cfg() -> dict:
+    global _CFG
+    if _CFG is None:
+        _CFG = load_rl_config()
+    return _CFG
+
+
+# ── DB access ─────────────────────────────────────────────
 
 def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
@@ -25,54 +86,55 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 
 def load_session_ids(conn: sqlite3.Connection) -> list[str]:
-    rows = conn.execute(
+    return [r[0] for r in conn.execute(
         "SELECT DISTINCT s.session_id FROM sessions s "
         "JOIN posts p ON s.session_id = p.session_id "
-        "ORDER BY s.session_id"
-    ).fetchall()
-    return [r[0] for r in rows]
+        "ORDER BY s.session_id").fetchall()]
 
 
-def load_session_data(conn: sqlite3.Connection, session_id: str) -> dict:
-    """Load all data for one session."""
+def load_session_data(conn: sqlite3.Connection, session_id: str
+                      ) -> tuple[dict, list[dict], list[dict], list[dict]]:
     session = dict(conn.execute(
         "SELECT session_id, title FROM sessions WHERE session_id = ?",
-        (session_id,),
-    ).fetchone())
+        (session_id,)).fetchone())
 
     posts = [dict(r) for r in conn.execute(
-        "SELECT p.post_id, p.user_id, p.content, p.created_at, "
+        "SELECT p.post_id, p.content, p.created_at, "
         "u.name AS author, u.role AS author_role "
         "FROM posts p JOIN users u ON p.user_id = u.user_id "
         "WHERE p.session_id = ? ORDER BY p.post_id",
-        (session_id,),
-    ).fetchall()]
+        (session_id,)).fetchall()]
 
     comments = [dict(r) for r in conn.execute(
-        "SELECT c.comment_id, c.post_id, c.user_id, c.content, "
-        "c.created_at, u.name AS author, u.role AS author_role "
+        "SELECT c.comment_id, c.post_id, c.content, c.created_at, "
+        "u.name AS author, u.role AS author_role "
         "FROM comments c JOIN users u ON c.user_id = u.user_id "
         "JOIN posts p ON c.post_id = p.post_id "
         "WHERE p.session_id = ? ORDER BY c.comment_id",
-        (session_id,),
-    ).fetchall()]
+        (session_id,)).fetchall()]
 
     votes = [dict(r) for r in conn.execute(
-        "SELECT v.vote_id, v.post_id, v.comment_id, v.value "
-        "FROM votes v "
+        "SELECT v.vote_id, v.post_id, v.comment_id, v.value, v.created_at, "
+        "u.role AS author_role "
+        "FROM votes v JOIN users u ON v.user_id = u.user_id "
         "LEFT JOIN posts p ON v.post_id = p.post_id "
         "LEFT JOIN comments c ON v.comment_id = c.comment_id "
         "LEFT JOIN posts p2 ON c.post_id = p2.post_id "
-        "WHERE COALESCE(p.session_id, p2.session_id) = ?",
-        (session_id,),
-    ).fetchall()]
+        "WHERE COALESCE(p.session_id, p2.session_id) = ? "
+        "ORDER BY v.vote_id",
+        (session_id,)).fetchall()]
 
-    return {"session": session, "posts": posts,
-            "comments": comments, "votes": votes}
+    return session, posts, comments, votes
 
+
+# ── Local IDs & timeline ─────────────────────────────────
 
 def assign_local_ids(posts: list[dict], comments: list[dict]) -> None:
-    """Assign session-local sequential IDs (P_1, P_2, C_1, C_2...)."""
+    """Assign session-local sequential IDs (P_1, P_2, …, C_1, C_2, …).
+
+    Order matches an agent's view: posts ordered by post_id (≡ creation
+    order via autoincrement), comments by comment_id.
+    """
     for i, p in enumerate(posts, 1):
         p["local_id"] = i
     for i, c in enumerate(comments, 1):
@@ -83,13 +145,13 @@ def assign_local_ids(posts: list[dict], comments: list[dict]) -> None:
 
 
 def build_timeline(posts: list[dict], comments: list[dict]) -> list[dict]:
-    """Merge posts and comments into a single chronological timeline."""
-    timeline = []
+    """Merge posts and comments into a chronological timeline."""
+    timeline: list[dict] = []
     for p in posts:
         timeline.append({
             "type": "post",
-            "global_id": p["post_id"],
             "local_id": p["local_id"],
+            "post_id": p["post_id"],
             "author": p["author"],
             "author_role": p["author_role"],
             "content": p["content"],
@@ -98,101 +160,290 @@ def build_timeline(posts: list[dict], comments: list[dict]) -> list[dict]:
     for c in comments:
         timeline.append({
             "type": "comment",
-            "global_id": c["comment_id"],
             "local_id": c["local_id"],
+            "comment_id": c["comment_id"],
             "local_post_id": c["local_post_id"],
             "author": c["author"],
             "author_role": c["author_role"],
             "content": c["content"],
             "created_at": c["created_at"],
         })
-    type_order = {"post": 0, "comment": 1}
-    timeline.sort(key=lambda x: (x["created_at"],
-                                  type_order.get(x["type"], 9),
-                                  x["global_id"]))
+    timeline.sort(key=lambda x: (
+        x["created_at"], TYPE_ORDER[x["type"]], x["local_id"]))
     return timeline
 
 
-def format_entry(entry: dict) -> str:
-    """Format a single timeline entry as discussion text."""
-    if entry["type"] == "post":
-        return f'[P_{entry["local_id"]}] {entry["author"]}:\n{entry["content"]}'
-    return (f'[C_{entry["local_id"]}] {entry["author"]} '
-            f'(on P_{entry["local_post_id"]}):\n{entry["content"]}')
+# ── Scoring ──────────────────────────────────────────────
+
+def fmt_score(s: int) -> str:
+    return f"+{s}" if s > 0 else str(s)
 
 
-def compute_post_rewards(posts: list[dict], votes: list[dict]) -> dict[int, float]:
-    """Compute reward for each post from its votes."""
-    rewards: dict[int, float] = {}
+def _fold_vote(post_scores: dict[int, int],
+               comment_scores: dict[int, int], v: dict) -> None:
+    """Add a single vote into the running score dicts."""
+    if v["post_id"]:
+        post_scores[v["post_id"]] = post_scores.get(v["post_id"], 0) + v["value"]
+    elif v["comment_id"]:
+        comment_scores[v["comment_id"]] = comment_scores.get(v["comment_id"], 0) + v["value"]
+
+
+# ── Identity anonymization ───────────────────────────────
+
+def sub_names_in_text(text: str, name_map: dict[str, str]) -> str:
+    """Rewrite every `Scientist_N` token in free-form text per `name_map`.
+
+    Belt-and-braces for legacy DBs whose content literally contains
+    `Scientist_N`. New Parliament runs (which apply the same name_map
+    at LLM time) never produce such strings in the first place.
+    """
+    if not name_map:
+        return text
+    return SCIENTIST_RE.sub(
+        lambda m: name_map.get(f"Scientist_{m.group(1)}",
+                               f"Scientist_{m.group(1)}"),
+        text,
+    )
+
+
+# ── Score visibility ─────────────────────────────────────
+
+def session_references_scores(posts: list[dict]) -> bool:
+    """True if any actor post in this session meta-references parliament scoring."""
     for p in posts:
-        rewards[p["post_id"]] = 0.0
+        if p["author_role"] == "actor" and SCORE_META_RE.search(p["content"]):
+            return True
+    return False
+
+
+def should_show_scores(posts: list[dict]) -> bool:
+    mode = cfg().get("score_visibility", "auto")
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return session_references_scores(posts)
+
+
+# ── Rendering ────────────────────────────────────────────
+
+def render_user_message(session_title: str, actor_name: str,
+                        timeline_before: list[dict],
+                        post_scores: dict[int, int],
+                        comment_scores: dict[int, int],
+                        show_scores: bool) -> str:
+    """Render the actor's first-person view as natural language."""
+    c = cfg()
+    headers = c["section_headers"]
+    you = c["you_marker"]
+    score_suffix = c["score_suffix"]
+
+    lines = [c["prompt_intro"].format(name=actor_name), "",
+             headers["problem"], "", session_title.strip(), "",
+             headers["discussion"], ""]
+
+    for entry in timeline_before:
+        is_you = you if entry["author"] == actor_name else ""
+        if entry["type"] == "post":
+            header = c["post_header"].format(
+                local_id=entry["local_id"], author=entry["author"],
+                is_you=is_you)
+            score = post_scores.get(entry["post_id"], 0)
+        else:
+            header = c["comment_header"].format(
+                local_id=entry["local_id"],
+                local_post_id=entry["local_post_id"],
+                author=entry["author"], is_you=is_you)
+            score = comment_scores.get(entry["comment_id"], 0)
+        if show_scores:
+            header += score_suffix.format(score=fmt_score(score))
+        lines.append(header)
+        lines.append(entry["content"].strip())
+        lines.append("")
+
+    lines.append(headers["next_contribution"])
+    return "\n".join(lines)
+
+
+# ── Rewards ──────────────────────────────────────────────
+
+def compute_post_rewards(actor_posts: list[dict],
+                         votes: list[dict]) -> dict[int, float]:
+    """Sum judge votes on each actor post.
+
+    Only judges contribute to the reward signal — actor votes are noisy
+    peer guesses (actors are also trying to find the answer). Actor votes
+    still appear in the discussion context the model conditions on; they
+    just don't bias the reward.
+    """
+    rewards = {p["post_id"]: 0.0 for p in actor_posts}
     for v in votes:
+        if v.get("author_role") != "judge":
+            continue
         pid = v.get("post_id")
-        if pid and pid in rewards:
+        if pid in rewards:
             rewards[pid] += v["value"]
     return rewards
 
 
-def compute_advantages(rewards: dict[int, float]) -> dict[int, float]:
-    """Compute GRPO advantage: per-session normalization."""
-    if not rewards:
-        return {}
-    values = list(rewards.values())
-    mean = sum(values) / len(values)
-    variance = sum((v - mean) ** 2 for v in values) / len(values)
-    std = variance ** 0.5
-    if std < 1e-8:
-        return {pid: 0.0 for pid in rewards}
-    return {pid: (r - mean) / std for pid, r in rewards.items()}
+# ── Per-session extraction ───────────────────────────────
 
+def extract_session(session: dict, posts: list[dict],
+                    comments: list[dict], votes: list[dict],
+                    rewards: dict[int, float],
+                    advantages: dict[int, float]) -> list[dict]:
+    """Build training samples for one session.
 
-def extract_session(data: dict) -> list[dict]:
-    """Extract training samples from one session."""
-    session = data["session"]
-    posts = data["posts"]
-    comments = data["comments"]
-    votes = data["votes"]
-
+    Streams the timeline once; at each actor post the running score dicts
+    contain exactly the votes placed strictly before that post's timestamp.
+    Cost: O((P+C+V) log V) for sorting + O(P+C+V) for the sweep.
+    """
     actor_posts = [p for p in posts if p["author_role"] == "actor"]
     if not actor_posts:
         return []
 
     assign_local_ids(posts, comments)
     timeline = build_timeline(posts, comments)
-    rewards = compute_post_rewards(actor_posts, votes)
-    advantages = compute_advantages(rewards)
 
-    samples = []
+    sid = session["session_id"]
+    name_map = assign_session_names(sid) if cfg().get("anonymize_identity") else {}
+    show_scores = should_show_scores(posts)
+
+    # Apply the name map to authors and content. Touches only the
+    # in-memory copies used for rendering; DB rows are unchanged.
+    # For NEW data generated by Parliament-side naming the content is
+    # already clean; this pass is the belt-and-braces for legacy DBs
+    # whose content still references "Scientist_N".
+    for entry in timeline:
+        entry["author"] = name_map.get(entry["author"], entry["author"])
+        entry["content"] = sub_names_in_text(entry["content"], name_map)
+
+    sorted_votes = sorted(votes, key=lambda v: v["created_at"])
+    vp = 0
+    post_scores: dict[int, int] = {}
+    comment_scores: dict[int, int] = {}
+    min_chars = cfg()["min_content_chars"]
+
+    samples: list[dict] = []
     for i, entry in enumerate(timeline):
+        cutoff = entry["created_at"]
+        while vp < len(sorted_votes) and sorted_votes[vp]["created_at"] < cutoff:
+            _fold_vote(post_scores, comment_scores, sorted_votes[vp])
+            vp += 1
+
         if entry["type"] != "post" or entry["author_role"] != "actor":
             continue
-
-        post_id = entry["global_id"]
-        content = entry["content"]
-        if not content or len(content.strip()) < 20:
+        content = sub_names_in_text(entry["content"].strip(), name_map)
+        if len(content) < min_chars:
             continue
 
-        context_parts = ["Problem: " + session["title"]]
-        for prev in timeline[:i]:
-            context_parts.append(format_entry(prev))
-        context = "\n\n".join(context_parts)
-
         samples.append({
-            "context": context,
-            "action": content,
-            "reward": rewards.get(post_id, 0.0),
-            "advantage": round(advantages.get(post_id, 0.0), 4),
-            "session_id": session["session_id"],
-            "post_id": post_id,
+            "messages": [
+                {"role": "user", "content": render_user_message(
+                    sub_names_in_text(session["title"], name_map),
+                    entry["author"], timeline[:i],
+                    post_scores, comment_scores, show_scores)},
+                {"role": "assistant", "content": content},
+            ],
+            "reward": rewards[entry["post_id"]],
+            "advantage": round(advantages[entry["post_id"]], 4),
+            "session_id": sid,
+            "post_id": entry["post_id"],
             "author": entry["author"],
+            "show_scores": show_scores,
         })
-
     return samples
 
 
-def main():
+# ── Advantage normalization ─────────────────────────────
+
+def _session_mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _session_std(values: list[float]) -> float:
+    if len(values) <= 1:
+        return 1.0
+    m = sum(values) / len(values)
+    var = sum((v - m) ** 2 for v in values) / len(values)
+    return var ** 0.5
+
+
+def compute_advantages(rewards_per_session: dict[str, dict[int, float]]
+                       ) -> dict[int, float]:
+    """Advantage = (reward − baseline) / scale, controlled by config.
+
+    Knobs in `RL_context/config.json`:
+
+      advantage_baseline:
+        0.0                → no centering (default)
+        "mean_session"     → classic GRPO centering (per-session mean)
+        "mean_global"      → REINFORCE++-style (dataset mean)
+        <any number>       → fixed constant
+
+      advantage_scale:
+        "session_std"      → per-session std (default; standard GRPO)
+        "global_std"       → dataset std (REINFORCE++-style)
+        "none" / 1.0       → raw reward-weighted regression
+        <any number>       → fixed constant
+
+    A near-zero session std (homogeneous session — every post got the
+    same reward) is floored at 1.0 so a degenerate session can't blow up
+    the gradient. With baseline=0 and rewards in ±10 this keeps |A| ≤ 10.
+    """
+    c = cfg()
+    baseline_opt = c.get("advantage_baseline", 0.0)
+    scale_opt = c.get("advantage_scale", "session_std")
+    std_floor = 1.0
+
+    all_rewards = [r for rs in rewards_per_session.values() for r in rs.values()]
+    mean_global = _session_mean(all_rewards)
+    std_global = max(pstdev(all_rewards) if len(all_rewards) > 1 else 1.0,
+                     std_floor)
+
+    def _baseline_for(values: list[float]) -> float:
+        if isinstance(baseline_opt, str):
+            if baseline_opt == "mean_session":
+                return _session_mean(values)
+            if baseline_opt == "mean_global":
+                return mean_global
+            try:
+                return float(baseline_opt)
+            except ValueError:
+                return 0.0
+        return float(baseline_opt)
+
+    def _scale_for(values: list[float]) -> float:
+        if isinstance(scale_opt, str):
+            if scale_opt == "session_std":
+                return max(_session_std(values), std_floor)
+            if scale_opt == "global_std":
+                return std_global
+            if scale_opt == "none":
+                return 1.0
+            try:
+                return float(scale_opt)
+            except ValueError:
+                return 1.0
+        return float(scale_opt)
+
+    advantages: dict[int, float] = {}
+    for rewards in rewards_per_session.values():
+        if not rewards:
+            continue
+        values = list(rewards.values())
+        baseline = _baseline_for(values)
+        scale = _scale_for(values)
+        for pid, r in rewards.items():
+            advantages[pid] = (r - baseline) / scale
+    return advantages
+
+
+# ── Main ─────────────────────────────────────────────────
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract GRPO training data from parliament.db")
+        description="Extract RL training data from parliament.db")
     parser.add_argument("--db", required=True, help="Path to parliament.db")
     parser.add_argument("--output", required=True, help="Output JSONL path")
     parser.add_argument("--min-posts", type=int, default=3,
@@ -207,34 +458,51 @@ def main():
     session_ids = load_session_ids(conn)
     print(f"Sessions: {len(session_ids)}")
 
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    total_samples = 0
-    skipped_sessions = 0
+    # Pass 1: load all sessions, compute per-session rewards.
+    cache: dict[str, tuple[dict, list, list, list, dict[int, float]]] = {}
+    rewards_per_session: dict[str, dict[int, float]] = {}
+    for sid in session_ids:
+        session, posts, comments, votes = load_session_data(conn, sid)
+        actor_posts = [p for p in posts if p["author_role"] == "actor"]
+        rewards = compute_post_rewards(actor_posts, votes)
+        cache[sid] = (session, posts, comments, votes, rewards)
+        rewards_per_session[sid] = rewards
+    conn.close()
 
+    # Global advantage normalization across all sessions.
+    advantages = compute_advantages(rewards_per_session)
+
+    # Pass 2: render samples.
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    total_samples = skipped_sessions = 0
+    score_kept_sessions = 0
     with open(args.output, "w") as f:
         for i, sid in enumerate(session_ids):
-            data = load_session_data(conn, sid)
-            samples = extract_session(data)
-
+            session, posts, comments, votes, rewards = cache[sid]
+            samples = extract_session(session, posts, comments, votes,
+                                      rewards, advantages)
             if len(samples) < args.min_posts:
                 skipped_sessions += 1
                 continue
-
+            if samples and samples[0]["show_scores"]:
+                score_kept_sessions += 1
             for s in samples:
                 f.write(json.dumps(s, ensure_ascii=False) + "\n")
             total_samples += len(samples)
-
             if (i + 1) % 100 == 0:
                 print(f"  {i + 1}/{len(session_ids)} sessions, "
                       f"{total_samples} samples", flush=True)
 
-    conn.close()
-
     print(f"\nDone:")
-    print(f"  Sessions: {len(session_ids) - skipped_sessions} "
+    print(f"  Sessions:        {len(session_ids) - skipped_sessions} "
           f"({skipped_sessions} skipped)")
-    print(f"  Samples:  {total_samples}")
-    print(f"  Output:   {args.output}")
+    print(f"  Samples:         {total_samples}")
+    print(f"  Scores kept in:  {score_kept_sessions} sessions "
+          f"(rest had no meta-reference)")
+    print(f"  Anonymized:      {cfg().get('anonymize_identity', False)}")
+    print(f"  Advantage:       baseline={cfg().get('advantage_baseline', 0)}, "
+          f"scale={cfg().get('advantage_scale', 'global_std')}")
+    print(f"  Output:          {args.output}")
 
 
 if __name__ == "__main__":

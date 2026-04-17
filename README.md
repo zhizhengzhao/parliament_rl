@@ -1,127 +1,155 @@
 # Parliament RL
 
-多个 AI 科学家在论坛上协作讨论科学问题，Judge 评审打分，收集全部交互时序数据用于 RL 训练。
+An experimental environment for decentralized multi-agent reasoning
+and the offline-RL pipeline built on top of it.
 
-## 快速开始
+Several LLM scientists collaborate on one scientific problem per
+session, posting, commenting, and voting on each other's work. Judges
+hold reference solutions and cast anonymous votes that double as (a)
+per-post reward and (b) an online steering signal that reshapes the
+discussion toward correct directions. The resulting per-post
+`(context, action, reward)` triples are lifted into RL training data.
+
+See [`docs/01_overview.md`](docs/01_overview.md) for the research
+motivation and the two-fold role of the Judge. See
+[`docs/02_parliament.md`](docs/02_parliament.md) for the data-
+generation architecture and [`docs/03_rl.md`](docs/03_rl.md) for the
+RL side.
+
+## Quick start
+
+One command for iterative training (launches in tmux, survives SSH
+disconnect, auto-resumes on re-invocation):
 
 ```bash
-python scripts/run.py \
-  --gpus 0,1,2,3,4,5,6,7 \
-  --sessions-per-gpu 2 \
-  --actors 3 --judges 3 \
-  --dataset datasets/sciencepedia_test.json \
-  --name experiment_1 \
-  --max-turns 30
+python scripts/iterate.py \
+  --name nrun_v1 \
+  --shards datasets/sciencepedia_train_part1.json,\
+datasets/sciencepedia_train_part2.json,\
+datasets/sciencepedia_train_part3.json,\
+datasets/sciencepedia_train_part4.json \
+  --gpus 0,1,2,3,4,5,6,7
 ```
 
-一条命令完成：启动 vLLM（并行）→ 启动 Parliament → 加载题目 → Harness 调度 → 清理。自动 tmux 托管，断开终端不影响运行。
-
-产出在 `data/<name>_<timestamp>/`：
-- `parliament.db` — 全部 RL 数据
-- `experiment.json` — 实验摘要
-- `llm_logs/` — 完整 LLM API 调用记录
-- `discards/` — 丢弃的 no-tool 响应（调试用）
-- `run.log` — 运行日志
-
-## 架构
+Each iteration does
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    run.py (调度层)                     │
-│  vLLM 并行启动 → Parliament 启动 → 加载题目 → Harness   │
-└─────────────────────┬───────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────┐
-│              Harness (event-driven v2)                │
-│                                                       │
-│  全局 session 队列 → 动态分配到 GPU                      │
-│  每个 session: 多轮 event 驱动                           │
-│    Actor: python_exec / vote → submit/wait 结束轮次     │
-│    Judge: python_exec → vote 结束轮次                    │
-│    Runner 只在有 post/comment 时分发（vote 不触发分发）    │
-│  Session 结束: actors 连续 idle > 1 → 等 judges 完成     │
-└──┬──────────┬──────────┬────────────────────────────┘
-   │          │          │
-   ▼          ▼          ▼
- vLLM      vLLM       vLLM        ← 每 GPU 一个 API
- GPU 0     GPU 1  ... GPU 7
-
- 所有 agent 通过 HTTP 调用 Parliament API (localhost:8080)
+vLLM + Parliament + harness  →  parliament.db
+         rl/extract            →  train.jsonl
+         rl/train              →  sharded checkpoint
+         rl/export             →  merged HF folder (next iteration's policy)
 ```
 
-## Agent Tools
+For a single-shot data collection without training, use
+`scripts/run.py` directly; see the "Scripts" table below.
 
-**Actor** (Scientist): `python_exec`, `vote`, `submit`, `wait`
-**Judge**: `python_exec`, `vote`
+## Project structure
 
-每轮：
-1. Harness 把新帖子/评论/投票推送给 agent
-2. Agent 可调多次 python_exec（计算）和 vote（投票），不结束轮次
-3. Actor 调 submit（发帖/评论）或 wait 结束轮次，唤醒 runner
-4. Judge 调 vote 结束轮次，不唤醒 runner
-5. Runner 在有新帖/评论时分发给所有 agent
-
-Judge 的投票以匿名形式（"Anonymous Scientist"）推送给 actor，受 `judge_votes_visible` 开关控制。
-
-## 参数说明
-
-| 参数 | 说明 | 默认 |
-|------|------|------|
-| `--gpus` | GPU 编号 | 必填 |
-| `--sessions-per-gpu` | 每张卡并行 session 数 | `2` |
-| `--actors` | 每 session 的科学家数 | `3` |
-| `--judges` | 每 session 的评委数 | `3` |
-| `--dataset` | 题目文件（JSON） | 必填 |
-| `--name` | 本次运行名称 | 必填 |
-| `--max-turns` | Actor 最大轮数（Judge 不限） | `30` |
-
-## 项目结构
+The project splits into **Parliament** (data generation) and **RL**
+(data consumption):
 
 ```
 parliament_rl/
+├── parliament/              # FastAPI server + SQLite store
+├── harness/                 # async agent runtime (LLM client of the server)
+├── rl/                      # extract, train, export
 ├── scripts/
-│   ├── run.py                # 一键启动（入口）
-│   └── harness/              # Agent 调度与执行
-│       ├── runner.py          # 全局调度（event-driven + idle 检测）
-│       ├── agent.py           # 单 agent 循环 + fallback parser
-│       └── tools.py           # Tool 定义 + 执行器（子进程 python_exec）
-├── parliament/                # 论坛 API 服务
-│   ├── server.py              # FastAPI API
-│   ├── store.py               # SQLite 存储层
-│   ├── auth.py / config.py / seed.py
-│   └── static/index.html      # Web UI
-├── rl/                        # RL 训练 pipeline
-│   └── extract.py             # parliament.db → 训练数据 JSONL
-├── context_configs/           # prompt + 参数，按版本管理
-└── datasets/                   # 题目数据
+│   ├── run.py               # single run (vLLM + Parliament + harness)
+│   ├── iterate.py           # multi-shard iterative training loop
+│   └── sample_dataset.py    # split a full dataset into train/test
+├── context_configs/
+│   ├── Parliament_context/  # agent-facing prompts + persona + name pool
+│   └── RL_context/          # RL-context rendering knobs
+├── datasets/                # Sciencepedia problems (test + 4×train_part)
+├── docs/                    # design docs (01_overview, 02_parliament, 03_rl)
+└── data/                    # run outputs (gitignored)
 ```
 
-## 数据产出
+**Parliament** = `parliament/` + `harness/` + `Parliament_context/`
+**RL**         = `rl/` + `RL_context/`
 
-### parliament.db 表结构
+## Scripts
 
-| 表 | 用途 |
+| script | purpose | typical wall time |
+|---|---|---|
+| `scripts/run.py` | one-shot data collection (cleanup → vLLM → Parliament → harness) | ~9 h for 1 026 questions on 8 GPU |
+| `scripts/iterate.py` | sample → train → export → repeat across shards | ~13.5 h per iteration |
+| `scripts/sample_dataset.py` | split a full dataset by depth-5 category | seconds |
+| `python -m rl.extract` | `parliament.db` → `train.jsonl` | ~45 s for ~10 k samples |
+| `python -m rl.train` (via `accelerate launch`) | FSDP2 offline RL | ~4 h per epoch for ~10 k samples on 8 GPU |
+| `python -m rl.export` (via `accelerate launch`) | sharded → merged HF directory | ~5 min |
+
+All scripts are resumable where that makes sense (iterate via
+`state.json`; train via `--resume ckpt/step_K`).
+
+## Ablation surface
+
+Most experimental knobs are already exposed in `context_configs/` or
+as CLI flags:
+
+- **Agent cardinality**: `--actors N --judges M`.
+- **Judge visibility**: `judge_votes_visible` in
+  `Parliament_context/config.json` (whether scientists see judge
+  votes at all).
+- **Remove the judge entirely**: `--judges 0` exercises Direction 2
+  (pure peer-review voting, no reference-solution anchor).
+- **Persona / name pools**: edit `Parliament_context/config.json` —
+  session-level deterministic resampling guarantees no within-session
+  collisions.
+- **Identity anonymization**: `anonymize_identity: true/false` in
+  `RL_context/config.json` — if false, training headers show the raw
+  `Scientist_N` instead of names (useful for debugging).
+- **Score visibility in training context**: `score_visibility:
+  "auto"|"always"|"never"` in `RL_context/config.json`.
+- **Advantage shape**: `advantage_baseline` ∈ {0, `mean_session`,
+  `mean_global`, any number}, `advantage_scale` ∈ {`session_std`,
+  `global_std`, `none`, any number} in `RL_context/config.json`.
+- **Loss variant**: `rl/train.py --use-ratio / --no-use-ratio`
+  switches between GRPO-with-ratio and RWR. `--beta-kl 0` drops the
+  KL term. `--advantage-clip 5.0` clamps advantages.
+- **Per-iteration overrides**: `scripts/iterate.py --train-extra "--num-epochs
+  1 --beta-kl 0.01"` forwards flags to every iteration's trainer.
+
+## Dataset
+
+`datasets/sciencepedia_test.json` — 100 graduate-level maths/physics
+problems with reference solutions (smoke-test size).
+
+`datasets/sciencepedia_train_part{1..4}.json` — 4 × 1 026 = 4 104
+problems, sampled uniformly over depth-5 Sciencepedia categories by
+`scripts/sample_dataset.py`. Natural sharding for iterative RL — one
+shard per iteration.
+
+## Versions
+
+| component | version |
 |---|---|
-| `interaction_log` | 每个 API 请求的完整记录（RL 轨迹核心） |
-| `votes` | 投票 reward 信号（Actor ±1, Judge ±1~±3） |
-| `posts` | 帖子内容 |
-| `comments` | 评论内容（一阶，不可嵌套） |
-| `session_participants` | 参与者加入/离开记录 |
-
-### RL 数据构建
-
-从 interaction_log 重构每个 agent 在 create_post 时刻的 context：
-- 时间戳确定 agent 当时能看到哪些帖子
-- posts 表提供全文
-- votes 表提供 reward 信号（Actor ±1, Judge ±1~±3）
-- 构建 (context, action, reward) 三元组
-
-## 版本依赖
-
-| 组件 | 版本 |
-|------|------|
 | vLLM | 0.17.1 |
-| 模型 | Qwen3.5-9B |
+| base model | Qwen3.5-9B |
 | Python | 3.11+ |
-| FastAPI | ≥0.100 |
-| aiohttp | ≥3.9 |
+| PyTorch | 2.10 (CUDA 12.8) |
+| transformers | ≥ 5.5 |
+| accelerate | ≥ 1.13 |
+| FastAPI | ≥ 0.100 |
+| aiohttp | ≥ 3.9 |
+
+## Data output shape
+
+After a session run, `data/<name>_<timestamp>/` contains:
+
+```
+parliament.db        # all posts, comments, votes, and per-request interaction log
+experiment.json      # run summary (per-agent stats, exit reasons, tokens, durations)
+llm_logs/            # every LLM API call, grouped by session
+  <sid>/<agent>.jsonl
+discards/            # no-tool streaks (debug)
+run.log              # stdout of run.py / iterate.py
+parliament.log       # FastAPI uvicorn log
+train.jsonl          # RL training samples (after rl.extract)
+ckpt/                # sharded FSDP checkpoints (after rl.train)
+  step_K/
+merged/              # single-file HF folder (after rl.export; vLLM-loadable)
+```
+
+`iterate.py` additionally writes `state.json` (resume pointer) and
+`iterate.log` at the run root.
