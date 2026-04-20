@@ -19,6 +19,6 @@
 
   "anonymize_identity": true,
 
-  "advantage_baseline": 0.0,
+  "advantage_baseline": "mean_session",
   "advantage_scale": "session_std"
 }

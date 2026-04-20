@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""GPQA Diamond zero-shot CoT evaluation.
+"""GPQA Diamond zero-shot CoT evaluation (Qwen3.5 thinking mode).
 
 Loads `idavidrein/gpqa:gpqa_diamond` (198 questions) via HuggingFace,
-runs each through a local vLLM instance with a zero-shot chain-of-thought
-prompt, parses the final `"The answer is (X)"` letter, and reports overall
+runs each through a local vLLM instance with `enable_thinking=True` in
+the chat template so the model's full reasoning block is generated,
+parses the final `"The answer is (X)"` letter, and reports overall
 plus per-domain accuracy.
 
 Shuffling the four choices per question (seeded, reproducible) removes the
@@ -18,23 +19,35 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
-import os
 import random
 import re
-import sys
 from collections import Counter
 from pathlib import Path
 
-# The project root contains a `datasets/` data directory which Python
-# treats as a namespace package and shadows the HuggingFace `datasets`
-# library.  Strip the project root from sys.path *before* the import.
-_PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path = [p for p in sys.path if os.path.abspath(p) != _PROJ_ROOT]
-from datasets import load_dataset  # noqa: E402  HuggingFace datasets
-sys.path.insert(0, _PROJ_ROOT)
+from vllm import LLM, SamplingParams
 
-from vllm import LLM, SamplingParams  # noqa: E402
+
+def load_gpqa(path_or_subset: str) -> list[dict]:
+    """Load GPQA rows from a local CSV or the HuggingFace gated dataset.
+
+    Local CSV is preferred: the HF `idavidrein/gpqa` dataset is gated and
+    requires network + access approval, while the CSV is a 200 KB file
+    we can ship with any checkpoint.
+    """
+    p = Path(path_or_subset)
+    if p.is_file() and p.suffix == ".csv":
+        with p.open() as f:
+            return list(csv.DictReader(f))
+    # HF dataset fallback (agent with approved token + internet only).
+    import sys
+    import os
+    _proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path = [x for x in sys.path if os.path.abspath(x) != _proj]
+    from datasets import load_dataset                # noqa: E402
+    sys.path.insert(0, _proj)
+    return list(load_dataset("idavidrein/gpqa", path_or_subset, split="train"))
 
 PROMPT_TEMPLATE = (
     "The following is a multiple choice question about {domain}. "
@@ -75,14 +88,22 @@ def main() -> None:
     p = argparse.ArgumentParser(description="GPQA Diamond zero-shot CoT eval")
     p.add_argument("--model", required=True, help="Local path or HF hub id")
     p.add_argument("--output", required=True, help="JSON result path")
-    p.add_argument("--subset", default="gpqa_diamond",
-                   choices=["gpqa_diamond", "gpqa_main", "gpqa_extended"])
+    p.add_argument("--data", default="gpqa_diamond",
+                   help="Local CSV path (preferred) or HF subset name "
+                        "(gpqa_diamond | gpqa_main | gpqa_extended).")
     p.add_argument("--seed", type=int, default=0,
                    help="Shuffle seed — identical across model versions "
                         "so each model sees the same letter→answer map")
-    p.add_argument("--max-tokens", type=int, default=2048)
-    p.add_argument("--temperature", type=float, default=0.0,
-                   help="0 = greedy. Set > 0 with --n > 1 for majority vote.")
+    p.add_argument("--max-tokens", type=int, default=8192,
+                   help="Qwen3.5 thinking mode emits long reasoning blocks; "
+                        "8k is the safe default, raise to 16k for hard math.")
+    p.add_argument("--temperature", type=float, default=0.6,
+                   help="Qwen team recommends 0.6 for thinking mode "
+                        "(0.0 hurts reasoning diversity).")
+    p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Qwen3.5 reasoning mode. --no-enable-thinking disables it.")
     p.add_argument("--n", type=int, default=1,
                    help="Samples per question. >1 + temperature>0 → majority vote.")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
@@ -91,8 +112,8 @@ def main() -> None:
     args = p.parse_args()
 
     # ── Dataset ────────────────────────────────────────────
-    ds = load_dataset("idavidrein/gpqa", args.subset, split="train")
-    print(f"Loaded {len(ds)} questions from {args.subset}")
+    ds = load_gpqa(args.data)
+    print(f"Loaded {len(ds)} questions from {args.data}")
 
     rng = random.Random(args.seed)
     prompts, answers, domains = [], [], []
@@ -117,12 +138,14 @@ def main() -> None:
         tokenizer.apply_chat_template(
             [{"role": "user", "content": p}],
             tokenize=False, add_generation_prompt=True,
+            enable_thinking=args.enable_thinking,
         )
         for p in prompts
     ]
 
     sampling = SamplingParams(
         temperature=args.temperature,
+        top_p=args.top_p,
         max_tokens=args.max_tokens,
         n=args.n,
     )
@@ -157,7 +180,7 @@ def main() -> None:
     acc = correct / len(outputs)
     result = {
         "model": args.model,
-        "subset": args.subset,
+        "data": args.data,
         "n_questions": len(outputs),
         "accuracy": acc,
         "per_domain_accuracy": {d: per_domain[d] / per_domain_total[d]
@@ -165,6 +188,9 @@ def main() -> None:
         "per_domain_total": dict(per_domain_total),
         "seed": args.seed,
         "temperature": args.temperature,
+        "top_p": args.top_p,
+        "enable_thinking": args.enable_thinking,
+        "max_tokens": args.max_tokens,
         "n_samples": args.n,
         "records": records,
     }
@@ -172,7 +198,7 @@ def main() -> None:
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(result, indent=2, ensure_ascii=False))
 
-    print(f"\n=== GPQA {args.subset} ===")
+    print(f"\n=== GPQA {args.data} ===")
     print(f"  Model:    {args.model}")
     print(f"  Accuracy: {acc:.4f} ({correct}/{len(outputs)})")
     for d in sorted(per_domain_total):

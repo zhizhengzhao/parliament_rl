@@ -369,6 +369,60 @@ def _session_std(values: list[float]) -> float:
     return var ** 0.5
 
 
+def _estimate_position_slope(rewards_per_session: dict[str, dict[int, float]],
+                             positions: dict[int, float]) -> float:
+    """Estimate the linear reward-vs-position slope from all data.
+
+    Later posts tend to score higher (they build on prior discussion).
+    This slope lets us detrend before advantage normalization so the
+    model doesn't learn "post late = good".
+
+    Returns the slope: E[reward](t=1) - E[reward](t=0), estimated via
+    the gap between the first-half and second-half means (midpoints at
+    t≈0.25 and t≈0.75, spanning 0.5 of the range).
+    """
+    early_r, late_r = [], []
+    for rewards in rewards_per_session.values():
+        pids = sorted(rewards.keys())
+        if len(pids) < 4:
+            continue
+        mid = len(pids) // 2
+        for pid in pids[:mid]:
+            early_r.append(rewards[pid])
+        for pid in pids[mid:]:
+            late_r.append(rewards[pid])
+    if not early_r or not late_r:
+        return 0.0
+    gap = _session_mean(late_r) - _session_mean(early_r)
+    # gap spans t=0.25→0.75 (0.5 units), so full-range slope = gap / 0.5
+    return gap / 0.5
+
+
+def debias_position(rewards_per_session: dict[str, dict[int, float]],
+                    positions: dict[int, float]) -> dict[str, dict[int, float]]:
+    """Remove linear position trend from rewards.
+
+    r_debiased = r - slope * (t - 0.5)
+
+    where t is the post's normalized position in its session [0, 1] and
+    slope is estimated globally from all sessions.  At t=0.5 (session
+    midpoint) the correction is zero; early posts are boosted, late posts
+    are reduced.
+    """
+    slope = _estimate_position_slope(rewards_per_session, positions)
+    if abs(slope) < 0.01:
+        return rewards_per_session
+    debiased: dict[str, dict[int, float]] = {}
+    for sid, rewards in rewards_per_session.items():
+        debiased[sid] = {}
+        for pid, r in rewards.items():
+            t = positions.get(pid, 0.5)
+            debiased[sid][pid] = r - slope * (t - 0.5)
+    print(f"  Position debias: slope={slope:.3f} "
+          f"(early boost ≈ +{slope * 0.5:.2f}, late penalty ≈ -{slope * 0.5:.2f})")
+    return debiased
+
+
 def compute_advantages(rewards_per_session: dict[str, dict[int, float]]
                        ) -> dict[int, float]:
     """Advantage = (reward − baseline) / scale, controlled by config.
@@ -376,7 +430,7 @@ def compute_advantages(rewards_per_session: dict[str, dict[int, float]]
     Knobs in `RL_context/config.json`:
 
       advantage_baseline:
-        0.0                → no centering (default)
+        0.0                → no centering
         "mean_session"     → classic GRPO centering (per-session mean)
         "mean_global"      → REINFORCE++-style (dataset mean)
         <any number>       → fixed constant
@@ -389,7 +443,7 @@ def compute_advantages(rewards_per_session: dict[str, dict[int, float]]
 
     A near-zero session std (homogeneous session — every post got the
     same reward) is floored at 1.0 so a degenerate session can't blow up
-    the gradient. With baseline=0 and rewards in ±10 this keeps |A| ≤ 10.
+    the gradient.
     """
     c = cfg()
     baseline_opt = c.get("advantage_baseline", 0.0)
@@ -458,19 +512,27 @@ def main() -> None:
     session_ids = load_session_ids(conn)
     print(f"Sessions: {len(session_ids)}")
 
-    # Pass 1: load all sessions, compute per-session rewards.
+    # Pass 1: load all sessions, compute per-session rewards + positions.
     cache: dict[str, tuple[dict, list, list, list, dict[int, float]]] = {}
     rewards_per_session: dict[str, dict[int, float]] = {}
+    post_positions: dict[int, float] = {}
     for sid in session_ids:
         session, posts, comments, votes = load_session_data(conn, sid)
         actor_posts = [p for p in posts if p["author_role"] == "actor"]
         rewards = compute_post_rewards(actor_posts, votes)
         cache[sid] = (session, posts, comments, votes, rewards)
         rewards_per_session[sid] = rewards
+        # Normalized position: 0 = first actor post, 1 = last
+        pids = sorted(rewards.keys())
+        for k, pid in enumerate(pids):
+            post_positions[pid] = k / max(len(pids) - 1, 1)
     conn.close()
 
-    # Global advantage normalization across all sessions.
-    advantages = compute_advantages(rewards_per_session)
+    # Position debiasing: remove linear trend (later posts score higher).
+    debiased = debias_position(rewards_per_session, post_positions)
+
+    # Advantage normalization on debiased rewards.
+    advantages = compute_advantages(debiased)
 
     # Pass 2: render samples.
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)

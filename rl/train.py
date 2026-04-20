@@ -55,7 +55,7 @@ import torch.nn.functional as F
 from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.utils import set_seed
 from peft import LoraConfig, get_peft_model
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import BatchSampler, DataLoader, Dataset, Sampler
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -164,7 +164,8 @@ class RLDataset(Dataset):
 
         raw = [json.loads(l) for l in open(jsonl_path)]
         self.samples: list[dict] = []
-        skipped_long = skipped_lowsig = skipped_nomask = 0
+        skipped_lowsig = skipped_nomask = 0
+        max_len_seen = 0
         for s in raw:
             adv = float(s["advantage"])
             if abs(adv) < advantage_min_abs:
@@ -173,12 +174,9 @@ class RLDataset(Dataset):
             text = tokenizer.apply_chat_template(
                 s["messages"], tokenize=False, add_generation_prompt=False)
             ids_list = tokenizer(text, add_special_tokens=False).input_ids
-            if len(ids_list) > max_seq_len:
-                skipped_long += 1
-                continue
             ids = torch.tensor(ids_list, dtype=torch.long)
             mask = make_response_mask(ids)
-            if mask.sum() == 0:           # malformed chat template — skip
+            if mask.sum() == 0:
                 skipped_nomask += 1
                 continue
             if advantage_clip > 0:
@@ -189,10 +187,11 @@ class RLDataset(Dataset):
                 "advantage": adv,
                 "session_id": s["session_id"],
             })
+            max_len_seen = max(max_len_seen, len(ids_list))
         print(f"  Dataset: {len(self.samples)} samples ready "
-              f"(dropped: {skipped_long} oversized, "
-              f"{skipped_lowsig} low-|A|<{advantage_min_abs}, "
-              f"{skipped_nomask} mask-empty)")
+              f"(dropped: {skipped_lowsig} low-|A|<{advantage_min_abs}, "
+              f"{skipped_nomask} mask-empty, "
+              f"max_tokens={max_len_seen})")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -225,6 +224,35 @@ def collate(batch: list[dict], pad_id: int) -> dict:
         "attention_mask": torch.stack(out_attn),
         "advantage": torch.stack(out_adv),
     }
+
+
+class LengthGroupedSampler(Sampler):
+    """Sort by token length, batch nearby lengths together, shuffle batches.
+
+    Within each batch, sequences have similar length → minimal padding.
+    Batch order is shuffled each epoch to avoid ordering bias.
+    """
+
+    def __init__(self, dataset: RLDataset, batch_size: int, seed: int = 42):
+        self.lengths = [len(s["input_ids"]) for s in dataset.samples]
+        self.sorted_indices = sorted(range(len(self.lengths)),
+                                     key=lambda i: self.lengths[i])
+        self.batch_size = batch_size
+        self.seed = seed
+        self.epoch = 0
+
+    def __iter__(self):
+        batches = [self.sorted_indices[i:i + self.batch_size]
+                   for i in range(0, len(self.sorted_indices), self.batch_size)]
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        order = torch.randperm(len(batches), generator=g).tolist()
+        for idx in order:
+            yield from batches[idx]
+        self.epoch += 1
+
+    def __len__(self):
+        return len(self.sorted_indices)
 
 
 # ── Loss ──────────────────────────────────────────────────
@@ -497,8 +525,11 @@ def main() -> None:
     pad_id = tokenizer.pad_token_id or DEFAULT_PAD_ID
     dataset = RLDataset(cfg.data, tokenizer, cfg.max_seq_len,
                         cfg.advantage_clip, cfg.advantage_min_abs)
+    sampler = LengthGroupedSampler(dataset, cfg.per_device_batch_size,
+                                    seed=cfg.seed)
     loader = DataLoader(
-        dataset, batch_size=cfg.per_device_batch_size, shuffle=True,
+        dataset, batch_size=cfg.per_device_batch_size, shuffle=False,
+        sampler=sampler,
         collate_fn=lambda b: collate(b, pad_id),
         num_workers=2, pin_memory=True,
     )
