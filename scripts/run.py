@@ -33,31 +33,20 @@ import urllib.request
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
-VLLM_PYTHON = "/root/miniconda3/envs/parliament/bin/python"
-MODEL_PATH = "/root/zhizheng/models/Qwen3.5-9B"
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
+
+from _common import Tee, env_prefix  # noqa: E402
+
+VLLM_PYTHON = os.environ.get("PRL_PYTHON", sys.executable)
+MODEL_PATH = os.environ.get("PRL_MODEL_PATH", "Qwen/Qwen3.5-9B")
 ADMIN_KEY = "sp_admin_parliament"
 TMUX_PREFIX = "vllm-gpu"
 EXPERIMENT_TMUX = "parliament-run"
 GPU_IDLE_MEMORY_THRESHOLD_MIB = 2048
-
-
-# ── Tee stdout/stderr to a file ──────────────────────────
-
-class Tee:
-    def __init__(self, *streams):
-        self.streams = streams
-
-    def write(self, data: str) -> int:
-        for s in self.streams:
-            s.write(data)
-            s.flush()
-        return len(data)
-
-    def flush(self) -> None:
-        for s in self.streams:
-            s.flush()
 
 
 # ── HTTP helpers ─────────────────────────────────────────
@@ -78,7 +67,10 @@ def http(method: str, url: str, key: str = "", body: dict | None = None):
     return None
 
 
-def wait_ready(url: str, timeout: int = 300) -> bool:
+def wait_ready(url: str, timeout: int = 600) -> bool:
+    """Poll URL until it returns 200 (or timeout). 600 s covers vLLM's
+    first-boot `torch.compile` on Qwen3.5 hybrid attention — second boot
+    hits the compile cache and returns in < 60 s."""
     t0 = time.time()
     while time.time() - t0 < timeout:
         try:
@@ -115,7 +107,10 @@ def stop_vllm() -> None:
             killed += 1
     if killed:
         print(f"  Killed {killed} vLLM tmux session(s)")
-        time.sleep(2)
+    # Belt-and-braces: kill any orphaned vllm processes by name
+    subprocess.run(["pkill", "-9", "-f", "vllm.entrypoints"],
+                   capture_output=True)
+    time.sleep(3)
 
 
 def cleanup_all(gpus: list[int], port: int) -> None:
@@ -124,8 +119,7 @@ def cleanup_all(gpus: list[int], port: int) -> None:
     kill_port(port)
     time.sleep(1)
 
-    busy: list[int] = []
-    for _ in range(10):
+    for attempt in range(20):
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,memory.used",
              "--format=csv,noheader,nounits"],
@@ -139,9 +133,17 @@ def cleanup_all(gpus: list[int], port: int) -> None:
                 busy.append(idx)
         if not busy:
             break
+        if attempt == 5:
+            print(f"  Force-killing GPU processes on {busy}")
+            for gpu in busy:
+                subprocess.run(
+                    f"nvidia-smi --query-compute-apps=pid --format=csv,noheader "
+                    f"-i {gpu} | xargs -r kill -9",
+                    shell=True, capture_output=True)
         time.sleep(3)
     if busy:
-        print(f"  WARNING: GPUs {busy} still have memory in use")
+        print(f"  FATAL: GPUs {busy} still occupied after 60s cleanup")
+        sys.exit(1)
     print("  Cleanup done\n")
 
 
@@ -163,7 +165,7 @@ def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH) -> list[int]:
             f"CUDA_VISIBLE_DEVICES={gpu} {VLLM_PYTHON} "
             f"-m vllm.entrypoints.openai.api_server "
             f"--model {model_path} --port {port} "
-            f"--max-model-len 262144 --gpu-memory-utilization 0.92 "
+            f"--max-model-len 32768 --gpu-memory-utilization 0.90 "
             f"--enable-auto-tool-choice --tool-call-parser qwen3_coder "
             f"--dtype auto 2>&1 | tee /tmp/vllm_gpu{gpu}.log"
         )
@@ -253,7 +255,7 @@ def relaunch_in_tmux(argv: list[str], name: str) -> None:
     time.sleep(1)
     subprocess.run(["tmux", "kill-session", "-t", EXPERIMENT_TMUX],
                    capture_output=True)
-    cmd = f"{shlex.quote(sys.executable)} {shlex.join(argv + ['--in-tmux'])}"
+    cmd = f"{env_prefix()}{shlex.quote(sys.executable)} {shlex.join(argv + ['--in-tmux'])}"
     r = subprocess.run(
         ["tmux", "new-session", "-d", "-s", EXPERIMENT_TMUX, cmd],
         capture_output=True, text=True)

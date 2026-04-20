@@ -5,6 +5,16 @@ aiohttp>=3.9
 
 # RL training (rl/train.py + rl/export.py)
 torch>=2.5
-transformers>=5.5            # Qwen3.5 support
-accelerate>=1.13             # FSDP2
+transformers>=4.51
+accelerate>=1.3
+peft>=0.14
 safetensors>=0.4
+
+# Inference (vLLM serving for data generation)
+vllm>=0.17
+
+# Optional: fused kernels for Qwen3.5 hybrid attention (2-3x vLLM speedup)
+# Pure Triton — no compilation needed, pip install and vLLM auto-detects.
+flash-linear-attention>=0.4
+causal-conv1d>=1.5
+flash-attn>=2.7

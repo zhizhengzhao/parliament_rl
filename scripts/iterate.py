@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
-"""One-click iterative RL training.
+"""One-click iterative RL training (ReST-style, 4-iteration default).
 
 For each dataset shard, in order:
 
-    1. Launch vLLM from the current policy
-    2. Run Parliament + harness (scripts/run.py) → parliament.db
-    3. Extract training data (rl/extract.py)     → train.jsonl
-    4. Train with FSDP (rl/train.py)              → ckpt/step_K
-    5. Export merged HF folder (rl/export.py)     → merged/
-    6. Set the merged folder as the next iteration's policy
+    1. scripts/run.py    →  vLLM + Parliament + harness  →  parliament.db
+    2. rl.extract        →  train.jsonl
+    3. (metrics summary) →  reward/advantage stats vs baseline
+    4. rl.train          →  ckpt/step_K  (DDP + LoRA + RWR + KL anchor)
+    5. rl.export         →  merged/      (LoRA → base + ΔW, vLLM-loadable)
+    6. eval.gpqa         →  gpqa_diamond.json  (single-GPU, ~10 min)
+    7. merged/ becomes the next iteration's actor policy
 
-State is persisted at `data/<name>_<ts>/state.json` so a crashed or
-killed run can be resumed by re-invoking the same command — completed
-iterations are skipped automatically.
+The base model is the *fixed* KL anchor across all iterations (LoRA's
+`disable_adapter()` recovers it for free) — this prevents drift from
+compounding. Each iteration starts a fresh LoRA on the merged base.
 
-Why shard at all? A single collection of N rollouts is fresh only
-against the π that produced it; after training drifts π the remaining
-rollouts are stale. Sharding keeps every collection freshly on-policy
-for its iteration. The built-in 4×1026 train_part split is the natural
-choice: 4 iterations × ≈13.5 h = ≈54 h end-to-end on 8 × A100-80GB.
+State is persisted at `data/<name>_<ts>/state.json`; re-invoking the
+same command resumes from the next incomplete iteration.
 
-Usage (typical):
+Time budget per iteration (8 × A100-80GB):
+    parliament  ≈ 9 h     (pred. scales 1/N with N parallel vLLM instances)
+    train       ≈ 4 h     (~10k samples, 2 epoch, LoRA)
+    export+eval ≈ 0.3 h
+    startup     ≈ 0.5 h
+    ──────────────────
+    total       ≈ 14 h    →  4 iter ≈ 56 h end-to-end
+
+On 24 × A100 (parliament parallelism 3×) it drops to ≈ 8 h/iter,
+≈ 32 h end-to-end.
+
+Usage:
     python scripts/iterate.py \\
         --name nrun_v1 \\
         --shards datasets/sciencepedia_train_part1.json,\\
@@ -29,10 +38,10 @@ Usage (typical):
                  datasets/sciencepedia_train_part4.json \\
         --gpus 0,1,2,3,4,5,6,7
 
-Resume (same command, same --name, it picks up from state.json):
+Resume (same command, same --name, picks up from state.json):
     python scripts/iterate.py --name nrun_v1 --shards ... --gpus ...
 
-Stop the background tmux job at any time:
+Stop the background tmux job:
     tmux kill-session -t parliament-iterate
 """
 
@@ -40,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -49,25 +59,14 @@ from datetime import datetime
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-BASE_MODEL = "/root/zhizheng/models/Qwen3.5-9B"
-ACCELERATE = "/root/miniconda3/envs/parliament/bin/accelerate"
-PYTHON_ENV = "/root/miniconda3/envs/parliament/bin/python"
+
+sys.path.insert(0, str(PROJECT_DIR / "scripts"))
+from _common import Tee, env_prefix  # noqa: E402
+
+BASE_MODEL = os.environ.get("PRL_MODEL_PATH", "Qwen/Qwen3.5-9B")
+ACCELERATE = os.environ.get("PRL_ACCELERATE", shutil.which("accelerate") or "accelerate")
+PYTHON_ENV = os.environ.get("PRL_PYTHON", sys.executable)
 ITERATE_TMUX = "parliament-iterate"
-
-
-class Tee:
-    def __init__(self, *streams):
-        self.streams = streams
-
-    def write(self, data: str) -> int:
-        for s in self.streams:
-            s.write(data)
-            s.flush()
-        return len(data)
-
-    def flush(self) -> None:
-        for s in self.streams:
-            s.flush()
 
 
 # ── Sub-step runners ─────────────────────────────────────
@@ -129,7 +128,7 @@ def train_step(train_jsonl: Path, model: str, run_dir: Path,
     ckpt_dir = run_dir / "ckpt"
     cmd = [
         ACCELERATE, "launch",
-        "--config_file", "rl/accelerate_fsdp.yaml",
+        "--config_file", "rl/accelerate_ddp.yaml",
         "--num_processes", str(num_gpus),
         "-m", "rl.train",
         "--data", str(train_jsonl),
@@ -144,16 +143,21 @@ def train_step(train_jsonl: Path, model: str, run_dir: Path,
 
 
 def export_step(ckpt_dir: Path, run_dir: Path, num_gpus: int) -> Path:
+    """LoRA merge is single-process; full-FT (legacy) needs accelerate."""
     merged_dir = run_dir / "merged"
     last = find_last_checkpoint(ckpt_dir)
-    run([
-        ACCELERATE, "launch",
-        "--config_file", "rl/accelerate_fsdp.yaml",
-        "--num_processes", str(num_gpus),
-        "-m", "rl.export",
-        "--ckpt", str(last),
-        "--output", str(merged_dir),
-    ])
+    if (last / "adapter").exists():
+        run([PYTHON_ENV, "-m", "rl.export",
+             "--ckpt", str(last), "--output", str(merged_dir)])
+    else:
+        run([
+            ACCELERATE, "launch",
+            "--config_file", "rl/accelerate_ddp.yaml",
+            "--num_processes", str(num_gpus),
+            "-m", "rl.export",
+            "--ckpt", str(last),
+            "--output", str(merged_dir),
+        ])
     return merged_dir
 
 
@@ -168,35 +172,123 @@ def prune_sharded_ckpt(ckpt_dir: Path) -> None:
     print(f"  Pruned sharded checkpoints in {ckpt_dir}", flush=True)
 
 
+def metrics_step(train_jsonl: Path, run_dir: Path) -> dict:
+    """Summarise reward/advantage distribution; one number per iter to
+    eyeball generation-quality drift across iterations.
+
+    Writes `metrics.json` (machine-readable) and prints a one-line table
+    so you can `grep "DATA METRICS" iterate.log` to track quality over
+    time.
+    """
+    rewards: list[float] = []
+    advs: list[float] = []
+    for line in open(train_jsonl):
+        s = json.loads(line)
+        rewards.append(float(s["reward"]))
+        advs.append(float(s["advantage"]))
+    if not rewards:
+        return {}
+
+    def q(xs: list[float], p: float) -> float:
+        return sorted(xs)[int(p * (len(xs) - 1))]
+
+    summary = {
+        "n_samples": len(rewards),
+        "reward_mean": sum(rewards) / len(rewards),
+        "reward_pos_pct": 100 * sum(1 for r in rewards if r > 0) / len(rewards),
+        "advantage_mean": sum(advs) / len(advs),
+        "advantage_p10": q(advs, 0.10),
+        "advantage_p90": q(advs, 0.90),
+        "advantage_abs_mean": sum(abs(a) for a in advs) / len(advs),
+    }
+    (run_dir / "metrics.json").write_text(json.dumps(summary, indent=2))
+    print(f"  DATA METRICS  n={summary['n_samples']}  "
+          f"r̄={summary['reward_mean']:+.3f}  "
+          f"r>0={summary['reward_pos_pct']:.1f}%  "
+          f"|A|̄={summary['advantage_abs_mean']:.3f}  "
+          f"A∈[{summary['advantage_p10']:+.2f}, {summary['advantage_p90']:+.2f}]")
+    return summary
+
+
+def eval_step(model_path: str, run_dir: Path,
+              eval_gpu: int, max_model_len: int = 16384) -> float | None:
+    """Run GPQA Diamond on a single GPU and return accuracy.
+
+    GPUs from the rollout phase are already free at this point
+    (`scripts/run.py` calls `stop_vllm()` on success). We pin to the
+    first listed GPU so the other 7 stay idle for the next iteration's
+    parliament boot.
+    """
+    out_path = run_dir / "gpqa_diamond.json"
+    cmd = [PYTHON_ENV, "-m", "eval.gpqa",
+           "--model", model_path, "--output", str(out_path),
+           "--max-model-len", str(max_model_len)]
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(eval_gpu)
+    print(f"\n$ CUDA_VISIBLE_DEVICES={eval_gpu} {shlex.join(cmd)}\n", flush=True)
+    r = subprocess.run(cmd, cwd=str(PROJECT_DIR), env=env)
+    if r.returncode != 0:
+        print(f"  WARN: eval failed (rc={r.returncode}); continuing iteration loop")
+        return None
+    try:
+        acc = float(json.loads(out_path.read_text())["accuracy"])
+        print(f"  GPQA Diamond accuracy: {acc:.4f}")
+        return acc
+    except Exception as e:
+        print(f"  WARN: could not parse {out_path}: {e}")
+        return None
+
+
 # ── Iteration loop ───────────────────────────────────────
 
-def run_one_iteration(iter_n: int, total: int, shard: str, model: str,
+def run_one_iteration(iter_n: int, total: int, shard: str,
+                      actor_model: str, train_anchor_model: str,
                       name_prefix: str, cfg: dict,
-                      train_extra: list[str]) -> str:
+                      train_extra: list[str], do_eval: bool) -> tuple[str, dict]:
+    """One full iteration: rollout → extract → train (LoRA) → export → eval.
+
+    `actor_model` is what vLLM serves to Parliament for data collection.
+    `train_anchor_model` is the *fixed* base used both as `--model` and
+    `--ref-model`; this never changes across iterations so the KL anchor
+    stays referenced to the original Qwen3.5-9B checkpoint.
+    """
     t0 = time.time()
     name = f"{name_prefix}_iter{iter_n:02d}"
     num_gpus = len(cfg["gpus"].split(","))
+    eval_gpu = int(cfg["gpus"].split(",")[0])
     print(f"\n{'=' * 72}")
     print(f"Iteration {iter_n}/{total} — shard={shard}")
-    print(f"  Current policy: {model}")
-    print(f"  Run name:       {name}")
+    print(f"  Actor (rollout):     {actor_model}")
+    print(f"  Train anchor (base): {train_anchor_model}")
+    print(f"  Run name:            {name}")
     print(f"{'=' * 72}")
 
-    run_dir = sample_step(shard, model, name, cfg)
+    run_dir = sample_step(shard, actor_model, name, cfg)
     train_jsonl = extract_step(run_dir)
-    ckpt_dir = train_step(train_jsonl, model, run_dir, num_gpus, train_extra)
+    metrics = metrics_step(train_jsonl, run_dir)
+    ckpt_dir = train_step(train_jsonl, train_anchor_model, run_dir,
+                          num_gpus, train_extra)
     merged = export_step(ckpt_dir, run_dir, num_gpus)
     prune_sharded_ckpt(ckpt_dir)
 
+    acc = eval_step(str(merged), run_dir, eval_gpu) if do_eval else None
     dur = (time.time() - t0) / 60
-    print(f"\n  Iteration {iter_n} done in {dur:.0f} min → {merged}\n")
-    return str(merged)
+    print(f"\n  Iteration {iter_n} done in {dur:.0f} min → {merged}")
+    if acc is not None:
+        print(f"  GPQA Diamond: {acc:.4f}\n")
+    return str(merged), {"metrics": metrics, "gpqa_acc": acc, "minutes": dur}
 
 
 def load_state(state_file: Path, initial_model: str) -> dict:
     if state_file.exists():
         return json.loads(state_file.read_text())
-    return {"completed": 0, "current_model": initial_model, "history": []}
+    return {
+        "completed": 0,
+        "current_model": initial_model,         # actor for next iteration
+        "base_model": initial_model,            # fixed KL anchor across all iters
+        "base_gpqa": None,                      # baseline accuracy, filled iter 1 prep
+        "history": [],
+    }
 
 
 def save_state(state_file: Path, state: dict) -> None:
@@ -217,7 +309,7 @@ def relaunch_in_tmux(argv: list[str]) -> None:
         print(f"  Or kill: tmux kill-session -t {ITERATE_TMUX}")
         sys.exit(1)
 
-    cmd = f"{shlex.quote(sys.executable)} {shlex.join(argv + ['--in-tmux'])}"
+    cmd = f"{env_prefix()}{shlex.quote(sys.executable)} {shlex.join(argv + ['--in-tmux'])}"
     r = subprocess.run(
         ["tmux", "new-session", "-d", "-s", ITERATE_TMUX, cmd],
         capture_output=True, text=True)
@@ -248,6 +340,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train-extra", default="",
                    help="Extra flags appended to rl.train, e.g. "
                         "\"--num-epochs 1 --beta-kl 0.01\"")
+    p.add_argument("--no-eval", action="store_true",
+                   help="Skip per-iteration GPQA eval (saves ~10 min/iter)")
     p.add_argument("--in-tmux", action="store_true",
                    help="Internal: skip tmux relaunch")
     return p.parse_args()
@@ -297,31 +391,50 @@ def main() -> None:
     state = load_state(state_file, args.initial_model)
 
     print(f"\n{'=' * 72}")
-    print(f"Iterative RL — {args.name}")
+    print(f"Iterative RL (RWR + KL-to-base) — {args.name}")
     print(f"{'=' * 72}")
-    print(f"  Output:         {out_dir}")
-    print(f"  Shards:         {len(shards)}")
-    print(f"  Starting policy:{state['current_model']}")
-    print(f"  Completed:      {state['completed']}/{len(shards)}")
-    print(f"  GPUs:           {cfg['gpus']}")
-    print(f"  Started:        {datetime.now().isoformat()}")
+    print(f"  Output:           {out_dir}")
+    print(f"  Shards:           {len(shards)}")
+    print(f"  Base / KL anchor: {state['base_model']}")
+    print(f"  Next actor:       {state['current_model']}")
+    print(f"  Completed:        {state['completed']}/{len(shards)}")
+    print(f"  GPUs:             {cfg['gpus']}")
+    print(f"  Per-iter eval:    {'off' if args.no_eval else 'GPQA Diamond'}")
+    print(f"  Started:          {datetime.now().isoformat()}")
     print(f"{'=' * 72}\n")
+
+    # Baseline GPQA on the original base model — only run once, before
+    # the very first iteration. Sets the floor for the iter-vs-acc curve.
+    if state["completed"] == 0 and state["base_gpqa"] is None and not args.no_eval:
+        eval_gpu = int(cfg["gpus"].split(",")[0])
+        baseline_dir = out_dir / "baseline_eval"
+        baseline_dir.mkdir(exist_ok=True)
+        print(f"\n--- Baseline GPQA on {state['base_model']} ---")
+        state["base_gpqa"] = eval_step(state["base_model"], baseline_dir, eval_gpu)
+        save_state(state_file, state)
 
     t_start = time.time()
     for i, shard in enumerate(shards, 1):
         if i <= state["completed"]:
             print(f"Skipping iter {i} (already completed)")
             continue
-        merged = run_one_iteration(
-            i, len(shards), shard, state["current_model"],
-            args.name, cfg, train_extra)
+        merged, summary = run_one_iteration(
+            i, len(shards), shard,
+            actor_model=state["current_model"],
+            train_anchor_model=state["base_model"],
+            name_prefix=args.name, cfg=cfg, train_extra=train_extra,
+            do_eval=not args.no_eval)
         state = {
+            **state,
             "completed": i,
             "current_model": merged,
             "history": state["history"] + [{
                 "iter": i, "shard": shard,
                 "merged": merged,
                 "timestamp": datetime.now().isoformat(),
+                "metrics": summary["metrics"],
+                "gpqa_acc": summary["gpqa_acc"],
+                "minutes": round(summary["minutes"], 1),
             }],
         }
         save_state(state_file, state)
@@ -331,6 +444,12 @@ def main() -> None:
     print(f"All {len(shards)} iterations complete in {total_min:.0f} min.")
     print(f"Final policy: {state['current_model']}")
     print(f"History:      {state_file}")
+    if state.get("base_gpqa") is not None:
+        print(f"\n  Base GPQA: {state['base_gpqa']:.4f}")
+    for h in state["history"]:
+        if h.get("gpqa_acc") is not None:
+            print(f"  Iter {h['iter']}: GPQA = {h['gpqa_acc']:.4f}  "
+                  f"(data |A|̄ = {h['metrics'].get('advantage_abs_mean', 0):.3f})")
     print(f"{'=' * 72}\n")
 
 

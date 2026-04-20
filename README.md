@@ -53,6 +53,7 @@ parliament_rl/
 ├── parliament/              # FastAPI server + SQLite store
 ├── harness/                 # async agent runtime (LLM client of the server)
 ├── rl/                      # extract, train, export
+├── eval/                    # benchmarks (GPQA Diamond, extensible)
 ├── scripts/
 │   ├── run.py               # single run (vLLM + Parliament + harness)
 │   ├── iterate.py           # multi-shard iterative training loop
@@ -78,6 +79,8 @@ parliament_rl/
 | `python -m rl.extract` | `parliament.db` → `train.jsonl` | ~45 s for ~10 k samples |
 | `python -m rl.train` (via `accelerate launch`) | FSDP2 offline RL | ~4 h per epoch for ~10 k samples on 8 GPU |
 | `python -m rl.export` (via `accelerate launch`) | sharded → merged HF directory | ~5 min |
+| `python -m eval.gpqa` | GPQA Diamond / Main zero-shot CoT accuracy | ~10 min/model on 1 × H800 |
+| `eval/gpqa_sweep.sh` | sweep base + every iter's merged policy through GPQA | ~1 h for 5 models |
 
 All scripts are resumable where that makes sense (iterate via
 `state.json`; train via `--resume ckpt/step_K`).
@@ -119,6 +122,22 @@ problems with reference solutions (smoke-test size).
 problems, sampled uniformly over depth-5 Sciencepedia categories by
 `scripts/sample_dataset.py`. Natural sharding for iterative RL — one
 shard per iteration.
+
+## Environment variables
+
+Host-specific paths are read from environment variables so the code
+runs unchanged on any machine.  Defaults work out of the box when
+you run from inside the target Python env.
+
+| variable | default | purpose |
+|---|---|---|
+| `PRL_PYTHON` | `sys.executable` | Python (or wrapper script) for vLLM / accelerate child processes |
+| `PRL_ACCELERATE` | `which accelerate` | accelerate binary for `rl.train` / `rl.export` |
+| `PRL_MODEL_PATH` | `Qwen/Qwen3.5-9B` | local model directory (vLLM needs a full path) |
+
+If your tmux server was started in a different env, point `PRL_PYTHON`
+at a wrapper that activates the right conda env before exec'ing python.
+All scripts forward these vars into tmux child shells automatically.
 
 ## Versions
 
