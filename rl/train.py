@@ -71,7 +71,6 @@ class TrainConfig:
     model: str = DEFAULT_MODEL
     ref_model: str = ""                 # empty → same as model (or unused under LoRA)
 
-    max_seq_len: int = 8192
     per_device_batch_size: int = 1
     grad_accum_steps: int = 16          # effective batch 128 on 8 GPUs
     num_epochs: int = 2                 # 1-2 is plenty for RWR (no IS to keep "fresh")
@@ -150,15 +149,14 @@ def make_response_mask(input_ids: torch.Tensor) -> torch.Tensor:
 class RLDataset(Dataset):
     """Loads a JSONL of (messages, advantage) and yields tokenized samples.
 
-    Drops samples whose tokenized length exceeds `max_seq_len` so we
-    never train on a truncated response (which would corrupt the loss).
+    All samples are kept regardless of length (no truncation, no filtering
+    by token count). Length-grouped batching minimizes padding overhead.
     """
 
-    def __init__(self, jsonl_path: str, tokenizer, max_seq_len: int,
+    def __init__(self, jsonl_path: str, tokenizer,
                  advantage_clip: float = 2.0,
                  advantage_min_abs: float = 0.1):
         self.tokenizer = tokenizer
-        self.max_seq_len = max_seq_len
         self.advantage_clip = advantage_clip
         self.advantage_min_abs = advantage_min_abs
 
@@ -457,7 +455,8 @@ def parse_args() -> TrainConfig:
     p.add_argument("--output", required=True, help="Checkpoint directory")
     p.add_argument("--model", default=d["model"].default)
     p.add_argument("--ref-model", default="")
-    p.add_argument("--max-seq-len", type=int, default=d["max_seq_len"].default)
+    p.add_argument("--max-seq-len", type=int, default=0,
+                   help="Deprecated, ignored. All samples kept regardless of length.")
     p.add_argument("--per-device-batch-size", type=int,
                    default=d["per_device_batch_size"].default)
     p.add_argument("--grad-accum-steps", type=int,
@@ -523,7 +522,7 @@ def main() -> None:
     # Tokenizer + dataset
     tokenizer = AutoTokenizer.from_pretrained(cfg.model, trust_remote_code=True)
     pad_id = tokenizer.pad_token_id or DEFAULT_PAD_ID
-    dataset = RLDataset(cfg.data, tokenizer, cfg.max_seq_len,
+    dataset = RLDataset(cfg.data, tokenizer,
                         cfg.advantage_clip, cfg.advantage_min_abs)
     sampler = LengthGroupedSampler(dataset, cfg.per_device_batch_size,
                                     seed=cfg.seed)

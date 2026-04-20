@@ -166,7 +166,7 @@ def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH) -> list[int]:
             f"-m vllm.entrypoints.openai.api_server "
             f"--model {model_path} --port {port} "
             f"--max-model-len 32768 --gpu-memory-utilization 0.90 "
-            f"--enable-auto-tool-choice --tool-call-parser qwen3_coder "
+            f"--enable-auto-tool-choice --tool-call-parser hermes "
             f"--dtype auto 2>&1 | tee /tmp/vllm_gpu{gpu}.log"
         )
         subprocess.run(["tmux", "new-session", "-d", "-s", session_name, cmd],

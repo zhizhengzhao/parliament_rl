@@ -330,12 +330,18 @@ async def run_agent_round(
             assistant_msg = llm_response["choices"][0]["message"]
         except Exception as e:
             llm_dur = time.time() - llm_start
+            err = str(e)
             result.llm_errors += 1
             print(f"  [{_ts()}] {name} step={step} LLM ERROR {llm_dur:.1f}s "
                   f"ctx={ctx_msgs}msgs: {e}", flush=True)
             logger.llm(round=result.rounds, step=step,
                        duration_s=round(llm_dur, 2), status="error",
-                       context_msgs=ctx_msgs, error=str(e), messages=messages)
+                       context_msgs=ctx_msgs, error=err, messages=messages)
+            if "400" in err and "input_tokens" in err:
+                result.exit_reason = "context_overflow"
+                print(f"  [{_ts()}] {name} context overflow, retiring",
+                      flush=True)
+                return None
             consecutive_errors += 1
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 return None
@@ -515,6 +521,8 @@ async def _run_agent_inner(
             submit_event.set()
 
         if round_result is None:
+            if result.exit_reason == "context_overflow":
+                break
             continue
         round_num += 1
 
