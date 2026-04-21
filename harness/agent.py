@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 import time
 import traceback
@@ -79,6 +80,7 @@ class AgentResult:
 
 async def _call_llm(http: aiohttp.ClientSession, endpoint: str, model: str,
                     messages: list[dict], tools: list[dict]) -> dict:
+    await asyncio.sleep(random.uniform(0, 0.5))
     payload = {
         "model": model, "messages": messages, "tools": tools,
         "tool_choice": "auto", "max_tokens": MAX_TOKENS,

@@ -241,11 +241,33 @@ def eval_step(model_path: str, run_dir: Path,
 
 # ── Iteration loop ───────────────────────────────────────
 
+def _find_existing_run_dir(name_prefix: str) -> Path | None:
+    """Return the most recent data/<name_prefix>_<ts>/ if any."""
+    candidates = sorted((PROJECT_DIR / "data").glob(f"{name_prefix}_*"),
+                        key=lambda p: p.stat().st_mtime)
+    return candidates[-1] if candidates else None
+
+
+def _is_merged_complete(merged_dir: Path) -> bool:
+    """A merged HF folder is usable if it has config + at least one
+    safetensors shard + tokenizer config."""
+    if not merged_dir.is_dir():
+        return False
+    has_cfg = (merged_dir / "config.json").exists()
+    has_weights = any(merged_dir.glob("*.safetensors"))
+    has_tok = (merged_dir / "tokenizer_config.json").exists()
+    return has_cfg and has_weights and has_tok
+
+
 def run_one_iteration(iter_n: int, total: int, shard: str,
                       actor_model: str, train_anchor_model: str,
                       name_prefix: str, cfg: dict,
                       train_extra: list[str], do_eval: bool) -> tuple[str, dict]:
     """One full iteration: rollout → extract → train (LoRA) → export → eval.
+
+    Each step is idempotent: if its output already exists from a prior
+    crashed run we skip the work and reuse it.  This lets us resume from
+    any failure point without re-doing expensive sampling/training.
 
     `actor_model` is what vLLM serves to Parliament for data collection.
     `train_anchor_model` is the *fixed* base used both as `--model` and
@@ -263,12 +285,46 @@ def run_one_iteration(iter_n: int, total: int, shard: str,
     print(f"  Run name:            {name}")
     print(f"{'=' * 72}")
 
-    run_dir = sample_step(shard, actor_model, name, cfg)
-    train_jsonl = extract_step(run_dir)
+    # Step 1 — Sample (resumable: skip if parliament.db + experiment.json exist).
+    existing = _find_existing_run_dir(name)
+    if existing and (existing / "parliament.db").exists() \
+            and (existing / "experiment.json").exists():
+        print(f"  [skip] sample_step — reusing {existing.name}")
+        run_dir = existing
+    else:
+        run_dir = sample_step(shard, actor_model, name, cfg)
+
+    # Step 2 — Extract (resumable: skip if train.jsonl exists and non-empty).
+    train_jsonl = run_dir / "train.jsonl"
+    if train_jsonl.exists() and train_jsonl.stat().st_size > 100:
+        print(f"  [skip] extract_step — {train_jsonl.name} exists "
+              f"({train_jsonl.stat().st_size // 1024} KB)")
+    else:
+        train_jsonl = extract_step(run_dir)
+
     metrics = metrics_step(train_jsonl, run_dir)
+
+    # Step 3 — Train (resumable: pass --resume to last step_* if any).
+    ckpt_dir = run_dir / "ckpt"
+    last_step = max(
+        (int(p.name.split("_")[1]) for p in ckpt_dir.glob("step_*")
+         if p.name.split("_")[1].isdigit()),
+        default=0,
+    )
+    extra = list(train_extra)
+    if last_step > 0:
+        resume_path = ckpt_dir / f"step_{last_step}"
+        print(f"  [resume] train_step — from step_{last_step}")
+        extra += ["--resume", str(resume_path)]
     ckpt_dir = train_step(train_jsonl, train_anchor_model, run_dir,
-                          num_gpus, train_extra)
-    merged = export_step(ckpt_dir, run_dir, num_gpus)
+                          num_gpus, extra)
+
+    # Step 4 — Export (resumable: skip if merged/ already valid).
+    merged = run_dir / "merged"
+    if _is_merged_complete(merged):
+        print(f"  [skip] export_step — merged/ already complete")
+    else:
+        merged = export_step(ckpt_dir, run_dir, num_gpus)
     prune_sharded_ckpt(ckpt_dir)
 
     acc = eval_step(str(merged), run_dir, eval_gpu) if do_eval else None

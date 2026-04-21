@@ -84,8 +84,8 @@ class TrainConfig:
     # raise to 0.05 if KL drifts past 5, lower to 0.005 if PG signal is
     # being suffocated.  Monitor `kl` column in metrics.jsonl.
     beta_kl: float = 0.02
-    advantage_clip: float = 2.0         # clamp |A| to 2 (covers ~95% of N(0,1) tail)
-    advantage_min_abs: float = 0.1      # drop |A|<0.1 samples (no signal, dilute grad)
+    advantage_clip: float = 2.0         # clamp |A| per turn to ±this
+    max_seq_len: int = 8192             # 0 = no limit; >0 drops longer samples
 
     # LoRA (DDP-friendly; base doubles as π_ref via `disable_adapter()`).
     # r=32 / α=64 on 9B is the sweet spot — larger r over-parameterizes
@@ -114,81 +114,127 @@ class TrainConfig:
 # Special tokens for Qwen3.5
 IM_START_ID = 248045
 IM_END_ID = 248046
+THINK_ID = 248068
 END_THINK_ID = 248069
+ASSISTANT_ID = 74455
 DEFAULT_PAD_ID = 248044    # <|endoftext|>
 
 
-def make_response_mask(input_ids: torch.Tensor) -> torch.Tensor:
-    """Mark the assistant's actual content tokens (post-`</think>`, pre-`<|im_end|>`).
+def make_response_mask(input_ids: torch.Tensor
+                       ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mark all assistant content tokens and assign turn indices.
 
-    Robust to user content containing literal `</think>`: locates the
-    last `<|im_start|>` (assistant section start), then the `</think>`
-    that closes the assistant's empty/real reasoning block, then the
-    next `<|im_end|>`.
+    Each assistant turn gets a segment index (1, 2, 3, …).  The chat
+    template puts ``<|im_start|>assistant\n…<|im_end|>`` for every turn;
+    intermediate turns contain just the response, and the final turn
+    additionally has a ``<think>\n\n</think>\n\n`` prefix.  We mask the
+    actual content tokens only, skipping the role header and any think
+    block.
     """
-    im_starts = (input_ids == IM_START_ID).nonzero(as_tuple=True)[0]
-    if len(im_starts) == 0:
-        return torch.zeros_like(input_ids)
-    asst_start = im_starts[-1].item()
-
-    end_think = (input_ids == END_THINK_ID).nonzero(as_tuple=True)[0]
-    end_think_after = end_think[end_think > asst_start]
-    if len(end_think_after) == 0:
-        return torch.zeros_like(input_ids)
-    response_start = end_think_after[0].item() + 2  # skip `</think>` + `\n\n`
-
-    im_ends = (input_ids == IM_END_ID).nonzero(as_tuple=True)[0]
-    eot_after = im_ends[im_ends >= response_start]
-    response_end = eot_after[0].item() if len(eot_after) else input_ids.size(0)
-
+    L = input_ids.size(0)
     mask = torch.zeros_like(input_ids)
-    mask[response_start:response_end] = 1
-    return mask
+    segments = torch.zeros_like(input_ids)
+
+    im_starts = (input_ids == IM_START_ID).nonzero(as_tuple=True)[0]
+    im_ends = (input_ids == IM_END_ID).nonzero(as_tuple=True)[0]
+
+    turn = 0
+    for s_pos in im_starts:
+        s = s_pos.item()
+        if s + 2 >= L:
+            continue
+        # Identify role: <|im_start|> <role_id> \n …
+        if input_ids[s + 1].item() != ASSISTANT_ID:
+            continue
+
+        # Content begins after `\n` (s+2) by default.
+        response_start = s + 3
+
+        # If the immediately-following content is `<think>` block, skip it.
+        # Layout: <|im_start|>(s) assistant(s+1) \n(s+2) <think>(s+3) ...
+        #         </think>(k) \n\n(k+1) content...
+        if response_start < L and input_ids[response_start].item() == THINK_ID:
+            think_end = (input_ids[response_start:] == END_THINK_ID).nonzero(
+                as_tuple=True)[0]
+            if len(think_end) > 0:
+                # Skip </think> + whitespace token (\n\n)
+                response_start = response_start + think_end[0].item() + 2
+
+        # Find the next <|im_end|> after response_start.
+        ie = im_ends[im_ends >= response_start]
+        response_end = ie[0].item() if len(ie) > 0 else L
+        if response_end <= response_start:
+            continue
+
+        turn += 1
+        mask[response_start:response_end] = 1
+        segments[response_start:response_end] = turn
+
+    return mask, segments
 
 
 class RLDataset(Dataset):
-    """Loads a JSONL of (messages, advantage) and yields tokenized samples.
+    """Loads per-actor trajectory JSONL and yields tokenized multi-turn samples.
 
-    All samples are kept regardless of length (no truncation, no filtering
-    by token count). Length-grouped batching minimizes padding overhead.
+    Each sample is one actor's full trajectory through a session:
+      user → assistant (post 1) → user → assistant (post 2) → ...
+    with per-turn advantages mapped to token-level advantage tensors.
     """
 
     def __init__(self, jsonl_path: str, tokenizer,
                  advantage_clip: float = 2.0,
-                 advantage_min_abs: float = 0.1):
+                 max_seq_len: int = 16384):
+        """`max_seq_len > 0` drops samples longer than that limit
+        (safety valve to avoid OOM on extreme outliers)."""
         self.tokenizer = tokenizer
         self.advantage_clip = advantage_clip
-        self.advantage_min_abs = advantage_min_abs
+        self.max_seq_len = max_seq_len
 
         raw = [json.loads(l) for l in open(jsonl_path)]
         self.samples: list[dict] = []
-        skipped_lowsig = skipped_nomask = 0
+        skipped_nomask = skipped_short = skipped_long = 0
         max_len_seen = 0
         for s in raw:
-            adv = float(s["advantage"])
-            if abs(adv) < advantage_min_abs:
-                skipped_lowsig += 1
-                continue
+            turn_advs = s.get("turn_advantages") or [s.get("advantage", 0)]
+            if advantage_clip > 0:
+                turn_advs = [max(-advantage_clip, min(advantage_clip, a))
+                             for a in turn_advs]
+
             text = tokenizer.apply_chat_template(
                 s["messages"], tokenize=False, add_generation_prompt=False)
             ids_list = tokenizer(text, add_special_tokens=False).input_ids
+
+            if max_seq_len > 0 and len(ids_list) > max_seq_len:
+                skipped_long += 1
+                continue
+
             ids = torch.tensor(ids_list, dtype=torch.long)
-            mask = make_response_mask(ids)
+            mask, segments = make_response_mask(ids)
             if mask.sum() == 0:
                 skipped_nomask += 1
                 continue
-            if advantage_clip > 0:
-                adv = max(-advantage_clip, min(advantage_clip, adv))
+
+            n_turns = int(segments.max().item())
+            if n_turns != len(turn_advs):
+                # Should never happen unless chat template / tokenizer drift.
+                skipped_short += 1
+                continue
+
+            adv_per_tok = torch.zeros(len(ids), dtype=torch.float32)
+            for t in range(n_turns):
+                adv_per_tok[segments == (t + 1)] = float(turn_advs[t])
+
             self.samples.append({
                 "input_ids": ids,
                 "response_mask": mask,
-                "advantage": adv,
+                "advantage": adv_per_tok,
                 "session_id": s["session_id"],
             })
             max_len_seen = max(max_len_seen, len(ids_list))
         print(f"  Dataset: {len(self.samples)} samples ready "
-              f"(dropped: {skipped_lowsig} low-|A|<{advantage_min_abs}, "
-              f"{skipped_nomask} mask-empty, "
+              f"(dropped: {skipped_nomask} mask-empty, "
+              f"{skipped_short} turn-mismatch, "
+              f"{skipped_long} >{max_seq_len} tokens, "
               f"max_tokens={max_len_seen})")
 
     def __len__(self) -> int:
@@ -199,7 +245,7 @@ class RLDataset(Dataset):
         return {
             "input_ids": s["input_ids"],
             "response_mask": s["response_mask"],
-            "advantage": torch.tensor(s["advantage"], dtype=torch.float32),
+            "advantage": s["advantage"],
         }
 
 
@@ -215,7 +261,7 @@ def collate(batch: list[dict], pad_id: int) -> dict:
         attn = torch.cat([torch.ones(n, dtype=torch.long),
                           torch.zeros(pad, dtype=torch.long)])
         out_attn.append(attn)
-        out_adv.append(b["advantage"])
+        out_adv.append(F.pad(b["advantage"], (0, pad), value=0.0))
     return {
         "input_ids": torch.stack(out_ids),
         "response_mask": torch.stack(out_mask),
@@ -294,7 +340,7 @@ def compute_loss(model, ref_model, batch: dict, beta_kl: float,
     input_ids = batch["input_ids"]
     response_mask = batch["response_mask"][:, 1:].float()
     target_ids = input_ids[:, 1:]
-    advantages = batch["advantage"]                       # [B], already clipped
+    advantages = batch["advantage"][:, 1:]                # [B, T] per-token
     attn = batch["attention_mask"]
     n_tok = response_mask.sum().clamp(min=1.0)
 
@@ -317,9 +363,8 @@ def compute_loss(model, ref_model, batch: dict, beta_kl: float,
     else:
         logp_ref = None
 
-    # Policy gradient: linear RWR.  A is per-sequence, broadcast to [B, T].
-    A_b = advantages.unsqueeze(1)                        # [B, 1]
-    pg_per_tok = -A_b * logp                              # [B, T]
+    # Policy gradient: per-token RWR.
+    pg_per_tok = -advantages * logp                        # [B, T]
     pg_loss = (pg_per_tok * response_mask).sum() / n_tok
 
     # KL(π_θ‖π_ref) k3 estimator (Schulman 2020): always ≥ 0, low variance.
@@ -342,7 +387,7 @@ def compute_loss(model, ref_model, batch: dict, beta_kl: float,
         "kl_loss": float(kl_loss.detach()),
         "total": float(total.detach()),
         "mean_logp_resp": float(((logp * response_mask).sum() / n_tok).detach()),
-        "mean_adv": float(advantages.mean().detach()),
+        "mean_adv": float((advantages * response_mask).sum().detach() / n_tok),
     }
 
 
@@ -422,9 +467,15 @@ def load_model(model_path: str, dtype: torch.dtype = torch.bfloat16):
 def attach_lora(model, cfg: "TrainConfig"):
     """Wrap base model with a LoRA adapter and freeze the base.
 
-    `target_modules="all-linear"` covers attention proj, MLP gate/up/down
-    and the linear-attention `in_proj_*` / `out_proj` layers so both the
-    self-attn and Mamba-style branches of Qwen3.5 hybrid get adapted.
+    Default `cfg.lora_target_modules = "q_proj,v_proj,o_proj"` patches
+    only attention projections — keeps the base MLP and Mamba-style
+    `in_proj_*` / `out_proj` weights frozen so general-domain knowledge
+    isn't perturbed by the RL signal.
+
+    Set the flag to `""` (empty) to fall back to PEFT's `"all-linear"`,
+    which covers attention proj, MLP gate/up/down, and the linear-
+    attention `in_proj_*` / `out_proj` layers — both Qwen3.5 hybrid
+    branches get adapted but with much higher KL drift risk.
     """
     targets = cfg.lora_target_modules.strip() or "all-linear"
     if "," in targets:
@@ -455,8 +506,6 @@ def parse_args() -> TrainConfig:
     p.add_argument("--output", required=True, help="Checkpoint directory")
     p.add_argument("--model", default=d["model"].default)
     p.add_argument("--ref-model", default="")
-    p.add_argument("--max-seq-len", type=int, default=0,
-                   help="Deprecated, ignored. All samples kept regardless of length.")
     p.add_argument("--per-device-batch-size", type=int,
                    default=d["per_device_batch_size"].default)
     p.add_argument("--grad-accum-steps", type=int,
@@ -474,9 +523,9 @@ def parse_args() -> TrainConfig:
     p.add_argument("--advantage-clip", type=float,
                    default=d["advantage_clip"].default,
                    help="Clamp |advantage| ≤ this (set 0 to disable)")
-    p.add_argument("--advantage-min-abs", type=float,
-                   default=d["advantage_min_abs"].default,
-                   help="Drop samples with |advantage| < this (set 0 to keep all)")
+    p.add_argument("--max-seq-len", type=int, default=d["max_seq_len"].default,
+                   help="Drop samples longer than this (0 = keep all). "
+                        "Safety valve against OOM on extreme outliers.")
     p.add_argument("--use-lora", action=argparse.BooleanOptionalAction,
                    default=d["use_lora"].default,
                    help="LoRA + DDP (default). Use --no-use-lora for full FT.")
@@ -523,7 +572,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(cfg.model, trust_remote_code=True)
     pad_id = tokenizer.pad_token_id or DEFAULT_PAD_ID
     dataset = RLDataset(cfg.data, tokenizer,
-                        cfg.advantage_clip, cfg.advantage_min_abs)
+                        cfg.advantage_clip, cfg.max_seq_len)
     sampler = LengthGroupedSampler(dataset, cfg.per_device_batch_size,
                                     seed=cfg.seed)
     loader = DataLoader(

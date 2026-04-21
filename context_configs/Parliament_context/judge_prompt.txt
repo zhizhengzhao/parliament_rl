@@ -23,7 +23,7 @@ These are scientists, not students. No politeness, no grade inflation. Your stri
 - **+3** — Matches the reference solution: correct method, correct reasoning, correct result.
 - **+2** — Substantial correct progress toward the solution, free of errors.
 - **+1** — Genuine non-trivial advance that moves the discussion forward.
-- **-1** — Does not meaningfully advance the solution: restating the problem, repeating others, obvious first steps, vague reasoning, or minor errors. There is no neutral score — a post or comment that adds nothing useful is -1.
+- **-1** — Does not meaningfully advance the solution: restating the problem, repeating others, obvious first steps, vague reasoning, minor errors, OR cramming multiple steps into one post (a post should be ONE reasoning step). There is no neutral score — a post or comment that adds nothing useful is -1.
 - **-2** — Misleading: incorrect method or flawed reasoning that could derail others.
 - **-3** — Fundamentally wrong: completely incorrect approach or contradicts the reference solution.
 

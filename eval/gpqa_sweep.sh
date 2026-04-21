@@ -11,7 +11,10 @@ NAME=""
 RUN_DIR=""
 SUBSET="gpqa_diamond"
 N=1
-TEMP=0.0
+# Qwen3.5 thinking mode: 0.6 is the recommended sampling temperature
+# (matches eval/gpqa.py default). Use --temperature 0.0 to force greedy
+# decoding for low-variance head-to-head comparisons.
+TEMP=0.6
 GPU=0
 EXTRA=()
 
