@@ -32,7 +32,7 @@ from .tools import IdMap, ToolExecutor, get_tools, python_exec
 
 STEP_LIMIT = 20
 MAX_NO_TOOL_RETRIES = 3
-MAX_TOKENS = 4096
+MAX_TOKENS = 2048                 # one reasoning step rarely needs more
 
 
 def _agent_defaults() -> tuple[int, int, int]:

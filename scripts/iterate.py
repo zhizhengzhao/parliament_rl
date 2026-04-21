@@ -1,48 +1,35 @@
 #!/usr/bin/env python3
-"""One-click iterative RL training (ReST-style, 4-iteration default).
+"""One-click iterative RL training (ReST-style).
 
 For each dataset shard, in order:
 
-    1. scripts/run.py    →  vLLM + Parliament + harness  →  parliament.db
-    2. rl.extract        →  train.jsonl
-    3. (metrics summary) →  reward/advantage stats vs baseline
-    4. rl.train          →  ckpt/step_K  (DDP + LoRA + RWR + KL anchor)
-    5. rl.export         →  merged/      (LoRA → base + ΔW, vLLM-loadable)
-    6. eval.gpqa         →  gpqa_diamond.json  (single-GPU, ~10 min)
+    1. scripts/run.py  →  vLLM + Parliament + harness  →  parliament.db
+    2. rl.extract      →  train.jsonl (per-actor trajectory)
+    3. metrics_step    →  reward/advantage stats
+    4. rl.train        →  ckpt/step_K  (DDP + LoRA + RWR + KL anchor)
+    5. rl.export       →  merged/      (LoRA → base, vLLM-loadable)
+    6. eval.gpqa       →  gpqa_diamond.json  (optional, --no-eval skips)
     7. merged/ becomes the next iteration's actor policy
 
 The base model is the *fixed* KL anchor across all iterations (LoRA's
-`disable_adapter()` recovers it for free) — this prevents drift from
-compounding. Each iteration starts a fresh LoRA on the merged base.
+`disable_adapter()` recovers it for free) so drift does not compound.
+Each iteration starts a fresh LoRA on the merged base.
 
-State is persisted at `data/<name>_<ts>/state.json`; re-invoking the
-same command resumes from the next incomplete iteration.
+Resume: re-invoking the same command picks up where things left off.
+Each sub-step is idempotent — it skips when its output already exists.
 
-Time budget per iteration (8 × A100-80GB):
-    parliament  ≈ 9 h     (pred. scales 1/N with N parallel vLLM instances)
-    train       ≈ 4 h     (~10k samples, 2 epoch, LoRA)
-    export+eval ≈ 0.3 h
-    startup     ≈ 0.5 h
-    ──────────────────
-    total       ≈ 14 h    →  4 iter ≈ 56 h end-to-end
-
-On 24 × A100 (parliament parallelism 3×) it drops to ≈ 8 h/iter,
-≈ 32 h end-to-end.
+    sample : skip if parliament.db + experiment.json present
+    extract: skip if train.jsonl non-empty
+    train  : --resume from latest step_*
+    export : skip if merged/ has config + weights + tokenizer
 
 Usage:
     python scripts/iterate.py \\
-        --name nrun_v1 \\
-        --shards datasets/sciencepedia_train_part1.json,\\
-                 datasets/sciencepedia_train_part2.json,\\
-                 datasets/sciencepedia_train_part3.json,\\
-                 datasets/sciencepedia_train_part4.json \\
+        --name run1 \\
+        --shards datasets/part1.json,datasets/part2.json,... \\
         --gpus 0,1,2,3,4,5,6,7
 
-Resume (same command, same --name, picks up from state.json):
-    python scripts/iterate.py --name nrun_v1 --shards ... --gpus ...
-
-Stop the background tmux job:
-    tmux kill-session -t parliament-iterate
+Stop: tmux kill-session -t parliament-iterate
 """
 
 from __future__ import annotations

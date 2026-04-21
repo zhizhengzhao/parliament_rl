@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
-"""Export an RL checkpoint as a single HF model directory.
+"""Export an RL checkpoint as a single vLLM-loadable HF model folder.
 
-LoRA path (default in `rl.train`): loads the base model + adapter saved
-at `<ckpt>/adapter`, merges via `merge_and_unload`, and writes the
-result. Single-process (no accelerate / FSDP needed) since LoRA params
-are tiny and the merge is a pure CPU/GPU `weight += alpha·BA` pass.
+LoRA path (default): load base + adapter, `merge_and_unload`, save.
+Single-process — LoRA merge is tiny (just `W += alpha · BA`).
 
-Full-FT fallback: if `<ckpt>/adapter` does not exist, falls back to the
-old FSDP-sharded reload path so the script keeps working for non-LoRA
-runs.
+Full-FT fallback: if `<ckpt>/adapter` is missing, gather FSDP-sharded
+weights on rank 0 and save (legacy, rarely used).
+
+Qwen3.5 is a multimodal model: ``AutoModelForCausalLM`` only loads the
+text backbone, so we additionally copy the base's ``config.json`` +
+preprocessor configs and patch in any missing visual/mtp weights so the
+merged folder stays drop-in replaceable for the original base.
 
 Usage:
-    python -m rl.export \\
-        --ckpt data/<run>/ckpt/step_K \\
+    python -m rl.export --ckpt data/<run>/ckpt/step_K \\
         --output data/<run>/merged
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import shutil
 from pathlib import Path
-
-import glob
 
 import torch
 from peft import PeftModel
@@ -44,18 +44,11 @@ def copy_aux(model_path: str, out_dir: Path) -> None:
 
 
 def _patch_missing_weights(base_path: str, out_dir: Path) -> None:
-    """Copy weights that exist in base but not in merged (visual, mtp).
-
-    AutoModelForCausalLM only loads the text backbone, so visual encoder
-    and multi-token-prediction head weights are missing from the merged
-    safetensors.  We load them from the base model and append them to a
-    new shard so vLLM finds the full model.
-    """
+    """Copy weights present in base but missing from merged (visual, mtp)."""
     base_keys: dict[str, str] = {}
     for f in sorted(glob.glob(os.path.join(base_path, "*.safetensors"))):
-        with open(f, "rb"):
-            for k in load_file(f, device="cpu").keys():
-                base_keys[k] = f
+        for k in load_file(f, device="cpu").keys():
+            base_keys[k] = f
 
     merged_keys: set[str] = set()
     for f in sorted(glob.glob(os.path.join(str(out_dir), "*.safetensors"))):
@@ -67,11 +60,10 @@ def _patch_missing_weights(base_path: str, out_dir: Path) -> None:
         return
 
     tensors: dict[str, torch.Tensor] = {}
-    files_needed = set(missing.values())
-    for f in files_needed:
+    for f in set(missing.values()):
         shard = load_file(f, device="cpu")
-        for k in missing:
-            if missing[k] == f and k in shard:
+        for k, src in missing.items():
+            if src == f and k in shard:
                 tensors[k] = shard[k]
 
     patch_path = out_dir / "model_patch.safetensors"

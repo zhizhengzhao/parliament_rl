@@ -117,7 +117,36 @@ IM_END_ID = 248046
 THINK_ID = 248068
 END_THINK_ID = 248069
 ASSISTANT_ID = 74455
+USER_ID = 846
 DEFAULT_PAD_ID = 248044    # <|endoftext|>
+
+
+def truncate_to_turn_boundary(ids: list[int], max_len: int) -> list[int]:
+    """Truncate a multi-turn chat from the front so the cut lands on a
+    ``<|im_start|>user`` boundary, never in the middle of an assistant turn.
+
+    We walk the token list and find all positions where a new user turn
+    starts (`<|im_start|> user \n`).  The returned slice begins at the
+    latest such boundary whose tail fits within ``max_len``; if every
+    single user turn alone exceeds ``max_len`` we fall back to a plain
+    tail truncation so at least the final assistant turn survives.
+    """
+    if len(ids) <= max_len:
+        return ids
+    # Find every <|im_start|>user position (not just assistant).
+    starts: list[int] = []
+    for i, t in enumerate(ids):
+        if (t == IM_START_ID and i + 1 < len(ids)
+                and ids[i + 1] == USER_ID):
+            starts.append(i)
+    # Pick the earliest start that keeps ≤ max_len at the tail.
+    total = len(ids)
+    for s in starts:
+        if total - s <= max_len:
+            return ids[s:]
+    # Every user turn alone is longer than max_len — degenerate session.
+    # Fall back to tail cut (may split a turn, mask_empty filter drops it).
+    return ids[-max_len:]
 
 
 def make_response_mask(input_ids: torch.Tensor
@@ -183,16 +212,17 @@ class RLDataset(Dataset):
 
     def __init__(self, jsonl_path: str, tokenizer,
                  advantage_clip: float = 2.0,
-                 max_seq_len: int = 16384):
-        """`max_seq_len > 0` drops samples longer than that limit
-        (safety valve to avoid OOM on extreme outliers)."""
+                 max_seq_len: int = 8192):
+        """Over-length trajectories are truncated at the nearest user-turn
+        boundary (so the cut never splits an assistant response), with
+        dropped assistant turns removed from turn_advantages accordingly."""
         self.tokenizer = tokenizer
         self.advantage_clip = advantage_clip
         self.max_seq_len = max_seq_len
 
         raw = [json.loads(l) for l in open(jsonl_path)]
         self.samples: list[dict] = []
-        skipped_nomask = skipped_short = skipped_long = 0
+        skipped_nomask = skipped_mismatch = n_truncated = 0
         max_len_seen = 0
         for s in raw:
             turn_advs = s.get("turn_advantages") or [s.get("advantage", 0)]
@@ -205,8 +235,8 @@ class RLDataset(Dataset):
             ids_list = tokenizer(text, add_special_tokens=False).input_ids
 
             if max_seq_len > 0 and len(ids_list) > max_seq_len:
-                skipped_long += 1
-                continue
+                ids_list = truncate_to_turn_boundary(ids_list, max_seq_len)
+                n_truncated += 1
 
             ids = torch.tensor(ids_list, dtype=torch.long)
             mask, segments = make_response_mask(ids)
@@ -215,14 +245,15 @@ class RLDataset(Dataset):
                 continue
 
             n_turns = int(segments.max().item())
-            if n_turns != len(turn_advs):
-                # Should never happen unless chat template / tokenizer drift.
-                skipped_short += 1
+            # Truncation drops leading assistant turns; keep the last n_turns.
+            if n_turns > len(turn_advs) or n_turns == 0:
+                skipped_mismatch += 1
                 continue
+            kept_advs = turn_advs[-n_turns:]
 
             adv_per_tok = torch.zeros(len(ids), dtype=torch.float32)
             for t in range(n_turns):
-                adv_per_tok[segments == (t + 1)] = float(turn_advs[t])
+                adv_per_tok[segments == (t + 1)] = float(kept_advs[t])
 
             self.samples.append({
                 "input_ids": ids,
@@ -230,11 +261,11 @@ class RLDataset(Dataset):
                 "advantage": adv_per_tok,
                 "session_id": s["session_id"],
             })
-            max_len_seen = max(max_len_seen, len(ids_list))
+            max_len_seen = max(max_len_seen, len(ids))
         print(f"  Dataset: {len(self.samples)} samples ready "
-              f"(dropped: {skipped_nomask} mask-empty, "
-              f"{skipped_short} turn-mismatch, "
-              f"{skipped_long} >{max_seq_len} tokens, "
+              f"(truncated: {n_truncated}, "
+              f"dropped: {skipped_nomask} mask-empty, "
+              f"{skipped_mismatch} turn-mismatch, "
               f"max_tokens={max_len_seen})")
 
     def __len__(self) -> int:
@@ -346,20 +377,22 @@ def compute_loss(model, ref_model, batch: dict, beta_kl: float,
 
     out = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
     logp = per_token_log_p(out.logits[:, :-1], target_ids)         # [B, T]
+    del out
 
     # Reference forward — needed when β_kl > 0.  No grad, bf16, single pass.
     if beta_kl > 0:
         with torch.no_grad():
             if lora_unwrap is not None:
                 with lora_unwrap.disable_adapter():
-                    ref_logits = model(input_ids=input_ids,
-                                       attention_mask=attn,
-                                       use_cache=False).logits
+                    ref_out = model(input_ids=input_ids,
+                                    attention_mask=attn,
+                                    use_cache=False)
             else:
-                ref_logits = ref_model(input_ids=input_ids,
-                                       attention_mask=attn,
-                                       use_cache=False).logits
-            logp_ref = per_token_log_p(ref_logits[:, :-1], target_ids)
+                ref_out = ref_model(input_ids=input_ids,
+                                    attention_mask=attn,
+                                    use_cache=False)
+            logp_ref = per_token_log_p(ref_out.logits[:, :-1], target_ids)
+            del ref_out
     else:
         logp_ref = None
 

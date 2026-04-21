@@ -73,13 +73,14 @@ parliament_rl/
 
 | script | purpose | typical wall time |
 |---|---|---|
-| `scripts/run.py` | one-shot data collection (cleanup → vLLM → Parliament → harness) | ~9 h for 1 026 questions on 8 GPU |
-| `scripts/iterate.py` | sample → train → export → repeat across shards | ~13.5 h per iteration |
+| `scripts/run.py` | one-shot data collection (cleanup → vLLM → Parliament → harness) | ~6-9 h for 1 026 questions on 8 GPU |
+| `scripts/iterate.py` | sample → extract → train → export → repeat across shards | ~8-10 h per iteration |
 | `scripts/sample_dataset.py` | split a full dataset by depth-5 category | seconds |
-| `python -m rl.extract` | `parliament.db` → `train.jsonl` | ~45 s for ~10 k samples |
-| `python -m rl.train` (via `accelerate launch`) | FSDP2 offline RL | ~4 h per epoch for ~10 k samples on 8 GPU |
-| `python -m rl.export` (via `accelerate launch`) | sharded → merged HF directory | ~5 min |
-| `python -m eval.gpqa` | GPQA Diamond / Main zero-shot CoT accuracy | ~10 min/model on 1 × H800 |
+| `python -m rl.extract` | `parliament.db` → `train.jsonl` (per-actor trajectories) | ~1 min per shard |
+| `python -m rl.train` (via `accelerate launch`) | DDP + LoRA offline RL (RWR + KL) | ~1 h per epoch for ~10 k turns on 8 GPU |
+| `python -m rl.export` | LoRA → merged HF directory (vLLM-loadable) | ~3 min |
+| `python -m eval.gpqa` | GPQA Diamond zero-shot CoT accuracy (thinking mode) | ~15 min/model on 1 × A100 |
+| `python -m eval.sciencepedia_mc` | held-out 100 multiple-choice questions (disjoint from train) | ~10 min/model |
 | `eval/gpqa_sweep.sh` | sweep base + every iter's merged policy through GPQA | ~1 h for 5 models |
 
 All scripts are resumable where that makes sense (iterate via
@@ -107,21 +108,25 @@ as CLI flags:
 - **Advantage shape**: `advantage_baseline` ∈ {0, `mean_session`,
   `mean_global`, any number}, `advantage_scale` ∈ {`session_std`,
   `global_std`, `none`, any number} in `RL_context/config.json`.
-- **Loss variant**: `rl/train.py --use-ratio / --no-use-ratio`
-  switches between GRPO-with-ratio and RWR. `--beta-kl 0` drops the
-  KL term. `--advantage-clip 5.0` clamps advantages.
+- **Loss knobs**: `rl/train.py --beta-kl 0` drops the KL anchor.
+  `--advantage-clip 2.0` clamps per-turn advantages to ±2.
+  `--max-seq-len 8192` sets the truncation boundary (over-length
+  trajectories are cut at the nearest user-turn edge).
 - **Per-iteration overrides**: `scripts/iterate.py --train-extra "--num-epochs
   1 --beta-kl 0.01"` forwards flags to every iteration's trainer.
 
 ## Dataset
 
-`datasets/sciencepedia_test.json` — 100 graduate-level maths/physics
-problems with reference solutions (smoke-test size).
+`datasets/sciencepedia_test.json` — 100 graduate-level problems with
+reference solutions (smoke size, disjoint from train).
 
 `datasets/sciencepedia_train_part{1..4}.json` — 4 × 1 026 = 4 104
 problems, sampled uniformly over depth-5 Sciencepedia categories by
-`scripts/sample_dataset.py`. Natural sharding for iterative RL — one
-shard per iteration.
+`scripts/sample_dataset.py`. One shard per iteration.
+
+`datasets/sciencepedia_heldout_mc100.json` — 100 multiple-choice
+problems (boxed letter answer) held out from both train and test.
+Pre-disjoint evaluation set for `eval/sciencepedia_mc.py`.
 
 ## Environment variables
 
@@ -164,9 +169,8 @@ llm_logs/            # every LLM API call, grouped by session
 discards/            # no-tool streaks (debug)
 run.log              # stdout of run.py / iterate.py
 parliament.log       # FastAPI uvicorn log
-train.jsonl          # RL training samples (after rl.extract)
-ckpt/                # sharded FSDP checkpoints (after rl.train)
-  step_K/
+train.jsonl          # per-actor trajectories (after rl.extract)
+ckpt/step_K/         # LoRA adapter + optimizer/scheduler state
 merged/              # single-file HF folder (after rl.export; vLLM-loadable)
 ```
 

@@ -20,10 +20,9 @@ peft>=0.19                # known-good: 0.19.1
 safetensors>=0.7          # known-good: 0.7.0
 
 # Inference (vLLM serving for data generation)
-# 0.17.x is what every iter has been validated against; 0.18+ changes
-# the auto-tool-choice / hermes parser handling and may break the
-# tool-call dispatch pipeline in harness/agent.py.
-vllm>=0.17,<0.18          # known-good: 0.17.1
+# scripts/run.py uses the generic `hermes` tool-call parser which is
+# supported across vllm 0.17-0.19.
+vllm>=0.17                # known-good: 0.17.1 (A100 box), 0.19.1 (KS box)
 
 # Optional: fused kernels for Qwen3.5 hybrid attention (~2-3x vLLM speedup)
 # All three have prebuilt wheels for the torch 2.10 / cu128 combo above.
