@@ -44,27 +44,43 @@ Three modes:
 
 ## Advantage normalization
 
+The full pipeline is two steps — first remove the position trend
+("later posts score higher" is a session-mechanic, not a quality
+signal), then normalize per session:
+
 ```
-A_i = (r_i − baseline) / scale
+1. position debias       r' = r - slope * (t - 0.5)        # extract.py:debias_position
+2. session normalize     A  = (r' - baseline) / scale       # extract.py:compute_advantages
 ```
+
+`slope` is fitted globally from all sessions (early-half vs late-half
+mean reward gap, mapped to a 0→1 span). `t` is the post's normalized
+position in its session [0, 1]. At the midpoint the correction is
+zero; early posts are boosted, late posts are reduced.
 
 | Key | Options | Default | Semantics |
 |---|---|---|---|
-| `advantage_baseline` | `0.0`, `"mean_session"`, `"mean_global"`, or any number | `0.0` | Constant to subtract before scaling. Default 0 preserves the absolute-reward sign (any judge-positive post keeps positive A). `"mean_session"` is classic GRPO group centering. |
+| `advantage_baseline` | `0.0`, `"mean_session"`, `"mean_global"`, or any number | `"mean_session"` | Constant to subtract before scaling. Default `"mean_session"` is classic GRPO group centering: each post's advantage is signed by whether it beat the rest of *its own* session, regardless of the session's absolute reward level. |
 | `advantage_scale` | `"session_std"`, `"global_std"`, `"none"`, or any number | `"session_std"` | Per-session std (standard GRPO), dataset std (REINFORCE++-style), or a fixed constant. |
 
 **Safety floor**: session std is floored at `1.0` so a degenerate
 session (all posts got identical reward) can't produce infinite
 advantages. With rewards in ±10, this keeps `|A|` bounded below 10 even
-for the noisiest case.
+for the noisiest case. `extract.py` then applies `advantage_clip = 2.0`
+inside the trainer (`rl/train.py:RLDataset`).
 
 ### Defaults explained
 
-- `baseline = 0`, `scale = session_std` — every actor post is compared
-  against the scale of variation within its own session, but the
-  absolute-reward sign is preserved. A post judged `+6` always has
-  positive A regardless of whether the session's mean was `+9` (usually
-  a net-good session) or `-1` (unusually bad). This matches the
-  intuition "positive judge signal is worth learning from, negative
-  signal worth avoiding" while still normalizing the gradient magnitude
-  session-by-session.
+- `baseline = "mean_session"`, `scale = "session_std"` — classic GRPO.
+  Each session is centered and scaled by its own statistics, so a
+  session full of strong posts and a session full of weak posts both
+  contribute well-balanced gradients. Combined with **position debias**
+  this yields `mean(A) ≈ 0`, `|A|̄ ≈ 0.82` and a 50/50 positive-vs-
+  negative split on Sciencepedia (mid200 measurement, 12 iters across
+  three hyper-parameter cells).
+- We previously ran with `baseline = 0` (preserving the absolute reward
+  sign), but the GRPO baseline gave a much cleaner training signal —
+  the absolute-reward sign was dominated by judge-strictness drift
+  across sessions and washed out the within-session learning signal.
+- The 2×2 ablation cells share these defaults; only the rollout-side
+  context (coupling and judge visibility) differs across cells.
