@@ -1,11 +1,24 @@
 """Tool definitions and execution for Parliament agents.
 
-Actor tools: python_exec, vote, submit, wait
-Judge tools: python_exec, vote
+Two actor tool sets, switched by `PRL_CONTEXT`:
+
+  Coupled  (Parliament_context, default):
+      python_exec, vote, submit(comments, post), wait
+      ↳ collaborative — vote on peers, comment, wait for new content
+  Independent (Solo_context):
+      python_exec, submit(step), leave
+      ↳ solo derivation — no peers to react to, exits with `leave`
+
+Judge tools: python_exec, vote (same in both modes).
 
 Round-ending tools (per role):
-  Actor → submit, wait     (sets event, wakes runner)
-  Judge → vote             (no event, runner stays asleep)
+  Actor (coupled)      → submit, wait
+  Actor (independent)  → submit, leave
+  Judge                → vote (no event, runner stays asleep)
+
+The independent `submit(step)` is the same wire-level call as the
+coupled `submit(post)` — the LLM-facing argument name is renamed for
+prompt cleanliness; the internal API and DB schema are unchanged.
 
 Session ID and API key are injected by the executor; the LLM never
 sees them and cannot vote outside its session.
@@ -84,7 +97,7 @@ _JUDGE_VOTE_PARAMS = _vote_schema(
 )
 
 
-ACTOR_TOOLS = [
+_COUPLED_ACTOR_TOOLS = [
     _PYTHON_EXEC,
     {"type": "function", "function": {
         "name": "vote",
@@ -134,6 +147,36 @@ ACTOR_TOOLS = [
     }},
 ]
 
+_INDEPENDENT_ACTOR_TOOLS = [
+    _PYTHON_EXEC,
+    {"type": "function", "function": {
+        "name": "submit",
+        "description": ("Record one reasoning step in your derivation. "
+                        "ENDS your turn — anonymous reviewers may score it."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "step": {
+                    "type": "string",
+                    "description": (
+                        "A focused, verifiable reasoning step — one logical "
+                        "move from a previous claim to a new one. Reference "
+                        "earlier steps by index (e.g. 'Building on P_3, ...')."),
+                },
+            },
+            "required": ["step"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "leave",
+        "description": ("Declare your derivation complete and retire from "
+                        "the session. ENDS your turn permanently — you will "
+                        "not be polled again. Use only when fully certain "
+                        "the answer chain is settled."),
+        "parameters": {"type": "object", "properties": {}},
+    }},
+]
+
 JUDGE_TOOLS = [
     _PYTHON_EXEC,
     {"type": "function", "function": {
@@ -145,8 +188,15 @@ JUDGE_TOOLS = [
 ]
 
 
-def get_tools(role: str) -> list[dict]:
-    return JUDGE_TOOLS if role == "judge" else ACTOR_TOOLS
+def get_tools(role: str, coupled: bool = True) -> list[dict]:
+    """Return the tool spec list for one role.
+
+    Judge tools are identical across coupled / independent (judges always
+    see all posts and score them); only the actor tool set differs.
+    """
+    if role == "judge":
+        return JUDGE_TOOLS
+    return _COUPLED_ACTOR_TOOLS if coupled else _INDEPENDENT_ACTOR_TOOLS
 
 
 # ── Generic value coercion ────────────────────────────────
@@ -447,14 +497,19 @@ class ToolExecutor:
         return [raw] if raw else []
 
     async def execute_submit(self, args: Any) -> dict:
-        """Execute submit (post + comments). Tolerates several arg shapes."""
+        """Execute submit (post/step + comments). Tolerates several arg shapes.
+
+        Accepts both `post` (coupled mode) and `step` (independent mode)
+        for the new-content field — they are the same wire-level call.
+        """
         if not isinstance(args, dict):
             return {"post_id": None, "comments": [],
                     "errors": [f"invalid arguments type: {type(args).__name__}"]}
 
         results: dict = {"post_id": None, "comments": [], "errors": []}
 
-        post_content = to_str(args.get("post", ""))
+        # Independent-mode `step` aliases coupled-mode `post`.
+        post_content = to_str(args.get("post", "") or args.get("step", ""))
         if post_content:
             await self._submit_post(post_content, results)
 
@@ -464,5 +519,5 @@ class ToolExecutor:
 
         if not results["post_id"] and not results["comments"] and not results["errors"]:
             results["errors"].append(
-                "Nothing submitted. Include a post or comments to contribute.")
+                "Nothing submitted. Include a post/step or comments to contribute.")
         return results

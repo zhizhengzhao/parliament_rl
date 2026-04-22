@@ -101,10 +101,13 @@ All scripts are resumable where that makes sense (iterate via
 Most experimental knobs are already exposed in `context_configs/` or
 as CLI flags:
 
+- **2×2 ablation cells** (coupling × judge-visibility, see
+  [`docs/04_2x2_design.md`](docs/04_2x2_design.md)):
+  - A — Parliament       (default: coupled, visible)
+  - B — BlindParliament  (`PRL_JUDGE_VOTES_VISIBLE=0`)
+  - C — Solo             (`PRL_CONTEXT=Solo`)
+  - D — BlindSolo        (both env vars)
 - **Agent cardinality**: `--actors N --judges M`.
-- **Judge visibility**: `judge_votes_visible` in
-  `Parliament_context/config.json` (whether scientists see judge
-  votes at all).
 - **Remove the judge entirely**: `--judges 0` exercises Direction 2
   (pure peer-review voting, no reference-solution anchor).
 - **Persona / name pools**: edit `Parliament_context/config.json` —

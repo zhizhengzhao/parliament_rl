@@ -1,20 +1,26 @@
 """Prompt and persona machinery — Parliament side.
 
 All "what the LLM sees" lives here:
-  - Loads `context_configs/Parliament_context/`
+  - Loads `context_configs/<PRL_CONTEXT>_context/` (default: Parliament)
   - Per-session persona sampling (no replacement) from a flat pool
   - System prompt rendering
   - Formatting new posts/comments/votes for context injection
+
+Switch the 2×2 ablation cell with:
+    PRL_CONTEXT=Parliament   # coupled (default)
+    PRL_CONTEXT=Solo         # independent
 """
 
 from __future__ import annotations
 
 import json
+import os
 import random
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-PARLIAMENT_CONTEXT = PROJECT_DIR / "context_configs" / "Parliament_context"
+CONTEXT_NAME = os.environ.get("PRL_CONTEXT", "Parliament")
+PARLIAMENT_CONTEXT = PROJECT_DIR / "context_configs" / f"{CONTEXT_NAME}_context"
 
 _MAX_AGENTS_PER_ROLE = 32  # per-role cap on `rng.sample` size
 

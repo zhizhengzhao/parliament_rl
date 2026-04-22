@@ -31,10 +31,24 @@ the harness boots; nothing in this directory is generated.
 - **`agent.max_consecutive_errors`** — LLM API retry budget before
   skipping a round.
 - **`agent.llm_timeout_s`** — total LLM call timeout.
-- **`judge_votes_visible`** — when true, actors receive judge votes
-  (anonymized as "Anonymous Scientist"); when false, judge votes are
-  withheld entirely. Useful for ablating the judge's online-steering
-  effect vs its reward-only effect.
+- **`actor_context_coupled`** — when true (this cell), actors see
+  every other actor's posts/comments/votes during the session
+  (collaborative). When false (`Solo_context`), each actor only sees
+  its own history plus optionally judge votes. Drives the **coupling**
+  axis of the 2×2 ablation.
+- **`judge_votes_visible`** — when true (this cell), actors receive
+  judge votes (anonymized as "Anonymous Scientist"); when false,
+  judge votes are withheld entirely. Drives the **judge visibility**
+  axis. Override at launch with `PRL_JUDGE_VOTES_VISIBLE=0` so a
+  single context dir covers both halves of the axis without an
+  extra config file.
+
+The 2×2 cells:
+
+  A Parliament       coupled=true  + visible=true   (this dir)
+  B BlindParliament  coupled=true  + visible=false  (this dir + env)
+  C Solo             coupled=false + visible=true   (Solo_context)
+  D BlindSolo        coupled=false + visible=false  (Solo_context + env)
 
 The DB keeps stable `Scientist_1..3`, `Judge_1..3` user names for
 debuggability. Name anonymization is purely presentational — applied

@@ -45,7 +45,8 @@ def _agent_defaults() -> tuple[int, int, int]:
 
 MAX_ROUNDS, MAX_CONSECUTIVE_ERRORS, LLM_TIMEOUT_S = _agent_defaults()
 
-_TOOL_PRIORITY = {"python_exec": 0, "vote": 1, "submit": 2, "wait": 3}
+_TOOL_PRIORITY = {"python_exec": 0, "vote": 1, "submit": 2,
+                  "wait": 3, "leave": 3}
 
 
 def _ts() -> str:
@@ -260,10 +261,15 @@ async def _dispatch_one_tool(tc: dict, executor: ToolExecutor, role: str,
                          "content": "Waiting for new content."})
         return "wait", None
 
+    if fn_name == "leave":
+        messages.append({"role": "tool", "tool_call_id": tc["id"],
+                         "content": "Left the session."})
+        return "leave", None
+
     messages.append({
         "role": "tool", "tool_call_id": tc["id"],
         "content": (f"Error: unknown tool '{fn_name}'. "
-                    "Available: python_exec, vote, submit, wait."),
+                    "Available: python_exec, vote, submit, wait/leave."),
     })
     return None, None
 
@@ -311,11 +317,13 @@ async def run_agent_round(
 
     Returns:
       submit args dict          — actor ended via submit
-      {"_action": "wait"}       — actor ended via wait
+      {"_action": "wait"}       — actor ended via wait (coupled mode)
+      {"_action": "leave"}      — actor ended via leave (independent mode)
       {"_action": "vote"}       — judge ended via vote
       None                      — failure (caller retries next round)
     """
-    tools = get_tools(role)
+    coupled = bool(get_config().get("actor_context_coupled", True))
+    tools = get_tools(role, coupled=coupled)
     gpu_port = llm_endpoint.split(":")[2].split("/")[0]
     consecutive_errors = 0
     no_tool_streak: list[dict] = []
@@ -433,6 +441,8 @@ async def run_agent_round(
             return end_args
         if end_action == "wait":
             return {"_action": "wait"}
+        if end_action == "leave":
+            return {"_action": "leave"}
         if end_action == "vote":
             return {"_action": "vote"}
 
@@ -526,6 +536,13 @@ async def _run_agent_inner(
             if result.exit_reason == "context_overflow":
                 break
             continue
+
+        # Independent-mode `leave` retires the actor permanently:
+        # don't loop back for new content, just wrap up.
+        if isinstance(round_result, dict) and round_result.get("_action") == "leave":
+            result.exit_reason = "left"
+            break
+
         round_num += 1
 
     await executor.leave(result.exit_reason or "completed")

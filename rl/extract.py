@@ -59,9 +59,12 @@ SCIENTIST_RE = re.compile(r"\bScientist_(\d+)\b")
 def load_rl_config() -> dict:
     cfg = json.loads((RL_CONTEXT / "config.json").read_text())
     cfg["prompt_intro"] = (RL_CONTEXT / "prompt_intro.txt").read_text().strip()
-    # The name_pool is the single source of truth for Parliament's session
-    # casting — harness uses it at runtime, we use the same pool + seed here
-    # so the mapping is identical.
+    # `name_pool` is the single source of truth for session casting and is
+    # identical across all 2×2 cells (Parliament_context and Solo_context
+    # share it), so we always read Parliament_context here regardless of
+    # which cell produced the data.  `assign_session_names` (imported from
+    # `harness.prompts`) deterministically reproduces the runtime mapping
+    # from `session_id`, independent of `PRL_CONTEXT`.
     parl_cfg = json.loads((PARLIAMENT_CONTEXT / "config.json").read_text())
     cfg["name_pool"] = parl_cfg.get("name_pool", [])
     return cfg

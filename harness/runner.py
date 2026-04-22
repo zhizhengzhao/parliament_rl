@@ -5,14 +5,25 @@ and distributes only when posts or comments exist. Votes are accumulated
 and delivered alongside the next post/comment batch.
 
 Judge votes never wake the runner. Two processing sets track actors and
-judges independently. Session ends when actors idle; runner waits for
-judges to finish before finalizing.
+judges independently. Session ends when actors idle (coupled mode) or
+when every actor has called `leave` (independent mode); runner waits
+for judges to finish before finalizing.
+
+Two `config.json` flags drive the 2×2 ablation:
+  actor_context_coupled (bool)  — distribute peers' posts/comments/votes
+                                  to actors? false ⇒ each actor sees only
+                                  its own history (and judge votes if
+                                  visible). Default true.
+  judge_votes_visible   (bool)  — push judge votes to actors? Default true.
+                                  Override at launch with
+                                  PRL_JUDGE_VOTES_VISIBLE=0 (or =false).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import urllib.request
 from collections import Counter
@@ -38,6 +49,18 @@ TYPE_ORDER = {"post": 0, "comment": 1, "vote": 2}
 
 def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
+
+
+def _resolve_judge_visibility(cfg: dict) -> bool:
+    """`PRL_JUDGE_VOTES_VISIBLE` overrides the config flag at launch.
+
+    Lets us pick the 2×2 cell on the command line without editing
+    config.json (e.g. `PRL_JUDGE_VOTES_VISIBLE=0` flips Parliament → BlindParliament).
+    """
+    env = os.environ.get("PRL_JUDGE_VOTES_VISIBLE")
+    if env is None:
+        return bool(cfg.get("judge_votes_visible", True))
+    return env.strip().lower() not in ("0", "false", "no", "off", "")
 
 
 # ── Types ─────────────────────────────────────────────────
@@ -184,10 +207,21 @@ def _distribute(queues: dict[str, asyncio.Queue],
             queues[name].put_nowait(to_push)
 
 
-def _nudge_actors(queues: dict[str, asyncio.Queue], names: list[str]) -> None:
-    msg = ("No new posts or comments from anyone. All scientists are waiting. "
-           "Break the silence — post your next analysis step or summarize "
-           "the final answer.")
+def _nudge_actors(queues: dict[str, asyncio.Queue], names: list[str],
+                  coupled: bool = True) -> None:
+    """Push a "do something" prompt when actors stall.
+
+    Coupled mode: implies "the room is silent, break it" — references
+    peers explicitly (the actor expects them).
+    Independent mode: no peers exist; nudge is a pure self-prompt.
+    """
+    if coupled:
+        msg = ("No new posts or comments from anyone. All scientists are "
+               "waiting. Break the silence — post your next analysis step "
+               "or summarize the final answer.")
+    else:
+        msg = ("No new feedback. Continue your derivation: submit the "
+               "next reasoning step, or call leave if the chain is settled.")
     for n in names:
         queues[n].put_nowait(msg)
 
@@ -270,7 +304,9 @@ async def run_session(
     sid = session["session_id"]
     ref_solution = session_details.get("reference_solution", "")
     gpu_port = endpoint.split(":")[2].split("/")[0]
-    judge_votes_visible = get_config().get("judge_votes_visible", True)
+    cfg = get_config()
+    actor_context_coupled = bool(cfg.get("actor_context_coupled", True))
+    judge_votes_visible = _resolve_judge_visibility(cfg)
 
     session_llm_dir = (llm_log_dir / sid[:8]) if llm_log_dir else None
     session_discard_dir = (discard_dir / sid[:8]) if discard_dir else None
@@ -340,8 +376,16 @@ async def run_session(
                 # (they'll start scoring while actors are still processing).
                 await asyncio.sleep(DISTRIBUTION_DELAY_S)
 
-                actor_payload = (fetched.posts + fetched.comments
-                                 + fetched.actor_votes)
+                # Coupled mode (Parliament / BlindParliament): actors see
+                # peers' posts, comments, and inter-actor votes.
+                # Independent mode (Solo / BlindSolo): actors only see
+                # judge feedback on their own steps; everything else stays
+                # invisible (peers do not exist from this actor's POV).
+                if actor_context_coupled:
+                    actor_payload = (fetched.posts + fetched.comments
+                                     + fetched.actor_votes)
+                else:
+                    actor_payload = []
                 if judge_votes_visible:
                     actor_payload += [{**v, "author": ANONYMOUS_VOTER}
                                       for v in fetched.judge_votes]
@@ -357,7 +401,7 @@ async def run_session(
                 idle_rounds += 1
                 active = [n for n in actor_names if not tasks[n].done()]
                 if idle_rounds <= 1 and active:
-                    _nudge_actors(queues, active)
+                    _nudge_actors(queues, active, coupled=actor_context_coupled)
                     print(f"  [{_ts()}] Session {sid[:8]} round={round_num} "
                           f"nudged actors (idle={idle_rounds})", flush=True)
                 elif idle_rounds > 1:
