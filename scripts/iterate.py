@@ -23,6 +23,15 @@ The base model is the *fixed* KL anchor across all iters (LoRA's
 `disable_adapter()` recovers it for free) so drift does not compound.
 Each iter starts a fresh LoRA on the merged base.
 
+Disk hygiene — "one merged per epoch": after each iter exports its
+merged/ (~19 GB on Qwen3.5-9B), the *previous* iter's merged/ is
+deleted unless that previous iter sat on an epoch boundary
+(iter % len(base_shards) == 0).  So at any given time the data tree
+holds: every completed epoch's final merged + the in-flight iter's
+merged.  Without this iterate.py would accumulate
+`total_epochs × base_shards × 19 GB` per cell — easy to fill an
+A100-class disk inside one cell.
+
 Resume: re-invoking the same command picks up where things left off.
 Each sub-step is idempotent — it skips when its output already exists.
 
@@ -161,12 +170,41 @@ def export_step(ckpt_dir: Path, run_dir: Path, num_gpus: int) -> Path:
 def prune_sharded_ckpt(ckpt_dir: Path) -> None:
     """Delete step_* directories once the merged export succeeds.
 
-    Saves ~51 GB per iteration; the merged/ folder has everything we
-    need for the next iteration's vLLM rollout and as a KL reference.
+    Saves ~51 GB per iter; the merged/ folder has everything we
+    need for the next iter's vLLM rollout and as a KL reference.
     """
     for d in ckpt_dir.glob("step_*"):
         shutil.rmtree(d, ignore_errors=True)
     print(f"  Pruned sharded checkpoints in {ckpt_dir}", flush=True)
+
+
+def prune_old_merged(name_prefix: str, current_iter: int,
+                     base_shards_count: int) -> None:
+    """Delete the previous iter's merged/ unless it sits on an epoch boundary.
+
+    "One merged per epoch" rule: across the chain
+        iter 1, 2, 3, 4 (epoch 1 final), 5, 6, 7, 8 (epoch 2 final), …
+    we always keep:
+      * the *current* iter's merged (vLLM serves it next iter),
+      * every epoch boundary's merged (iter % base_shards_count == 0),
+    and delete everything in between.  Each merged is ~19 GB on
+    Qwen3.5-9B, so without this iterate.py would accumulate `total_iters
+    × 19 GB` per cell — exhausting an A100-class disk inside one cell.
+    """
+    if current_iter <= 1:
+        return
+    prev = current_iter - 1
+    if prev % base_shards_count == 0:
+        return  # previous iter was an epoch boundary — preserve it
+    prev_run = _find_existing_run_dir(f"{name_prefix}_iter{prev:02d}")
+    if prev_run is None:
+        return
+    merged = prev_run / "merged"
+    if merged.is_dir():
+        shutil.rmtree(merged, ignore_errors=True)
+        print(f"  Pruned old merged: {prev_run.name}/merged "
+              f"(intermediate iter; epoch boundary preserved elsewhere)",
+              flush=True)
 
 
 def metrics_step(train_jsonl: Path, run_dir: Path) -> dict:
@@ -263,8 +301,9 @@ def _is_merged_complete(merged_dir: Path) -> bool:
 
 def run_one_iteration(iter_n: int, total: int, shard: str,
                       actor_model: str, train_anchor_model: str,
-                      name_prefix: str, cfg: dict,
-                      train_extra: list[str], do_eval: bool) -> tuple[str, dict]:
+                      name_prefix: str, cfg: dict, train_extra: list[str],
+                      do_eval: bool, base_shards_count: int = 1
+                      ) -> tuple[str, dict]:
     """One full iteration: rollout → extract → train (LoRA) → export → eval.
 
     Each step is idempotent: if its output already exists from a prior
@@ -273,8 +312,12 @@ def run_one_iteration(iter_n: int, total: int, shard: str,
 
     `actor_model` is what vLLM serves to Parliament for data collection.
     `train_anchor_model` is the *fixed* base used both as `--model` and
-    `--ref-model`; this never changes across iterations so the KL anchor
+    `--ref-model`; this never changes across iters so the KL anchor
     stays referenced to the original Qwen3.5-9B checkpoint.
+
+    `base_shards_count` is the size of the un-repeated shard list. Used
+    to decide which iters lie on epoch boundaries so we keep their
+    merged/ checkpoint and prune the intermediate ones.
     """
     t0 = time.time()
     name = f"{name_prefix}_iter{iter_n:02d}"
@@ -329,6 +372,9 @@ def run_one_iteration(iter_n: int, total: int, shard: str,
     else:
         merged = export_step(ckpt_dir, run_dir, num_gpus)
     prune_sharded_ckpt(ckpt_dir)
+    # Drop the previous iter's merged unless it's an epoch boundary —
+    # one merged per epoch + the current one is all we need on disk.
+    prune_old_merged(name_prefix, iter_n, base_shards_count)
 
     acc = eval_step(str(merged), run_dir, eval_gpu) if do_eval else None
     dur = (time.time() - t0) / 60
@@ -507,7 +553,8 @@ def main() -> None:
             actor_model=state["current_model"],
             train_anchor_model=state["base_model"],
             name_prefix=args.name, cfg=cfg, train_extra=train_extra,
-            do_eval=not args.no_eval)
+            do_eval=not args.no_eval,
+            base_shards_count=len(base_shards))
         state = {
             **state,
             "completed": i,
