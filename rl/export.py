@@ -97,7 +97,9 @@ def export_lora(ckpt_dir: Path, out_dir: Path, model_path: str,
     (out_dir / "rl_meta.json").write_text(json.dumps({
         "exported_from": str(ckpt_dir),
         "rl_step": meta["step"],
-        "rl_epoch": meta["epoch"],
+        # Read new "ppo_epoch" key first, fall back to legacy "epoch"
+        # so already-exported pre-rename ckpts still merge cleanly.
+        "rl_ppo_epoch": meta.get("ppo_epoch", meta.get("epoch", 0)),
         "mode": "lora_merged",
     }, indent=2))
     print(f"Exported → {out_dir}")
@@ -133,7 +135,7 @@ def export_fsdp(ckpt_dir: Path, out_dir: Path, model_path: str,
         (out_dir / "rl_meta.json").write_text(json.dumps({
             "exported_from": str(ckpt_dir),
             "rl_step": meta["step"],
-            "rl_epoch": meta["epoch"],
+            "rl_ppo_epoch": meta.get("ppo_epoch", meta.get("epoch", 0)),
             "mode": "fsdp_full",
         }, indent=2))
         acc.print(f"Exported → {out_dir}")

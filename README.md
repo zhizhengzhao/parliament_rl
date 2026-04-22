@@ -28,16 +28,26 @@ python scripts/iterate.py \
 datasets/sciencepedia_train_part2.json,\
 datasets/sciencepedia_train_part3.json,\
 datasets/sciencepedia_train_part4.json \
+  --total-epochs 2 \
+  --train-extra "--ppo-epochs 2" \
   --gpus 0,1,2,3,4,5,6,7
 ```
 
-Each iteration does
+Three nested loops (verl-aligned, see [`docs/00_naming.md`](docs/00_naming.md)):
+
+| level | name | knob | example |
+|---|---|---|---|
+| outer | **total_epoch** | `--total-epochs N` | shard list runs `N` times |
+| middle | **iter** | one per shard per epoch | sample → train → export |
+| inner | **ppo_epoch** | `--train-extra "--ppo-epochs N"` | passes through `train.jsonl` |
+
+Each iter does
 
 ```
 vLLM + Parliament + harness  →  parliament.db
          rl/extract            →  train.jsonl
-         rl/train              →  sharded checkpoint
-         rl/export             →  merged HF folder (next iteration's policy)
+         rl/train              →  sharded checkpoint  (loops `ppo_epochs` times)
+         rl/export             →  merged HF folder (next iter's policy)
 ```
 
 For a single-shot data collection without training, use
@@ -74,10 +84,10 @@ parliament_rl/
 | script | purpose | typical wall time |
 |---|---|---|
 | `scripts/run.py` | one-shot data collection (cleanup → vLLM → Parliament → harness) | ~6-9 h for 1 026 questions on 8 GPU |
-| `scripts/iterate.py` | sample → extract → train → export → repeat across shards | ~8-10 h per iteration |
+| `scripts/iterate.py` | sample → extract → train → export → repeat across shards × `total_epochs` | ~1.5 h per iter (mid200), ~8-10 h per iter (full shard) |
 | `scripts/sample_dataset.py` | split a full dataset by depth-5 category | seconds |
 | `python -m rl.extract` | `parliament.db` → `train.jsonl` (per-actor trajectories) | ~1 min per shard |
-| `python -m rl.train` (via `accelerate launch`) | DDP + LoRA offline RL (RWR + KL) | ~1 h per epoch for ~10 k turns on 8 GPU |
+| `python -m rl.train` (via `accelerate launch`) | DDP + LoRA offline RL (RWR + KL) | ~1 h per ppo_epoch for ~10 k turns on 8 GPU |
 | `python -m rl.export` | LoRA → merged HF directory (vLLM-loadable) | ~3 min |
 | `python -m eval.gpqa` | GPQA Diamond zero-shot CoT accuracy (thinking mode) | ~15 min/model on 1 × A100 |
 | `python -m eval.sciencepedia_mc` | held-out 100 multiple-choice questions (disjoint from train) | ~10 min/model |
@@ -112,8 +122,9 @@ as CLI flags:
   `--advantage-clip 2.0` clamps per-turn advantages to ±2.
   `--max-seq-len 8192` sets the truncation boundary (over-length
   trajectories are cut at the nearest user-turn edge).
-- **Per-iteration overrides**: `scripts/iterate.py --train-extra "--num-epochs
-  1 --beta-kl 0.01"` forwards flags to every iteration's trainer.
+- **Per-iter overrides**: `scripts/iterate.py --train-extra "--ppo-epochs 1
+  --beta-kl 0.01"` forwards flags to every iter's trainer (verl naming;
+  `--num-epochs` is kept as a deprecated alias).
 
 ## Dataset
 
@@ -122,7 +133,8 @@ reference solutions (smoke size, disjoint from train).
 
 `datasets/sciencepedia_train_part{1..4}.json` — 4 × 1 026 = 4 104
 problems, sampled uniformly over depth-5 Sciencepedia categories by
-`scripts/sample_dataset.py`. One shard per iteration.
+`scripts/sample_dataset.py`. One shard per iter; `--total-epochs N`
+runs the full shard list `N` times.
 
 `datasets/sciencepedia_heldout_mc100.json` — 100 multiple-choice
 problems (boxed letter answer) held out from both train and test.

@@ -62,16 +62,19 @@ naturally in one loop.
                                ▼
 ┌─── RL (data consumption) ───────────────────────────────────┐
 │                                                             │
-│  rl/extract.py   →  train.jsonl  (reward + advantage)       │
-│  rl/train.py     →  FSDP2 GRPO/RWR + ratio + KL → ckpt/     │
-│  rl/export.py    →  merged HF folder (for next iteration)   │
+│  rl/extract.py   →  train.jsonl  (per-actor trajectories)   │
+│  rl/train.py     →  DDP + LoRA + RWR + KL → ckpt/           │
+│  rl/export.py    →  merged HF folder (next iter's policy)   │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 `scripts/iterate.py` chains these two halves together over a sequence
-of dataset shards, so each iteration's rollouts are fresh against the
-latest policy.
+of dataset shards, so each iter's rollouts are fresh against the
+latest policy.  Three nested loops control how much you train:
+**total_epoch** (outer, full shard list) ⊃ **iter** (one shard) ⊃
+**ppo_epoch** (inner, passes through `train.jsonl`).  See
+[`00_naming.md`](00_naming.md) for the verl-aligned terminology.
 
 ## Research arc
 

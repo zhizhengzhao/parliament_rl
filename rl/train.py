@@ -15,11 +15,17 @@ the rollout actually saw, so any importance ratio against a logged
 "old log-prob" would be against the wrong distribution. Treat the data
 as off-policy and use the off-policy-correct objective: weighted
 regression. Multi-iteration safety comes from the KL anchor to base
-plus 4-iteration ReST-style data refresh in `scripts/iterate.py`.
+plus ReST-style data refresh across iters/total_epochs in `scripts/iterate.py`.
 
 Why token-level aggregation? `sum / mask.sum()` over the whole batch
 (DAPO-style) gives every response token equal weight. Per-sequence
 mean-then-batch-mean instead biases gradients toward short responses.
+
+Naming (verl-aligned, see docs/00_naming.md):
+    --ppo-epochs N   Passes through the same train.jsonl per iter.
+                     `--num-epochs` kept as deprecated alias.
+    Outer loops (`iter`, `total_epochs`) are owned by `scripts/iterate.py`;
+    this script trains one shard's data once, repeated `ppo_epochs` times.
 
 Usage (single-process smoke):
     python -m rl.train --data data/<run>/train.jsonl --output ckpts/run1
@@ -73,7 +79,10 @@ class TrainConfig:
 
     per_device_batch_size: int = 1
     grad_accum_steps: int = 16          # effective batch 128 on 8 GPUs
-    num_epochs: int = 2                 # 1-2 is plenty for RWR (no IS to keep "fresh")
+    # Number of passes through the same train.jsonl per `iterate.py` iteration.
+    # verl calls this `actor.ppo_epochs`; OpenRLHF `--max_epochs`.  1-2 is
+    # plenty for RWR (no IS to keep "fresh"); see docs/00_naming.md.
+    ppo_epochs: int = 2
     learning_rate: float = 1e-4         # LoRA default; lower (~1e-6) for full FT
     warmup_steps: int = 10
     weight_decay: float = 0.0           # RL fine-tuning doesn't benefit
@@ -305,7 +314,7 @@ class LengthGroupedSampler(Sampler):
     """Sort by token length, batch nearby lengths together, shuffle batches.
 
     Within each batch, sequences have similar length → minimal padding.
-    Batch order is shuffled each epoch to avoid ordering bias.
+    Batch order is shuffled each ppo epoch to avoid ordering bias.
     """
 
     def __init__(self, dataset: RLDataset, batch_size: int, seed: int = 42):
@@ -314,17 +323,17 @@ class LengthGroupedSampler(Sampler):
                                      key=lambda i: self.lengths[i])
         self.batch_size = batch_size
         self.seed = seed
-        self.epoch = 0
+        self.ppo_epoch = 0
 
     def __iter__(self):
         batches = [self.sorted_indices[i:i + self.batch_size]
                    for i in range(0, len(self.sorted_indices), self.batch_size)]
         g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
+        g.manual_seed(self.seed + self.ppo_epoch)
         order = torch.randperm(len(batches), generator=g).tolist()
         for idx in order:
             yield from batches[idx]
-        self.epoch += 1
+        self.ppo_epoch += 1
 
     def __len__(self):
         return len(self.sorted_indices)
@@ -427,7 +436,7 @@ def compute_loss(model, ref_model, batch: dict, beta_kl: float,
 # ── Checkpointing ────────────────────────────────────────
 
 def save_checkpoint(acc: Accelerator, model, optimizer, scheduler,
-                    step: int, epoch: int, cfg: TrainConfig,
+                    step: int, ppo_epoch: int, cfg: TrainConfig,
                     output_dir: Path) -> None:
     """Save a fully-resumable checkpoint.
 
@@ -451,7 +460,7 @@ def save_checkpoint(acc: Accelerator, model, optimizer, scheduler,
     else:
         acc.save_state(str(ckpt_dir))
     if acc.is_main_process:
-        meta = {"step": step, "epoch": epoch, "config": asdict(cfg)}
+        meta = {"step": step, "ppo_epoch": ppo_epoch, "config": asdict(cfg)}
         (ckpt_dir / "meta.json").write_text(json.dumps(meta, indent=2))
         acc.print(f"  saved checkpoint → {ckpt_dir}")
         if cfg.keep_last > 0:
@@ -465,7 +474,11 @@ def save_checkpoint(acc: Accelerator, model, optimizer, scheduler,
 
 def load_checkpoint(acc: Accelerator, model, optimizer, scheduler,
                     resume_dir: str, cfg: TrainConfig) -> tuple[int, int]:
-    """Restore from a checkpoint produced by `save_checkpoint`."""
+    """Restore from a checkpoint produced by `save_checkpoint`.
+
+    Returns ``(step, ppo_epoch)``.  Falls back to the legacy ``"epoch"``
+    meta key if a checkpoint was written before the rename.
+    """
     rd = Path(resume_dir)
     meta = json.loads((rd / "meta.json").read_text())
     if cfg.use_lora:
@@ -483,7 +496,7 @@ def load_checkpoint(acc: Accelerator, model, optimizer, scheduler,
     else:
         acc.load_state(resume_dir)
     acc.print(f"  resumed from {resume_dir} at step {meta['step']}")
-    return meta["step"], meta["epoch"]
+    return meta["step"], meta.get("ppo_epoch", meta.get("epoch", 0))
 
 
 # ── Model loading ────────────────────────────────────────
@@ -543,7 +556,12 @@ def parse_args() -> TrainConfig:
                    default=d["per_device_batch_size"].default)
     p.add_argument("--grad-accum-steps", type=int,
                    default=d["grad_accum_steps"].default)
-    p.add_argument("--num-epochs", type=int, default=d["num_epochs"].default)
+    # `ppo_epochs` follows verl's `actor.ppo_epochs`: number of passes
+    # through the same train.jsonl per iter.  `--num-epochs` kept as a
+    # deprecated alias so in-flight runs can still resume.
+    p.add_argument("--ppo-epochs", "--num-epochs", dest="ppo_epochs",
+                   type=int, default=d["ppo_epochs"].default,
+                   help="Passes through train.jsonl per iter (verl: ppo_epochs)")
     p.add_argument("--learning-rate", type=float,
                    default=d["learning_rate"].default)
     p.add_argument("--warmup-steps", type=int,
@@ -643,8 +661,8 @@ def main() -> None:
         lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
         betas=(0.9, 0.95),
     )
-    steps_per_epoch = math.ceil(len(loader) / cfg.grad_accum_steps)
-    total_steps = steps_per_epoch * cfg.num_epochs
+    steps_per_ppo_epoch = math.ceil(len(loader) / cfg.grad_accum_steps)
+    total_steps = steps_per_ppo_epoch * cfg.ppo_epochs
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=cfg.warmup_steps,
         num_training_steps=total_steps)
@@ -660,9 +678,9 @@ def main() -> None:
     # access inside the hot loop — avoids per-step `acc.unwrap_model()`.
     lora_unwrap = acc.unwrap_model(model) if cfg.use_lora else None
 
-    start_step = start_epoch = 0
+    start_step = start_ppo_epoch = 0
     if cfg.resume:
-        start_step, start_epoch = load_checkpoint(
+        start_step, start_ppo_epoch = load_checkpoint(
             acc, model, optimizer, scheduler, cfg.resume, cfg)
 
     # Training loop
@@ -673,7 +691,7 @@ def main() -> None:
     micro_count = 0
     micro_metrics: dict[str, float] = {}
 
-    for epoch in range(start_epoch, cfg.num_epochs):
+    for ppo_epoch in range(start_ppo_epoch, cfg.ppo_epochs):
         for batch in loader:
             with acc.accumulate(model):
                 loss, m = compute_loss(model, ref_model, batch,
@@ -694,7 +712,7 @@ def main() -> None:
                 if step % cfg.log_every == 0 and acc.is_main_process:
                     avg = {k: v / micro_count for k, v in micro_metrics.items()}
                     elapsed = time.time() - t0
-                    line = (f"step={step:5d} ep={epoch} "
+                    line = (f"step={step:5d} ppo_ep={ppo_epoch} "
                             f"pg={avg['pg_loss']:+.4f} "
                             f"kl={avg['kl_loss']:+.4f} "
                             f"L={avg['total']:+.4f} "
@@ -704,18 +722,18 @@ def main() -> None:
                             f"{elapsed:.0f}s")
                     acc.print(line)
                     metrics_log.write(json.dumps({
-                        "step": step, "epoch": epoch,
+                        "step": step, "ppo_epoch": ppo_epoch,
                         **avg, "lr": scheduler.get_last_lr()[0],
                         "elapsed_s": round(elapsed, 1),
                     }) + "\n")
                     metrics_log.flush()
                 if step % cfg.save_every == 0:
                     save_checkpoint(acc, model, optimizer, scheduler,
-                                    step, epoch, cfg, output_dir)
+                                    step, ppo_epoch, cfg, output_dir)
                 micro_metrics = {}
                 micro_count = 0
 
-    save_checkpoint(acc, model, optimizer, scheduler, step, epoch, cfg, output_dir)
+    save_checkpoint(acc, model, optimizer, scheduler, step, ppo_epoch, cfg, output_dir)
     if metrics_log:
         metrics_log.close()
     acc.print(f"\nTraining done. {step} optimizer steps in "

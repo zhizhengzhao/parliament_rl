@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """One-click iterative RL training (ReST-style).
 
-For each dataset shard, in order:
+Naming (verl-aligned, see docs/00_naming.md):
+    iter         One sample → train → export cycle on a single shard.
+    total_epoch  One full pass through the shard list.
+                 Repeating shards across epochs gives the policy a
+                 second chance at every shard with a stronger model.
+    ppo_epoch    Passes through the same train.jsonl in `rl.train`
+                 (forwarded as --train-extra "--ppo-epochs N").
+
+For each iter, in order:
 
     1. scripts/run.py  →  vLLM + Parliament + harness  →  parliament.db
     2. rl.extract      →  train.jsonl (per-actor trajectory)
@@ -9,11 +17,11 @@ For each dataset shard, in order:
     4. rl.train        →  ckpt/step_K  (DDP + LoRA + RWR + KL anchor)
     5. rl.export       →  merged/      (LoRA → base, vLLM-loadable)
     6. eval.gpqa       →  gpqa_diamond.json  (optional, --no-eval skips)
-    7. merged/ becomes the next iteration's actor policy
+    7. merged/ becomes the next iter's actor policy
 
-The base model is the *fixed* KL anchor across all iterations (LoRA's
+The base model is the *fixed* KL anchor across all iters (LoRA's
 `disable_adapter()` recovers it for free) so drift does not compound.
-Each iteration starts a fresh LoRA on the merged base.
+Each iter starts a fresh LoRA on the merged base.
 
 Resume: re-invoking the same command picks up where things left off.
 Each sub-step is idempotent — it skips when its output already exists.
@@ -27,6 +35,8 @@ Usage:
     python scripts/iterate.py \\
         --name run1 \\
         --shards datasets/part1.json,datasets/part2.json,... \\
+        --total-epochs 2 \\
+        --train-extra "--ppo-epochs 2" \\
         --gpus 0,1,2,3,4,5,6,7
 
 Stop: tmux kill-session -t parliament-iterate
@@ -169,10 +179,15 @@ def metrics_step(train_jsonl: Path, run_dir: Path) -> dict:
     """
     rewards: list[float] = []
     advs: list[float] = []
+    n_turns_total = 0
     for line in open(train_jsonl):
         s = json.loads(line)
-        rewards.append(float(s["reward"]))
-        advs.append(float(s["advantage"]))
+        # per-actor trajectory: each sample has lists of per-turn values
+        for r in s.get("turn_rewards", []):
+            rewards.append(float(r))
+        for a in s.get("turn_advantages", []):
+            advs.append(float(a))
+        n_turns_total += len(s.get("turn_rewards", []))
     if not rewards:
         return {}
 
@@ -180,7 +195,7 @@ def metrics_step(train_jsonl: Path, run_dir: Path) -> dict:
         return sorted(xs)[int(p * (len(xs) - 1))]
 
     summary = {
-        "n_samples": len(rewards),
+        "n_samples": n_turns_total,
         "reward_mean": sum(rewards) / len(rewards),
         "reward_pos_pct": 100 * sum(1 for r in rewards if r > 0) / len(rewards),
         "advantage_mean": sum(advs) / len(advs),
@@ -380,9 +395,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--actors", type=int, default=3)
     p.add_argument("--judges", type=int, default=3)
     p.add_argument("--max-turns", type=int, default=30)
+    # Outer loop over the full shard list.  verl's `trainer.total_epochs`.
+    # `--shards p1,p2,p3,p4 --total-epochs 2` runs 8 iters (each shard
+    # twice), each iter starting from the previous merged model so the
+    # second pass over `p1` learns from the iter-4 policy.
+    p.add_argument("--total-epochs", type=int, default=1,
+                   help="How many times to run through the shard list "
+                        "(verl: trainer.total_epochs). Default 1.")
     p.add_argument("--train-extra", default="",
                    help="Extra flags appended to rl.train, e.g. "
-                        "\"--num-epochs 1 --beta-kl 0.01\"")
+                        "\"--ppo-epochs 2 --beta-kl 0.01\"")
     p.add_argument("--no-eval", action="store_true",
                    help="Skip per-iteration GPQA eval (saves ~10 min/iter)")
     p.add_argument("--in-tmux", action="store_true",
@@ -397,17 +419,29 @@ def main() -> None:
         relaunch_in_tmux(sys.argv)
         return
 
-    shards = [s.strip() for s in args.shards.split(",") if s.strip()]
-    for s in shards:
+    base_shards = [s.strip() for s in args.shards.split(",") if s.strip()]
+    for s in base_shards:
         if not Path(s).exists():
             print(f"FATAL: shard not found: {s}")
             sys.exit(1)
+    # Outer loop: run the shard list `total_epochs` times.  We just
+    # repeat the list — each repetition becomes additional iters whose
+    # actor model is the previous iter's merged checkpoint, so the
+    # second pass over a shard already learns from the trained policy.
+    if args.total_epochs < 1:
+        print("FATAL: --total-epochs must be >= 1")
+        sys.exit(1)
+    shards = base_shards * args.total_epochs
 
     # Find-or-create the top-level run dir. We pick an existing one if
     # the name prefix already has a state.json so resume works.
-    existing = sorted((PROJECT_DIR / "data").glob(f"{args.name}_*"),
-                      key=lambda p: p.stat().st_mtime)
-    existing = [p for p in existing if (p / "state.json").exists()]
+    # Resume the most-recent top-level run dir, even if state.json hasn't
+    # been written yet (iter 1 may have crashed before the first save).
+    # We exclude per-iter dirs (they have "_iter" in the name).
+    existing = sorted(
+        (p for p in (PROJECT_DIR / "data").glob(f"{args.name}_*")
+         if "_iter" not in p.name and p.is_dir()),
+        key=lambda p: p.stat().st_mtime)
     if existing:
         out_dir = existing[-1]
         print(f"Resuming existing run: {out_dir}")
@@ -437,7 +471,10 @@ def main() -> None:
     print(f"Iterative RL (RWR + KL-to-base) — {args.name}")
     print(f"{'=' * 72}")
     print(f"  Output:           {out_dir}")
-    print(f"  Shards:           {len(shards)}")
+    print(f"  Shards (base):    {len(base_shards)}")
+    print(f"  Total epochs:     {args.total_epochs}  "
+          f"(verl: trainer.total_epochs)")
+    print(f"  Total iters:      {len(shards)}  (= shards × total_epochs)")
     print(f"  Base / KL anchor: {state['base_model']}")
     print(f"  Next actor:       {state['current_model']}")
     print(f"  Completed:        {state['completed']}/{len(shards)}")
@@ -461,6 +498,9 @@ def main() -> None:
         if i <= state["completed"]:
             print(f"Skipping iter {i} (already completed)")
             continue
+        # Which outer epoch (1-indexed) does this iter belong to?
+        # iter `i` over a base list of length B is in epoch ((i-1)//B + 1).
+        total_epoch = (i - 1) // len(base_shards) + 1
         merged, summary = run_one_iteration(
             i, len(shards), shard,
             actor_model=state["current_model"],
@@ -472,7 +512,7 @@ def main() -> None:
             "completed": i,
             "current_model": merged,
             "history": state["history"] + [{
-                "iter": i, "shard": shard,
+                "iter": i, "total_epoch": total_epoch, "shard": shard,
                 "merged": merged,
                 "timestamp": datetime.now().isoformat(),
                 "metrics": summary["metrics"],
@@ -484,14 +524,16 @@ def main() -> None:
 
     total_min = (time.time() - t_start) / 60
     print(f"\n{'=' * 72}")
-    print(f"All {len(shards)} iterations complete in {total_min:.0f} min.")
+    print(f"All {len(shards)} iters ({args.total_epochs} epoch(s) "
+          f"× {len(base_shards)} shards) complete in {total_min:.0f} min.")
     print(f"Final policy: {state['current_model']}")
     print(f"History:      {state_file}")
     if state.get("base_gpqa") is not None:
         print(f"\n  Base GPQA: {state['base_gpqa']:.4f}")
     for h in state["history"]:
         if h.get("gpqa_acc") is not None:
-            print(f"  Iter {h['iter']}: GPQA = {h['gpqa_acc']:.4f}  "
+            tag = f"ep{h.get('total_epoch', 1)}.iter{h['iter']}"
+            print(f"  {tag}: GPQA = {h['gpqa_acc']:.4f}  "
                   f"(data |A|̄ = {h['metrics'].get('advantage_abs_mean', 0):.3f})")
     print(f"{'=' * 72}\n")
 
