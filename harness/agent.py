@@ -1,13 +1,17 @@
 """Single agent loop — event-driven polling mode.
 
 Each agent runs in rounds. Within a round, the LLM can call python_exec
-and vote (actor) any number of times. The round ends when:
-  - Actor calls submit or wait  →  set_event (wakes runner)
-  - Judge calls vote            →  no set_event (silent)
+(plus `vote` in coupled mode) any number of times. The round ends when:
+  - Actor (coupled)     calls submit or wait  →  set_event (wakes runner)
+  - Actor (independent) calls submit or leave →  set_event (wakes runner)
+                                                  `leave` also retires
+                                                  the agent permanently
+  - Judge               calls vote             →  no event (silent)
 
-Between rounds the agent waits for new content via its queue. The queue
-only receives posts/comments (never vote-only batches), so no collection
-window is needed.
+Between rounds the agent blocks on its queue. Items pushed by the
+runner are batches of posts/comments/(anonymized)judge_votes for
+coupled actors, or just (anonymized)judge_votes for independent actors;
+a placeholder `str` may also be pushed to nudge a stalled actor.
 """
 
 from __future__ import annotations
@@ -213,7 +217,8 @@ async def _dispatch_one_tool(tc: dict, executor: ToolExecutor, role: str,
     Returns:
       (None, None)             — round continues
       ("submit", submit_args)  — actor finished by submit
-      ("wait", None)           — actor finished by wait
+      ("wait", None)           — actor (coupled) finished by wait
+      ("leave", None)          — actor (independent) retired permanently
       ("vote", None)           — judge finished by vote
     """
     fn_name = tc["function"]["name"]
@@ -497,6 +502,12 @@ async def _run_agent_inner(
                                        session_id=session_id),
     }]
 
+    coupled = bool(get_config().get("actor_context_coupled", True))
+    round_0_prompt = ("Parliament is empty. No one has posted yet. Begin."
+                      if coupled
+                      else "You are starting from a blank slate. "
+                           "Submit your first reasoning step.")
+
     start = time.time()
     round_num = 0
     while role != "actor" or round_num < max_rounds:
@@ -504,10 +515,7 @@ async def _run_agent_inner(
 
         if round_num == 0 and role == "actor":
             processing.add(name)
-            messages.append({
-                "role": "user",
-                "content": "Parliament is empty. No one has posted yet. Begin.",
-            })
+            messages.append({"role": "user", "content": round_0_prompt})
         else:
             wait_start = time.time()
             collected = await _wait_for_content(new_content_queue)

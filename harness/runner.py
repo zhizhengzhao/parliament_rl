@@ -281,7 +281,8 @@ def _print_session_summary(sid: str, gpu_port: str, dur: float,
                            results: list[AgentResult]) -> None:
     print(f"  [{_ts()}] Session {sid[:8]} done on :{gpu_port} "
           f"({dur:.0f}s)", flush=True)
-    icons = {"session_end": "+", "max_rounds": "M",
+    icons = {"session_end": "+", "max_rounds": "M", "left": "L",
+             "context_overflow": "X", "exception": "E",
              "llm_errors": "!", "step_limit": "S", "no_tool": "N"}
     for r in results:
         icon = icons.get(r.exit_reason, "?")
@@ -390,6 +391,15 @@ async def run_session(
                     actor_payload += [{**v, "author": ANONYMOUS_VOTER}
                                       for v in fetched.judge_votes]
                 _distribute(queues, tasks, actor_names, actor_payload)
+                # Independent mode: when nothing landed in the actor's
+                # queue (BlindSolo, or Solo with no fresh judge votes
+                # this round), nudge so the actor doesn't burn 60 s on
+                # an empty queue waiting for peers that don't exist.
+                if not actor_context_coupled and not actor_payload:
+                    _nudge_actors(
+                        queues,
+                        [n for n in actor_names if not tasks[n].done()],
+                        coupled=False)
 
                 idle_rounds = 0
                 print(f"  [{_ts()}] Session {sid[:8]} round={round_num} "

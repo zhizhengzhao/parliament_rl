@@ -90,5 +90,15 @@ latest policy.  Three nested loops control how much you train:
   version of the same paradigm; Parliament is set up to flip the
   Judge off by simply running with `--judges 0`.
 
-Further reading: see `docs/02_parliament.md` for the Parliament/harness
-architecture, and `docs/03_rl.md` for the RL pipeline details.
+- **2×2 ablation — coupling × judge visibility.** Two orthogonal axes
+  (do actors see each other's posts? do they see judge votes?) yield
+  four cells that isolate the contributions of multi-agent coupling
+  and online judge steering. The default cell (`Parliament`) is
+  multi-agent + visible-judge; flipping either axis at launch via
+  `PRL_CONTEXT` / `PRL_JUDGE_VOTES_VISIBLE` gives the other three.
+
+Further reading:
+- [`02_parliament.md`](02_parliament.md) — Parliament/harness architecture
+- [`03_rl.md`](03_rl.md) — RL pipeline details
+- [`00_naming.md`](00_naming.md) — total_epoch / iter / ppo_epoch terminology
+- [`04_2x2_design.md`](04_2x2_design.md) — 2×2 ablation cells

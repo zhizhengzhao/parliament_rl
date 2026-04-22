@@ -61,7 +61,7 @@ import torch.nn.functional as F
 from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.utils import set_seed
 from peft import LoraConfig, get_peft_model
-from torch.utils.data import BatchSampler, DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -94,7 +94,9 @@ class TrainConfig:
     # being suffocated.  Monitor `kl` column in metrics.jsonl.
     beta_kl: float = 0.02
     advantage_clip: float = 2.0         # clamp |A| per turn to ±this
-    max_seq_len: int = 8192             # 0 = no limit; >0 drops longer samples
+    # 0 = no truncation; >0 = clean truncation at the nearest user-turn
+    # boundary so the cut never splits an assistant response.
+    max_seq_len: int = 8192
 
     # LoRA (DDP-friendly; base doubles as π_ref via `disable_adapter()`).
     # r=32 / α=64 on 9B is the sweet spot — larger r over-parameterizes
@@ -575,7 +577,8 @@ def parse_args() -> TrainConfig:
                    default=d["advantage_clip"].default,
                    help="Clamp |advantage| ≤ this (set 0 to disable)")
     p.add_argument("--max-seq-len", type=int, default=d["max_seq_len"].default,
-                   help="Drop samples longer than this (0 = keep all). "
+                   help="Truncate over-length samples at the nearest "
+                        "user-turn boundary (0 = keep full length). "
                         "Safety valve against OOM on extreme outliers.")
     p.add_argument("--use-lora", action=argparse.BooleanOptionalAction,
                    default=d["use_lora"].default,

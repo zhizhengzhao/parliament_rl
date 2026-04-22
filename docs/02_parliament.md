@@ -92,16 +92,24 @@ sessions on the same problem almost never look alike.
 
 ## Tools per role
 
-| tool | Actor | Judge | ends round? | wakes runner? |
-|---|:-:|:-:|:-:|:-:|
-| `python_exec` | ✓ | ✓ | no | no |
-| `vote` | ±1 only | ±1..±3 | no (actor) / yes (judge) | no |
-| `submit` | ✓ | ✗ | yes | yes |
-| `wait` | ✓ | ✗ | yes | yes |
+The actor tool set switches with the 2×2 cell (see [`04_2x2_design.md`](04_2x2_design.md));
+judge tools are identical in every cell.
 
-Argument validation is enforced in both the tool schema (for the LLM)
-and in `ToolExecutor` (server-side): the Actor's vote range is
-hard-capped at ±1 regardless of what the LLM tries to output.
+| tool | Coupled actor | Independent actor | Judge | ends round? | wakes runner? |
+|---|:-:|:-:|:-:|:-:|:-:|
+| `python_exec` | ✓ | ✓ | ✓ | no | no |
+| `vote` | ±1 only | — | ±1..±3 | no (actor) / yes (judge) | no |
+| `submit(comments, post)` | ✓ | — | ✗ | yes | yes |
+| `submit(step)` | — | ✓ | ✗ | yes | yes |
+| `wait` | ✓ | — | ✗ | yes | yes |
+| `leave` | — | ✓ | ✗ | yes (and retires) | yes |
+
+`submit(step)` is the same wire-level call as `submit(post)` — the
+LLM-facing argument name is the only difference; both end up writing
+a row to the same `posts` table. Argument validation is enforced in
+both the tool schema (for the LLM) and in `ToolExecutor` (server-side):
+the Actor's vote range is hard-capped at ±1 regardless of what the
+LLM tries to output.
 
 `python_exec` runs in an isolated subprocess with a 10-second timeout.
 Output is truncated at 10 k characters so a runaway `print` loop can't

@@ -1,38 +1,30 @@
 # TODO
 
-## Done
+Live list of work that is **not yet implemented in `main`**. Anything
+"done" lives in [`README.md`](README.md) + [`docs/`](docs/) and is no
+longer tracked here.
 
-### Parliament & harness (data generation)
-- FastAPI + SQLite server, per-request interaction log, Judge role-level permissions
-- Web UI (forum + timeline, score sort, KaTeX math)
-- One-click pipeline (`scripts/run.py`): cleanup → parallel vLLM → Parliament → harness → cleanup
-- Event-driven runner with split actor/judge processing sets, idle detection, queue drain
-- Four actor tools (`python_exec` / `vote` / `submit` / `wait`) and two judge tools; vote range enforced server- and client-side
-- Defensive parameter coercion (comment ↔ comments, JSON-in-string, embedded votes), fallback tool-call parser, no-tool resample, all with explicit model-facing feedback
-- Subprocess-isolated `python_exec` (10 s timeout, 10 k-char truncation)
-- `force_close` TCP to eliminate keep-alive races during long LLM calls
-- Per-session deterministic anonymization: 406-name pool + 100-persona scientist + 60-persona judge pools, single-sample sort-without-replacement guarantees no intra-session collision
-- Judge vote anonymization (`judge_votes_visible` toggle, default on)
+## Open
 
-### RL pipeline
-- `rl/extract.py`: parliament.db → training JSONL
-  - natural-language context with score-annotated headers
-  - session-seeded name mapping (single source of truth via `harness.prompts.assign_session_names`)
-  - automatic score-visibility detection (kept only in sessions whose content meta-references scoring)
-  - configurable advantage: `advantage_baseline` × `advantage_scale` combinations (session/global/constant)
-  - judge-only reward (actor votes visible as context signal, don't bias reward)
-  - streaming vote fold, `O((P+C+V)·log V)`
-- `rl/train.py`: single-file FSDP2 offline RL trainer
-  - PPO ratio + clip (default on) or RWR (with `--no-use-ratio`)
-  - KL k3 estimator in fp32 with log-ratio clamp (BF16-stable)
-  - grad clip, advantage clip, weight decay, cosine + warmup schedule
-  - sharded checkpoint save/load, `--keep-last N` rotation
-  - clean distributed shutdown (avoids NCCL teardown hang)
-- `rl/export.py`: sharded FSDP → merged HF folder (vLLM-loadable for next iteration)
-- `scripts/iterate.py`: multi-shard sample → train → export → repeat loop with state-file resume
+### Infra
+- [ ] Per-iter held-out eval at the end of `iterate.py` (currently
+      `--no-eval` skips it; the GPQA eval at iter boundaries works
+      but doubles wall time on small shards — needs a cheaper eval
+      hook, perhaps `eval/sciencepedia_mc.py` on a 50-question subset).
+- [ ] Wandb / TensorBoard hook in `rl/train.py` (today: `metrics.jsonl`
+      only). Single optional dependency; gated by `--wandb` flag.
+- [ ] Compare resuming-from-merged vs. resuming-from-LoRA-adapter
+      across `total_epochs` (current: always merges, so the second
+      pass loses optimizer state that a kept LoRA could restore).
 
-## Next
-- Run the full 4-shard iterative training (`scripts/iterate.py --shards part1..4`, ~54 h on 8 × A100)
-- Evaluate each iteration's policy on the held-out `sciencepedia_test.json` (100 problems)
-- Direction 2 exploration: `--judges 0` runs (pure peer-review, no ground-truth anchor)
-- Optional: install `flash-linear-attention` + `causal-conv1d` to accelerate Qwen3.5's hybrid-attention layers (~2–3× speedup, currently using torch fallback)
+### Experiments to run
+- [ ] Held-out GPQA Diamond + Sciencepedia-MC sweep on the existing
+      `mid200_S{1,2,3}` final checkpoints (compares the three
+      hyper-parameter cells head-to-head against base).
+- [ ] **2×2 ablation** smoke check on each cell using `mid40` data
+      (Parliament / BlindParliament / Solo / BlindSolo); see
+      [`docs/04_2x2_design.md`](docs/04_2x2_design.md) for the four
+      launch commands.
+- [ ] Direction 2 (peer-review-only): `--judges 0` runs as the
+      vote-only baseline; needs a separate reward-extraction path
+      (current `extract.py` requires judge votes).

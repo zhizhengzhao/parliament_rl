@@ -308,11 +308,12 @@ def run_one_iteration(iter_n: int, total: int, shard: str,
 
     # Step 3 — Train (resumable: pass --resume to last step_* if any).
     ckpt_dir = run_dir / "ckpt"
-    last_step = max(
-        (int(p.name.split("_")[1]) for p in ckpt_dir.glob("step_*")
-         if p.name.split("_")[1].isdigit()),
-        default=0,
-    )
+    step_dirs = []
+    for p in ckpt_dir.glob("step_*"):
+        suffix = p.name.split("_", 1)[1]
+        if suffix.isdigit():
+            step_dirs.append(int(suffix))
+    last_step = max(step_dirs, default=0)
     extra = list(train_extra)
     if last_step > 0:
         resume_path = ckpt_dir / f"step_{last_step}"

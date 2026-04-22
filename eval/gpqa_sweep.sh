@@ -1,5 +1,9 @@
 #!/bin/bash
-# Sweep base + every iteration's merged policy through eval/gpqa.py.
+# Sweep base + every iter's merged policy through eval/gpqa.py.
+#
+# `--subset` here is forwarded as `eval/gpqa.py --data`, so it accepts
+# either a HF subset name (`gpqa_diamond` | `gpqa_main` | `gpqa_extended`)
+# or a path to a local CSV.
 #
 # Usage:
 #   eval/gpqa_sweep.sh --name nrun_v1                    # required
@@ -78,7 +82,7 @@ for pair in "${PAIRS[@]}"; do
   CUDA_VISIBLE_DEVICES=$GPU python -m eval.gpqa \
     --model "$model" \
     --output "$out" \
-    --subset "$SUBSET" \
+    --data "$SUBSET" \
     --n "$N" \
     --temperature "$TEMP" \
     "${EXTRA[@]}"

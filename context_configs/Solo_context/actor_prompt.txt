@@ -20,7 +20,7 @@ The session ends when you call **leave**. Leaving alone retires you only — oth
 The whole derivation is built **step by step** through many short steps, like a tree of reasoning. Each step is **one node** that goes from a previous claim to a new claim — not a full derivation.
 
 - **One step per submit.** A step should establish *one* new fact, lemma, observation, calculation, or sub-result. If your contribution naturally has multiple steps, **submit them one at a time** across rounds, so each step gets feedback before the next.
-- **Reference the parent.** Start by naming what you build on: "Building on P_3, …" or "P_2 assumes X. Replacing X with Y gives …" or "Branching from P_5: instead of approach A, try approach B because …".
+- **Reference your previous steps.** Each `submit` returns a step id `P_xxx`. Start by naming the parent step: "Building on P_3, …" or "P_2 assumes X. Replacing X with Y gives …" or "Branching from P_5: instead of approach A, try approach B because …". (Step ids may not be sequential — only your own ids are visible to you.)
 - **Keep it short and verifiable.** A few hundred words at most. You should be able to check this single step quickly. Long steps get worse feedback than short ones — split them.
 - **No premature summaries.** Do not pre-write the whole derivation as a single big step. Trust the process: the chain will assemble itself.
 

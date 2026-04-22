@@ -1,22 +1,38 @@
 #!/usr/bin/env python3
 """Extract RL training data from parliament.db.
 
-Each actor post becomes one training sample. We reconstruct the actor's
-first-person view at the moment of posting:
+One training sample = one actor's complete multi-turn trajectory in
+one session.  The chat alternates between user (problem + intervening
+discussion) and assistant (this actor's posts), so each sample contains
+several reward-bearing assistant turns:
 
-  user message  = problem + full prior discussion (posts + comments,
-                  optionally annotated with cumulative scores)
-                  + [you] markers on the actor's own contributions
-  assistant msg = the actual post content
-  reward        = sum of judge votes on this post (judges only)
-  advantage     = (reward - baseline) / scale, both configurable
+  user      problem + initial context
+  assistant actor's 1st post
+  user      what other agents posted/commented/voted on since
+  assistant actor's 2nd post
+  …
 
-All content is natural language — no JSON, no tool calls, no agent-specific
-formatting. The goal is to train scientific reasoning, not agent behavior.
+Per-turn rewards / advantages live in `turn_rewards` / `turn_advantages`
+arrays alongside the messages; `rl/train.py` broadcasts each advantage
+to the matching assistant-turn tokens via segment masks.
 
-Identity is anonymized with a per-session draw from a name pool, and score
-annotations are kept only in sessions that actually meta-reference
-Parliament scoring. Both behaviors are controlled by `RL_context/config.json`.
+  reward     = sum of judge votes on the actor's post (judges only)
+  position   debias linearly removed before normalization (later posts
+             tend to score higher; we don't want the model to learn
+             "post late = good")
+  advantage  = (debiased_reward - baseline) / scale, both configurable
+             (default mean_session / session_std → classic GRPO)
+
+All content is natural language — no JSON, no tool calls, no
+agent-specific formatting. The goal is to train scientific reasoning,
+not agent behavior. Identity is anonymized with a per-session draw
+from the name pool, and score annotations are kept only in sessions
+that actually meta-reference Parliament scoring. Both behaviours are
+controlled by `RL_context/config.json`.
+
+Works for every 2×2 cell unchanged — independent (Solo) sessions
+simply produce trajectories whose intervening user turns contain
+only judge votes (or "No new discussion. Continue.").
 
 Usage:
     python -m rl.extract --db data/run/parliament.db --output data/run/train.jsonl
@@ -455,8 +471,8 @@ def _session_std(values: list[float]) -> float:
     return var ** 0.5
 
 
-def _estimate_position_slope(rewards_per_session: dict[str, dict[int, float]],
-                             positions: dict[int, float]) -> float:
+def _estimate_position_slope(
+        rewards_per_session: dict[str, dict[int, float]]) -> float:
     """Estimate the linear reward-vs-position slope from all data.
 
     Later posts tend to score higher (they build on prior discussion).
@@ -495,7 +511,7 @@ def debias_position(rewards_per_session: dict[str, dict[int, float]],
     midpoint) the correction is zero; early posts are boosted, late posts
     are reduced.
     """
-    slope = _estimate_position_slope(rewards_per_session, positions)
+    slope = _estimate_position_slope(rewards_per_session)
     if abs(slope) < 0.01:
         return rewards_per_session
     debiased: dict[str, dict[int, float]] = {}
