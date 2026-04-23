@@ -540,6 +540,11 @@ async def _run_agent_inner(
         if role != "judge":
             submit_event.set()
 
+        # Count this as a round regardless of success so that repeated
+        # LLM errors (round_result is None) can't keep an actor looping
+        # forever — `max_rounds` is an upper bound on *attempts*.
+        round_num += 1
+
         if round_result is None:
             if result.exit_reason == "context_overflow":
                 break
@@ -550,8 +555,6 @@ async def _run_agent_inner(
         if isinstance(round_result, dict) and round_result.get("_action") == "leave":
             result.exit_reason = "left"
             break
-
-        round_num += 1
 
     await executor.leave(result.exit_reason or "completed")
     processing.discard(name)

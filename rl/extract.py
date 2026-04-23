@@ -540,7 +540,7 @@ def compute_advantages(rewards_per_session: dict[str, dict[int, float]]
       advantage_scale:
         "session_std"      → per-session std (default; standard GRPO)
         "global_std"       → dataset std (REINFORCE++-style)
-        "none" / 1.0       → raw reward-weighted regression
+        "none" / 1.0       → no rescaling (raw reward as advantage)
         <any number>       → fixed constant
 
     A near-zero session std (homogeneous session — every post got the
@@ -664,8 +664,8 @@ def main() -> None:
     print(f"  Scores kept in:  {score_kept_sessions} sessions "
           f"(rest had no meta-reference)")
     print(f"  Anonymized:      {cfg().get('anonymize_identity', False)}")
-    print(f"  Advantage:       baseline={cfg().get('advantage_baseline', 0)}, "
-          f"scale={cfg().get('advantage_scale', 'global_std')}")
+    print(f"  Advantage:       baseline={cfg().get('advantage_baseline', 0.0)}, "
+          f"scale={cfg().get('advantage_scale', 'session_std')}")
     print(f"  Output:          {args.output}")
 
 

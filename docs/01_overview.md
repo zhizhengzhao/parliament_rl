@@ -63,16 +63,17 @@ naturally in one loop.
 ┌─── RL (data consumption) ───────────────────────────────────┐
 │                                                             │
 │  rl/extract.py   →  train.jsonl  (per-actor trajectories)   │
-│  rl/train.py     →  DDP + LoRA + RWR + KL → ckpt/           │
+│  rl/train.py     →  DDP + LoRA + PPO clip + KL → ckpt/      │
 │  rl/export.py    →  merged HF folder (next iter's policy)   │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-`scripts/iterate.py` chains these two halves together over a sequence
-of dataset shards, so each iter's rollouts are fresh against the
-latest policy.  Three nested loops control how much you train:
-**total_epoch** (outer, full shard list) ⊃ **iter** (one shard) ⊃
+`scripts/iterate.py` chains these two halves together over a
+deterministic draw from the question pool, so each iter's rollouts are
+fresh against the latest policy.  Three nested loops control how much
+you train:
+**total_epoch** (outer, cycle the draw) ⊃ **iter** (one sampling round) ⊃
 **ppo_epoch** (inner, passes through `train.jsonl`).  See
 [`00_naming.md`](00_naming.md) for the verl-aligned terminology.
 

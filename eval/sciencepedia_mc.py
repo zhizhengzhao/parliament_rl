@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Sciencepedia held-out multiple-choice evaluation (Qwen3.5 thinking mode).
 
-Filters `datasets/sciencepedia_test.json` to only multiple-choice questions
-(those whose `answer` matches `\\boxed{A|B|C|D}`), runs each through a local
-vLLM with `enable_thinking=True`, parses the model's final boxed letter
-(or "answer is (X)" fallback), and reports accuracy.
+Runs the pre-built 100-question held-out MC set
+(`datasets/sciencepedia_heldout_mc100.json`) through a local vLLM with
+`enable_thinking=True`, parses the model's final boxed letter (or
+"answer is (X)" fallback), and reports accuracy.  Can also be pointed
+at a raw Sciencepedia file via `--data`; in that case it extracts the
+MC subset on the fly by filtering for `\\boxed{A|B|C|D}` answers.
 
-Why filter MC only:
-  Sciencepedia has free-form answers (formulas, numbers, lists) that are
-  hard to autograde. The boxed-letter subset (~14% of test set) is a
-  clean check that the model picks the right option after CoT reasoning.
+Why MC only:
+  Sciencepedia has free-form answers (formulas, numbers, lists) that
+  are hard to autograde.  The boxed-letter subset is a clean check
+  that the model picks the right option after CoT reasoning.
 
 Usage:
     python -m eval.sciencepedia_mc \\
@@ -78,7 +80,9 @@ def main() -> None:
         description="Sciencepedia held-out MC eval (thinking mode).")
     p.add_argument("--model", required=True, help="Local path or HF hub id")
     p.add_argument("--data", default=str(DEFAULT_TEST),
-                   help="Path to sciencepedia_test.json")
+                   help="Path to a Sciencepedia JSON; defaults to the "
+                        "held-out MC100 subset.  Non-MC rows are filtered "
+                        "out automatically (by detecting \\boxed{A-D}).")
     p.add_argument("--output", required=True, help="JSON result path")
     p.add_argument("--max-tokens", type=int, default=8192,
                    help="Thinking mode generates long reasoning blocks.")

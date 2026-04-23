@@ -1,11 +1,14 @@
 """Tool definitions and execution for Parliament agents.
 
-Two actor tool sets, switched by `PRL_CONTEXT`:
+Two actor tool sets, selected by the `actor_context_coupled` flag in
+the active context's `config.json` (which is itself selected by the
+`PRL_CONTEXT` env var — "Parliament" by default, "Solo" for the
+independent cells):
 
-  Coupled  (Parliament_context, default):
+  Coupled  (Parliament_context, `actor_context_coupled: true`):
       python_exec, vote, submit(comments, post), wait
       ↳ collaborative — vote on peers, comment, wait for new content
-  Independent (Solo_context):
+  Independent (Solo_context, `actor_context_coupled: false`):
       python_exec, submit(step), leave
       ↳ solo derivation — no peers to react to, exits with `leave`
 

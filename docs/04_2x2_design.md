@@ -22,22 +22,39 @@ four cells. Only the actor side differs:
 Two environment variables control the cell. Defaults give cell A
 (Parliament).
 
+The rest of the command is **identical across all four cells** — same
+`--pool`, `--total-questions`, `--sampling-batch-size`, `--seed`,
+`--total-epochs`, `--train-extra` — so every cell sees exactly the
+same deterministic question schedule and the same training
+hyperparameters.  The only flags that vary are the two env vars:
+
 ```bash
-# A — Parliament (default, current main experiment)
-python scripts/iterate.py --name cellA ...
+COMMON='--pool datasets/sciencepedia_train_part1.json,\
+datasets/sciencepedia_train_part2.json,\
+datasets/sciencepedia_train_part3.json,\
+datasets/sciencepedia_train_part4.json \
+  --total-questions 1000 --sampling-batch-size 200 \
+  --total-epochs 2 --seed 42 \
+  --train-extra "--ppo-epochs 2 --clip-ratio-high 0.25 --beta-kl 0.005 \
+                 --lora-r 64 --lora-alpha 128" \
+  --gpus 0,1,2,3,4,5,6,7'
 
-# B — BlindParliament
-PRL_JUDGE_VOTES_VISIBLE=0 python scripts/iterate.py --name cellB ...
+# A — Parliament (defaults: coupled, judge-visible)
+python scripts/iterate.py --name mainA $COMMON
 
-# C — Solo
-PRL_CONTEXT=Solo python scripts/iterate.py --name cellC ...
+# B — BlindParliament (coupled, judge-hidden)
+PRL_JUDGE_VOTES_VISIBLE=0 python scripts/iterate.py --name mainB $COMMON
 
-# D — BlindSolo
-PRL_CONTEXT=Solo PRL_JUDGE_VOTES_VISIBLE=0 python scripts/iterate.py --name cellD ...
+# C — Solo (independent, judge-visible)
+PRL_CONTEXT=Solo python scripts/iterate.py --name mainC $COMMON
+
+# D — BlindSolo (independent, judge-hidden)
+PRL_CONTEXT=Solo PRL_JUDGE_VOTES_VISIBLE=0 \
+    python scripts/iterate.py --name mainD $COMMON
 ```
 
 Both env vars propagate through `iterate.py → scripts/run.py → harness/`
-naturally — no extra CLI plumbing needed.
+(via `scripts/_common.FORWARDED_ENV`) so no extra CLI plumbing needed.
 
 `PRL_JUDGE_VOTES_VISIBLE` accepted truthy values: anything except
 `""`, `0`, `false`, `no`, `off` (case-insensitive).
@@ -101,13 +118,15 @@ isomorphic by construction.
 
 | dimension | how identical |
 |---|---|
-| number of actors | same `--actors` flag |
-| number of judges | same `--judges` flag |
-| max rounds | same `--max-turns` flag, same `agent.max_rounds` |
+| **question schedule** | same `--pool` + `--total-questions` + `--sampling-batch-size` + `--seed` → literally the same batches at the same positions |
+| number of actors | same `--actors` |
+| number of judges | same `--judges` |
+| max rounds | same `--max-turns`, same `agent.max_rounds` |
 | token budget | same `MAX_TOKENS` (2048) |
 | reward source | same judge cohort, same scoring rubric |
 | advantage formula | `rl/extract.py` unchanged (mean_session + position debias) |
-| training loss | `rl/train.py` unchanged (RWR + KL anchor) |
+| training loss | `rl/train.py` unchanged (PPO clip + KL-to-base) |
+| PPO hyperparams | same `--ppo-epochs`, `--clip-ratio-low/high`, `--beta-kl` |
 | trajectory format | per-actor multi-turn chat in all cells |
 | KL anchor | base model fixed across iters in every cell |
 
@@ -129,17 +148,26 @@ The only intended difference is the **actor's information access**.
 
 ## Minimal smoke check
 
+Run a tiny end-to-end iter (50 q / 10 per round / 1 epoch / 1 ppo_epoch)
+with one cell's flags to sanity-check the full pipeline:
+
 ```bash
-PRL_CONTEXT=Solo  PRL_JUDGE_VOTES_VISIBLE=0  python scripts/run.py \
-    --gpus 0,1 --sessions-per-gpu 1 --actors 3 --judges 3 \
-    --dataset datasets/mini40_part1.json --name cellD_smoke
+PRL_CONTEXT=Solo  PRL_JUDGE_VOTES_VISIBLE=0  \
+python scripts/iterate.py \
+    --name smoke_D \
+    --pool datasets/sciencepedia_test.json \
+    --total-questions 50 --sampling-batch-size 10 \
+    --total-epochs 1 --seed 42 \
+    --train-extra "--ppo-epochs 1" \
+    --gpus 0,1,2,3,4,5,6,7
 ```
 
 Expect:
-* tmux `prl-main` running, vLLM up
+* tmux `parliament-iterate` running, vLLM up on 8 GPUs
 * `harness` log shows tool list `[python_exec, submit, leave]` for
-  each actor
-* `parliament.db` accumulates posts (stored as posts even though the
-  actor "submitted a step")
-* sessions terminate when all three actors call `leave` (or hit
-  `max_rounds`)
+  each actor (independent Solo cell)
+* `parliament.db` accumulates posts (DB schema unchanged across cells)
+* `ckpt/metrics.jsonl` records `clipfrac ≈ 0` and `approx_kl_old ≈ 0`
+  for `ppo_epoch=1` (ratio ≈ 1, no trust-region action yet)
+* `backups/smoke_D_<ts>/ep1.round{1..5}/` populated with metrics +
+  train.jsonl per iter

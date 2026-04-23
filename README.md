@@ -24,12 +24,13 @@ disconnect, auto-resumes on re-invocation):
 ```bash
 python scripts/iterate.py \
   --name nrun_v1 \
-  --shards datasets/sciencepedia_train_part1.json,\
+  --pool datasets/sciencepedia_train_part1.json,\
 datasets/sciencepedia_train_part2.json,\
 datasets/sciencepedia_train_part3.json,\
 datasets/sciencepedia_train_part4.json \
-  --total-epochs 2 \
-  --train-extra "--ppo-epochs 2" \
+  --total-questions 1000 --sampling-batch-size 200 \
+  --total-epochs 2 --seed 42 \
+  --train-extra "--ppo-epochs 2 --clip-ratio-high 0.25 --beta-kl 0.005" \
   --gpus 0,1,2,3,4,5,6,7
 ```
 
@@ -37,17 +38,23 @@ Three nested loops (verl-aligned, see [`docs/00_naming.md`](docs/00_naming.md)):
 
 | level | name | knob | example |
 |---|---|---|---|
-| outer | **total_epoch** | `--total-epochs N` | shard list runs `N` times |
-| middle | **iter** | one per shard per epoch | sample → train → export |
-| inner | **ppo_epoch** | `--train-extra "--ppo-epochs N"` | passes through `train.jsonl` |
+| outer | **total_epoch** | `--total-epochs N` | cycle the drawn schedule `N` times |
+| middle | **iter** | one per sampling round | sample `B` questions → train → export |
+| inner | **ppo_epoch** | `--train-extra "--ppo-epochs N"` | SGD passes through `train.jsonl` (PPO clip applies) |
+
+All 2×2 cells share the **same draw + schedule** via a common
+`--seed`: `random.sample(pool, total_questions)` cached on launch,
+then split into `rounds = total_questions / sampling_batch_size`
+per-round batches.
 
 Each iter does
 
 ```
 vLLM + Parliament + harness  →  parliament.db
          rl/extract            →  train.jsonl
-         rl/train              →  sharded checkpoint  (loops `ppo_epochs` times)
+         rl/train              →  PPO ratio + clip + KL anchor → step_K
          rl/export             →  merged HF folder (next iter's policy)
+         backup                →  backups/<run>_<ts>/ep{E}.round{R}/
 ```
 
 For a single-shot data collection without training, use
@@ -66,7 +73,7 @@ parliament_rl/
 ├── eval/                    # benchmarks (GPQA Diamond, extensible)
 ├── scripts/
 │   ├── run.py               # single run (vLLM + Parliament + harness)
-│   ├── iterate.py           # multi-shard iterative training loop
+│   ├── iterate.py           # iterative training loop over a deterministic pool draw
 │   └── sample_dataset.py    # split a full dataset into train/test
 ├── context_configs/
 │   ├── Parliament_context/  # agent-facing prompts + persona + name pool
@@ -84,10 +91,10 @@ parliament_rl/
 | script | purpose | typical wall time |
 |---|---|---|
 | `scripts/run.py` | one-shot data collection (cleanup → vLLM → Parliament → harness) | ~6-9 h for 1 026 questions on 8 GPU |
-| `scripts/iterate.py` | sample → extract → train → export → repeat across shards × `total_epochs` | ~1.5 h per iter (mid200), ~8-10 h per iter (full shard) |
+| `scripts/iterate.py` | sample → extract → train → export → repeat over the drawn schedule × `total_epochs` | ~1.5 h per iter at `sampling_batch_size=200` |
 | `scripts/sample_dataset.py` | split a full dataset by depth-5 category | seconds |
-| `python -m rl.extract` | `parliament.db` → `train.jsonl` (per-actor trajectories) | ~1 min per shard |
-| `python -m rl.train` (via `accelerate launch`) | DDP + LoRA offline RL (RWR + KL) | ~1 h per ppo_epoch for ~10 k turns on 8 GPU |
+| `python -m rl.extract` | `parliament.db` → `train.jsonl` (per-actor trajectories) | ~1 min per iter |
+| `python -m rl.train` (via `accelerate launch`) | DDP + LoRA + PPO clip + KL anchor | ~5 min per ppo_epoch for a 200-q iter on 8 GPU |
 | `python -m rl.export` | LoRA → merged HF directory (vLLM-loadable) | ~3 min |
 | `python -m eval.gpqa` | GPQA Diamond zero-shot CoT accuracy (thinking mode) | ~15 min/model on 1 × A100 |
 | `python -m eval.sciencepedia_mc` | held-out 100 multiple-choice questions (disjoint from train) | ~10 min/model |
@@ -121,13 +128,20 @@ as CLI flags:
 - **Advantage shape**: `advantage_baseline` ∈ {0, `mean_session`,
   `mean_global`, any number}, `advantage_scale` ∈ {`session_std`,
   `global_std`, `none`, any number} in `RL_context/config.json`.
-- **Loss knobs**: `rl/train.py --beta-kl 0` drops the KL anchor.
-  `--advantage-clip 2.0` clamps per-turn advantages to ±2.
-  `--max-seq-len 8192` sets the truncation boundary (over-length
-  trajectories are cut at the nearest user-turn edge).
-- **Per-iter overrides**: `scripts/iterate.py --train-extra "--ppo-epochs 1
-  --beta-kl 0.01"` forwards flags to every iter's trainer (verl naming;
-  `--num-epochs` is kept as a deprecated alias).
+- **PPO clip**: `rl/train.py --clip-ratio-low 0.2 --clip-ratio-high 0.25`
+  sets the asymmetric trust-region bounds; `--no-use-ppo-clip`
+  degenerates to vanilla RWR.
+- **KL anchor**: `--beta-kl 0` drops the base-model anchor entirely
+  (DAPO-style reference-free); `--beta-kl 0.02` is our original
+  conservative setting.
+- **Other loss knobs**: `--advantage-clip 2.0` clamps per-turn
+  advantages to ±2; `--max-seq-len 8192` truncates over-length
+  trajectories at the nearest user-turn edge.
+- **Per-iter overrides**: `scripts/iterate.py --train-extra "..."`
+  forwards any flag into every iter's `rl.train` invocation. Common
+  uses: `"--ppo-epochs 2 --beta-kl 0.005 --clip-ratio-high 0.25
+  --lora-r 64 --lora-alpha 128"`. `--num-epochs` is kept as a
+  deprecated alias for `--ppo-epochs`.
 
 ## Dataset
 
@@ -136,8 +150,9 @@ reference solutions (smoke size, disjoint from train).
 
 `datasets/sciencepedia_train_part{1..4}.json` — 4 × 1 026 = 4 104
 problems, sampled uniformly over depth-5 Sciencepedia categories by
-`scripts/sample_dataset.py`. One shard per iter; `--total-epochs N`
-runs the full shard list `N` times.
+`scripts/sample_dataset.py`.  Pass all four to `iterate.py --pool`
+(comma-separated) and they are concatenated into a single 4 104-question
+pool from which `--total-questions` are deterministically drawn.
 
 `datasets/sciencepedia_heldout_mc100.json` — 100 multiple-choice
 problems (boxed letter answer) held out from both train and test.

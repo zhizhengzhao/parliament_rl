@@ -1,31 +1,49 @@
 #!/usr/bin/env python3
 """Offline RL trainer for Parliament-collected data.
 
-Algorithm: token-level Reward-Weighted Regression with KL-anchor to base
-(ReST / RAFT family; AWR's linear cousin). The loss is
+Algorithm: token-level PPO surrogate with KL anchor to the frozen base
+(= GRPO / DAPO family; the `π_old` for the ratio is recomputed on the
+training side at the start of each iter, not grabbed from the vLLM
+rollout).  The loss is:
 
-    L = -mean_token( clip(A,±C) · logπ_θ(y_t|x,y_<t) )      ← policy
-        + β · mean_token( exp(log r) − log r − 1 )            ← KL anchor
-            where  log r = logπ_θ − logπ_base ,  base = LoRA disabled.
+    ratio_t = exp(logπ_θ − logπ_old)                         ← trust region
+    pg      = − mean_token( min(                              ← clip surrogate
+                 ratio_t · A_t,
+                 clip(ratio_t, 1 − ε_lo, 1 + ε_hi) · A_t ))
+    kl      = + mean_token( exp(log r) − log r − 1 )          ← k3 estimator
+                 with log r = logπ_θ − logπ_ref                ← vs frozen base
+    L       = pg + β_kl · kl
 
-Why no PPO ratio? `rl/extract.py` re-renders every prompt from `parliament.db`
-(anonymized names, custom headers, `[you]` markers, score-visibility
-gating). The training prompt-token sequence therefore differs from what
-the rollout actually saw, so any importance ratio against a logged
-"old log-prob" would be against the wrong distribution. Treat the data
-as off-policy and use the off-policy-correct objective: weighted
-regression. Multi-iteration safety comes from the KL anchor to base
-plus ReST-style data refresh across iters/total_epochs in `scripts/iterate.py`.
+Defaults follow the 2025 DAPO-adjacent middle ground:
+    ε_lo = 0.2    (standard; keeps low-probability tokens alive)
+    ε_hi = 0.25   (asymmetric, mildly relaxed; DAPO uses 0.28)
+    β_kl = 0.005  (between DeepSeek-R1-final 0.001 and GRPO 0.04)
 
-Why token-level aggregation? `sum / mask.sum()` over the whole batch
-(DAPO-style) gives every response token equal weight. Per-sequence
+Why recompute `π_old` on the training side instead of saving logprobs
+from vLLM rollouts?  `rl/extract.py` re-renders every prompt from
+`parliament.db` (anonymized names, custom headers, `[you]` markers,
+score-visibility gating, 2×2-cell context switching).  The training
+prompt-token sequence therefore differs from what the rollout actually
+saw, so any ratio against the rollout's old log-prob would be against
+the wrong distribution.  Instead we pre-forward the policy once at the
+start of the iter, freeze that as `π_old`, and use it across all
+`ppo_epochs` passes.  This gives a clean trust region for the multi-
+epoch SGD while keeping the rollout-side code unchanged.
+
+Why token-level aggregation?  `sum / mask.sum()` over the whole batch
+(DAPO-style) gives every response token equal weight.  Per-sequence
 mean-then-batch-mean instead biases gradients toward short responses.
 
 Naming (verl-aligned, see docs/00_naming.md):
-    --ppo-epochs N   Passes through the same train.jsonl per iter.
-                     `--num-epochs` kept as deprecated alias.
+    --ppo-epochs N        Passes through the same train.jsonl per iter
+                          (`--num-epochs` kept as deprecated alias).
+    --use-ppo-clip        Enable the PPO ratio+clip surrogate (default on;
+                          --no-use-ppo-clip degenerates to vanilla RWR).
+    --clip-ratio-low/high PPO clip bounds = [1 − low, 1 + high].
+
     Outer loops (`iter`, `total_epochs`) are owned by `scripts/iterate.py`;
-    this script trains one shard's data once, repeated `ppo_epochs` times.
+    this script trains one sampling round's data once, repeated
+    `ppo_epochs` times under a fresh π_old.
 
 Usage (single-process smoke):
     python -m rl.train --data data/<run>/train.jsonl --output ckpts/run1
@@ -80,19 +98,35 @@ class TrainConfig:
     per_device_batch_size: int = 1
     grad_accum_steps: int = 16          # effective batch 128 on 8 GPUs
     # Number of passes through the same train.jsonl per `iterate.py` iteration.
-    # verl calls this `actor.ppo_epochs`; OpenRLHF `--max_epochs`.  1-2 is
-    # plenty for RWR (no IS to keep "fresh"); see docs/00_naming.md.
+    # verl calls this `actor.ppo_epochs`; OpenRLHF `--max_epochs`.  With PPO
+    # clip+ratio enabled, ppo_epochs=2 ≈ doubles sample efficiency per
+    # rollout without destabilising the policy.  See docs/00_naming.md.
     ppo_epochs: int = 2
     learning_rate: float = 1e-4         # LoRA default; lower (~1e-6) for full FT
     warmup_steps: int = 10
     weight_decay: float = 0.0           # RL fine-tuning doesn't benefit
     grad_clip: float = 1.0              # LLM-RL standard
 
-    # RWR + KL anchor.
-    # `beta_kl` 0.02 gives KL(π_θ‖π_base) ≈ O(1) on Sciencepedia data;
-    # raise to 0.05 if KL drifts past 5, lower to 0.005 if PG signal is
-    # being suffocated.  Monitor `kl` column in metrics.jsonl.
-    beta_kl: float = 0.02
+    # ── PPO surrogate (2025 DAPO-style asymmetric clip) ─────
+    # `use_ppo_clip=False` degenerates to the older RWR objective (ratio=1,
+    # no clip); only useful for ablating the clip's value.
+    # `clip_ratio_low`  = 0.2 (standard)  — suppress side; keeping it tight
+    #                     prevents probabilities of low-probability tokens
+    #                     from being driven to zero (entropy collapse).
+    # `clip_ratio_high` = 0.25 (relaxed)  — encourage side; allowing this to
+    #                     be larger than the low bound gives low-probability
+    #                     tokens room to rise when A>0 (DAPO uses 0.28, we
+    #                     keep 0.25 as a safer midpoint for our setup).
+    use_ppo_clip: bool = True
+    clip_ratio_low: float = 0.2
+    clip_ratio_high: float = 0.25
+
+    # KL anchor to the frozen base model (LoRA disabled).  k3 estimator.
+    # 0.02 was the initial conservative value; 0.005 (default here) gives
+    # the policy ~4x more freedom and matches the DeepSeek-R1-final /
+    # DAPO-adjacent range while still preventing long-term drift.
+    # Set to 0 to run KL-free (DAPO style) when reward is fully verifiable.
+    beta_kl: float = 0.005
     advantage_clip: float = 2.0         # clamp |A| per turn to ±this
     # 0 = no truncation; >0 = clean truncation at the nearest user-turn
     # boundary so the cut never splits an assistant response.
@@ -271,6 +305,14 @@ class RLDataset(Dataset):
                 "response_mask": mask,
                 "advantage": adv_per_tok,
                 "session_id": s["session_id"],
+                # Pre-computed per-token log-probs (filled by
+                # `precompute_log_probs` just before the PPO epochs
+                # start). `old_log_prob` is the policy's own log-prob
+                # at that moment (used for the PPO ratio's denominator),
+                # `ref_log_prob` is the frozen-base log-prob (used for
+                # the KL anchor). Both shape: [T], float32, CPU-resident.
+                "old_log_prob": None,
+                "ref_log_prob": None,
             })
             max_len_seen = max(max_len_seen, len(ids))
         print(f"  Dataset: {len(self.samples)} samples ready "
@@ -284,17 +326,32 @@ class RLDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         s = self.samples[idx]
-        return {
+        item = {
             "input_ids": s["input_ids"],
             "response_mask": s["response_mask"],
             "advantage": s["advantage"],
         }
+        if s["old_log_prob"] is not None:
+            item["old_log_prob"] = s["old_log_prob"]
+        if s["ref_log_prob"] is not None:
+            item["ref_log_prob"] = s["ref_log_prob"]
+        return item
 
 
 def collate(batch: list[dict], pad_id: int) -> dict:
-    """Right-pad a batch to its max length."""
+    """Right-pad a batch to its max length.
+
+    Cached `old_log_prob` / `ref_log_prob` tensors (present once the
+    pre-compute pass has run) are padded with 0.0 — those positions are
+    already masked out by `response_mask` so the pad value never
+    reaches the loss.
+    """
     L = max(b["input_ids"].size(0) for b in batch)
     out_ids, out_mask, out_attn, out_adv = [], [], [], []
+    has_old = "old_log_prob" in batch[0]
+    has_ref = "ref_log_prob" in batch[0]
+    out_old: list[torch.Tensor] = [] if has_old else []
+    out_ref: list[torch.Tensor] = [] if has_ref else []
     for b in batch:
         n = b["input_ids"].size(0)
         pad = L - n
@@ -304,12 +361,21 @@ def collate(batch: list[dict], pad_id: int) -> dict:
                           torch.zeros(pad, dtype=torch.long)])
         out_attn.append(attn)
         out_adv.append(F.pad(b["advantage"], (0, pad), value=0.0))
-    return {
+        if has_old:
+            out_old.append(F.pad(b["old_log_prob"], (0, pad), value=0.0))
+        if has_ref:
+            out_ref.append(F.pad(b["ref_log_prob"], (0, pad), value=0.0))
+    out: dict[str, torch.Tensor] = {
         "input_ids": torch.stack(out_ids),
         "response_mask": torch.stack(out_mask),
         "attention_mask": torch.stack(out_attn),
         "advantage": torch.stack(out_adv),
     }
+    if has_old:
+        out["old_log_prob"] = torch.stack(out_old)
+    if has_ref:
+        out["ref_log_prob"] = torch.stack(out_ref)
+    return out
 
 
 class LengthGroupedSampler(Sampler):
@@ -362,77 +428,147 @@ def per_token_log_p(logits: torch.Tensor, target_ids: torch.Tensor,
     return out
 
 
-def compute_loss(model, ref_model, batch: dict, beta_kl: float,
-                 lora_unwrap=None) -> tuple[torch.Tensor, dict]:
-    """Token-level RWR + KL anchor.
+def _masked_mean(x: torch.Tensor, mask: torch.Tensor,
+                 denom: torch.Tensor) -> torch.Tensor:
+    """Token-mean ``(x * mask).sum() / denom`` — DAPO-style batch-level
+    averaging. Every response token contributes equally regardless of
+    which sequence it belongs to; no length bias.
+    """
+    return (x * mask).sum() / denom
 
-        pg = - mean_token( A · logπ_θ(y_t|·) )            [B, T] → scalar
-        kl = + mean_token( exp(log r) − log r − 1 )       k3 estimator
-        L  = pg + β · kl
 
-    `mean_token` = `(x * mask).sum() / mask.sum()` over the whole batch
-    (DAPO-style) so every response token contributes equally — no length
-    bias, no per-sequence renormalization that would over-weight short
-    rollouts.
+def compute_loss(model, batch: dict, cfg: TrainConfig) -> tuple[torch.Tensor, dict]:
+    """Token-level PPO surrogate + KL anchor.
 
-    `lora_unwrap` (PeftModel | None): when non-None, base = `model` with
-    adapter disabled — saves 18 GB/GPU vs a duplicated π_ref. When None
-    (full FT path), use the explicit `ref_model`.
+    ::
+
+        ratio_t = exp(logπ_θ(y_t|·) − logπ_old(y_t|·))       [B, T]
+
+        pg   = − mean_token( min(                        ← clip-surrogate
+                  ratio_t · A_t,
+                  clip(ratio_t, 1 − ε_lo, 1 + ε_hi) · A_t))
+        kl   = + mean_token( exp(log r) − log r − 1 )    ← k3 estimator
+                                 with log r = logπ_θ − logπ_ref
+        L    = pg + β_kl · kl
+
+    ``old_log_prob`` and ``ref_log_prob`` are pre-computed (detached)
+    and attached to the batch by :func:`precompute_log_probs`.  If
+    ``old_log_prob`` is absent the ratio degenerates to 1 and the
+    surrogate reduces to vanilla RWR (``-A · logπ_θ``).  If
+    ``ref_log_prob`` is absent or ``β_kl = 0`` the KL term is skipped.
     """
     input_ids = batch["input_ids"]
-    response_mask = batch["response_mask"][:, 1:].float()
-    target_ids = input_ids[:, 1:]
-    advantages = batch["advantage"][:, 1:]                # [B, T] per-token
-    attn = batch["attention_mask"]
-    n_tok = response_mask.sum().clamp(min=1.0)
+    mask = batch["response_mask"][:, 1:].float()
+    advantages = batch["advantage"][:, 1:]                 # [B, T] per-token
+    n_tok = mask.sum().clamp(min=1.0)
 
-    out = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
-    logp = per_token_log_p(out.logits[:, :-1], target_ids)         # [B, T]
+    out = model(input_ids=input_ids,
+                attention_mask=batch["attention_mask"],
+                use_cache=False)
+    logp = per_token_log_p(out.logits[:, :-1], input_ids[:, 1:])  # [B, T]
     del out
 
-    # Reference forward — needed when β_kl > 0.  No grad, bf16, single pass.
-    if beta_kl > 0:
-        with torch.no_grad():
-            if lora_unwrap is not None:
-                with lora_unwrap.disable_adapter():
-                    ref_out = model(input_ids=input_ids,
-                                    attention_mask=attn,
-                                    use_cache=False)
-            else:
-                ref_out = ref_model(input_ids=input_ids,
-                                    attention_mask=attn,
-                                    use_cache=False)
-            logp_ref = per_token_log_p(ref_out.logits[:, :-1], target_ids)
-            del ref_out
-    else:
-        logp_ref = None
+    # ── Policy gradient ──
+    if cfg.use_ppo_clip and "old_log_prob" in batch:
+        old_logp = batch["old_log_prob"][:, 1:]             # detached
+        log_ratio = (logp - old_logp).float().clamp(-20.0, 20.0)
+        ratio = log_ratio.exp()
+        pg_unclip = -advantages * ratio
+        pg_clip = -advantages * ratio.clamp(
+            1.0 - cfg.clip_ratio_low, 1.0 + cfg.clip_ratio_high)
+        pg_per_tok = torch.maximum(pg_unclip, pg_clip)
+        clipfrac = _masked_mean((pg_clip > pg_unclip).float(), mask, n_tok)
+        # Schulman's low-variance estimator of KL(π_θ‖π_old) — drift metric.
+        approx_kl_old = _masked_mean(
+            0.5 * (logp - old_logp).float().pow(2), mask, n_tok)
+    else:                                                   # RWR fallback
+        pg_per_tok = -advantages * logp
+        clipfrac = torch.zeros((), device=input_ids.device)
+        approx_kl_old = torch.zeros((), device=input_ids.device)
+    pg_loss = _masked_mean(pg_per_tok, mask, n_tok)
 
-    # Policy gradient: per-token RWR.
-    pg_per_tok = -advantages * logp                        # [B, T]
-    pg_loss = (pg_per_tok * response_mask).sum() / n_tok
-
-    # KL(π_θ‖π_ref) k3 estimator (Schulman 2020): always ≥ 0, low variance.
-    if beta_kl > 0:
-        log_r = (logp - logp_ref).float().clamp(-10.0, 10.0)
-        kl_per_tok = log_r.exp() - log_r - 1.0
-        kl_loss = (kl_per_tok * response_mask).sum() / n_tok
+    # ── KL anchor vs frozen base (k3 estimator, always ≥ 0) ──
+    if cfg.beta_kl > 0 and "ref_log_prob" in batch:
+        log_r_ref = (logp - batch["ref_log_prob"][:, 1:]
+                     ).float().clamp(-10.0, 10.0)
+        kl_per_tok = log_r_ref.exp() - log_r_ref - 1.0
+        kl_loss = _masked_mean(kl_per_tok, mask, n_tok)
     else:
         kl_loss = torch.zeros((), device=input_ids.device)
 
-    total = pg_loss + beta_kl * kl_loss
+    total = pg_loss + cfg.beta_kl * kl_loss
     if not torch.isfinite(total):
         # Rare: a single bf16 overflow in a long sequence.  Fall back to
-        # the finite component so the optimizer step still happens with a
-        # safe gradient instead of corrupting AdamW's moving averages.
+        # the finite component so the optimizer step still happens with
+        # a safe gradient instead of corrupting AdamW's moving averages.
         total = pg_loss if torch.isfinite(pg_loss) else torch.zeros(
             (), device=input_ids.device, requires_grad=True)
     return total, {
         "pg_loss": float(pg_loss.detach()),
         "kl_loss": float(kl_loss.detach()),
         "total": float(total.detach()),
-        "mean_logp_resp": float(((logp * response_mask).sum() / n_tok).detach()),
-        "mean_adv": float((advantages * response_mask).sum().detach() / n_tok),
+        "mean_logp_resp": float(_masked_mean(logp, mask, n_tok).detach()),
+        "mean_adv": float(_masked_mean(advantages, mask, n_tok).detach()),
+        "clipfrac": float(clipfrac.detach()),
+        "approx_kl_old": float(approx_kl_old.detach()),
     }
+
+
+def _forward_log_prob(net, ids: torch.Tensor) -> torch.Tensor:
+    """Single no-grad forward → length-T CPU float32 log-prob tensor.
+
+    Convention: `logp[i]` is the log-prob of `ids[i]` (the token at
+    position i). Position 0 has no predecessor and is padded to 0; the
+    response mask ignores it anyway.
+    """
+    out = net(input_ids=ids,
+              attention_mask=torch.ones_like(ids),
+              use_cache=False)
+    lp = per_token_log_p(out.logits[:, :-1], ids[:, 1:])[0].float().cpu()
+    del out
+    return F.pad(lp, (1, 0), value=0.0)
+
+
+def precompute_log_probs(model, dataset: "RLDataset", device: torch.device,
+                         lora_unwrap=None, ref_model=None,
+                         need_old: bool = True, need_ref: bool = True) -> None:
+    """Cache π_old and π_ref per-token log-probs into ``dataset.samples``.
+
+    Fills ``dataset.samples[i]["old_log_prob"]`` and ``["ref_log_prob"]``
+    with length-T CPU float32 tensors that the PPO-clip loss reads
+    later. Semantics:
+
+    * ``old_log_prob`` = the current policy's log-prob at the moment
+      this pre-compute runs (i.e. just before the PPO epochs begin).
+      Frozen across all ``ppo_epochs`` → the π_old of the PPO ratio.
+      Matches verl's ``actor.compute_log_prob``.
+    * ``ref_log_prob`` = the frozen-base log-prob, used in the KL
+      anchor. LoRA path: same model with the adapter disabled. Full-FT
+      path: a separate ``ref_model``.
+
+    Each rank fills its own copy (no distributed sampler) — the
+    tensors are tiny (T floats/sample) and the forward cost is
+    dominated by rollout anyway. ~1 min on one A100 for 200 questions.
+    """
+    if not (need_old or need_ref):
+        return
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for s in dataset.samples:
+                ids = s["input_ids"].unsqueeze(0).to(device)
+                if need_old:
+                    s["old_log_prob"] = _forward_log_prob(model, ids)
+                if need_ref:
+                    if lora_unwrap is not None:
+                        with lora_unwrap.disable_adapter():
+                            s["ref_log_prob"] = _forward_log_prob(model, ids)
+                    elif ref_model is not None:
+                        s["ref_log_prob"] = _forward_log_prob(ref_model, ids)
+    finally:
+        if was_training:
+            model.train()
 
 
 # ── Checkpointing ────────────────────────────────────────
@@ -549,7 +685,7 @@ def parse_args() -> TrainConfig:
     """CLI defaults mirror the TrainConfig dataclass above."""
     d = TrainConfig.__dataclass_fields__
     p = argparse.ArgumentParser(
-        description="Offline RL trainer — token-level RWR + KL-to-base.")
+        description="Offline RL trainer — token-level PPO clip + KL-to-base.")
     p.add_argument("--data", required=True, help="JSONL from rl.extract")
     p.add_argument("--output", required=True, help="Checkpoint directory")
     p.add_argument("--model", default=d["model"].default)
@@ -573,6 +709,17 @@ def parse_args() -> TrainConfig:
     p.add_argument("--grad-clip", type=float, default=d["grad_clip"].default)
     p.add_argument("--beta-kl", type=float, default=d["beta_kl"].default,
                    help="KL(π_θ‖π_base) coefficient. 0 disables the anchor.")
+    p.add_argument("--use-ppo-clip", action=argparse.BooleanOptionalAction,
+                   default=d["use_ppo_clip"].default,
+                   help="Enable PPO ratio + asymmetric clip. "
+                        "--no-use-ppo-clip degenerates to RWR (ratio=1).")
+    p.add_argument("--clip-ratio-low", type=float,
+                   default=d["clip_ratio_low"].default,
+                   help="PPO clip lower bound = 1 - clip_ratio_low (default 0.2)")
+    p.add_argument("--clip-ratio-high", type=float,
+                   default=d["clip_ratio_high"].default,
+                   help="PPO clip upper bound = 1 + clip_ratio_high "
+                        "(default 0.25; DAPO-style asymmetric)")
     p.add_argument("--advantage-clip", type=float,
                    default=d["advantage_clip"].default,
                    help="Clamp |advantage| ≤ this (set 0 to disable)")
@@ -686,6 +833,23 @@ def main() -> None:
         start_step, start_ppo_epoch = load_checkpoint(
             acc, model, optimizer, scheduler, cfg.resume, cfg)
 
+    # ── Pre-compute π_old and π_ref log-probs ──
+    # Runs once, just before the PPO epochs.  On resume, the current
+    # checkpoint's weights become the new π_old — trust region is
+    # effectively re-anchored from that ckpt.  Every rank fills its
+    # own copy; tensors are tiny so no distributed broadcast needed.
+    need_old = cfg.use_ppo_clip
+    need_ref = cfg.beta_kl > 0
+    if need_old or need_ref:
+        pc_t0 = time.time()
+        acc.print(f"Pre-computing log-probs "
+                  f"(old={need_old}, ref={need_ref}) on {len(dataset)} samples...")
+        precompute_log_probs(
+            model, dataset, acc.device,
+            lora_unwrap=lora_unwrap, ref_model=ref_model,
+            need_old=need_old, need_ref=need_ref)
+        acc.print(f"  done in {time.time() - pc_t0:.0f}s\n")
+
     # Training loop
     metrics_log_path = output_dir / "metrics.jsonl"
     metrics_log = open(metrics_log_path, "a") if acc.is_main_process else None
@@ -697,8 +861,7 @@ def main() -> None:
     for ppo_epoch in range(start_ppo_epoch, cfg.ppo_epochs):
         for batch in loader:
             with acc.accumulate(model):
-                loss, m = compute_loss(model, ref_model, batch,
-                                       cfg.beta_kl, lora_unwrap=lora_unwrap)
+                loss, m = compute_loss(model, batch, cfg)
                 acc.backward(loss)
                 if acc.sync_gradients and cfg.grad_clip > 0:
                     acc.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -721,6 +884,8 @@ def main() -> None:
                             f"L={avg['total']:+.4f} "
                             f"logp={avg['mean_logp_resp']:+.3f} "
                             f"adv={avg['mean_adv']:+.3f} "
+                            f"clip%={avg.get('clipfrac', 0.0) * 100:.1f} "
+                            f"kl_old={avg.get('approx_kl_old', 0.0):.3f} "
                             f"lr={scheduler.get_last_lr()[0]:.2e} "
                             f"{elapsed:.0f}s")
                     acc.print(line)
