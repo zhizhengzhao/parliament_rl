@@ -67,10 +67,17 @@ def http(method: str, url: str, key: str = "", body: dict | None = None):
     return None
 
 
-def wait_ready(url: str, timeout: int = 600) -> bool:
-    """Poll URL until it returns 200 (or timeout). 600 s covers vLLM's
-    first-boot `torch.compile` on Qwen3.5 hybrid attention — second boot
-    hits the compile cache and returns in < 60 s."""
+def wait_ready(url: str, timeout: int = 1800) -> bool:
+    """Poll URL until it returns 200 (or timeout). 1800 s (= 30 min)
+    covers two known-slow paths simultaneously:
+
+      1. vLLM first-boot `torch.compile` on Qwen3.5 hybrid attention
+         (second boot hits the compile cache and returns in < 60 s).
+      2. Loading the 19 GB model from NFS-shared paths
+         (e.g. `/ytech_m2v5_hdd/...`) when several pods read the same
+         file concurrently — bandwidth contention can stretch a single
+         load past 10 min.  600 s (the previous default) was too tight.
+    """
     t0 = time.time()
     while time.time() - t0 < timeout:
         try:
