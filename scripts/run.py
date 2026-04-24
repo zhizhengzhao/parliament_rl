@@ -161,8 +161,28 @@ def gpu_to_port(gpu: int) -> int:
 
 
 def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH) -> list[int]:
+    """Bring up one vLLM API per GPU in this pod, *sequentially*.
+
+    Within a single pod the 8 vLLM processes all read the same 19 GB
+    Qwen3.5-9B safetensors.  If we launch them concurrently they all
+    issue NFS reads against the same file before the OS page cache
+    has had time to fill — every vLLM ends up waiting on its own
+    disk traffic and a 4-pod parallel launch can blow past the
+    wait-ready timeout.
+
+    Sequential launch fixes this almost for free: the first vLLM
+    pays the full NFS cost (5-15 min on a contended `/ytech_m2v5_hdd/`
+    mount); once its weights are resident in the kernel page cache,
+    every subsequent vLLM on the same pod hits warm cache and its
+    own torch-compile cache, so it boots in well under a minute.
+
+    First-vLLM timeout: ``wait_ready`` default (1800 s) — covers slow
+    NFS + first-boot ``torch.compile``.
+    Later-vLLMs timeout: 600 s (cache-hit path, with a generous safety
+    margin for transient NFS hiccups).
+    """
     ports: list[int] = []
-    for gpu in gpus:
+    for i, gpu in enumerate(gpus):
         port = gpu_to_port(gpu)
         ports.append(port)
         session_name = f"{TMUX_PREFIX}{gpu}"
@@ -178,15 +198,16 @@ def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH) -> list[int]:
         )
         subprocess.run(["tmux", "new-session", "-d", "-s", session_name, cmd],
                        capture_output=True)
-        print(f"  GPU {gpu} → :{port} launching...")
-
-    print(f"  Waiting for {len(gpus)} instances...", flush=True)
-    for gpu, port in zip(gpus, ports):
-        if not wait_ready(f"http://127.0.0.1:{port}/v1/models"):
-            print(f"  GPU {gpu} → :{port} FAILED")
+        timeout = 1800 if i == 0 else 600     # first vs cache-hit
+        print(f"  GPU {gpu} → :{port} launching"
+              f" ({'cold' if i == 0 else 'warm'}, timeout={timeout}s)...",
+              flush=True)
+        if not wait_ready(f"http://127.0.0.1:{port}/v1/models",
+                          timeout=timeout):
+            print(f"  GPU {gpu} → :{port} FAILED after {timeout}s")
             stop_vllm()
             sys.exit(1)
-        print(f"  GPU {gpu} → :{port} ready")
+        print(f"  GPU {gpu} → :{port} ready", flush=True)
     print(f"  All {len(ports)} vLLM instances ready")
     return ports
 
