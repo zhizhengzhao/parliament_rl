@@ -150,8 +150,13 @@ class TrainConfig:
     lora_dropout: float = 0.0
     lora_target_modules: str = "q_proj,v_proj,o_proj"
 
-    save_every: int = 50
-    keep_last: int = 3                  # rotate checkpoints (0 keeps all)
+    # ``save_every = 0`` (default): no mid-training checkpoints — only the
+    # final ``save_checkpoint`` at the bottom of ``main`` runs, giving
+    # exactly one ckpt per iter (= per sample-train cycle in
+    # ``scripts/iterate.py``).  Set a positive int to additionally save
+    # every N optimizer steps inside the iter.
+    save_every: int = 0
+    keep_last: int = 1                  # one ckpt per iter (rotate count)
     log_every: int = 1
     seed: int = 42
     resume: str = ""
@@ -783,7 +788,10 @@ def parse_args() -> TrainConfig:
     p.add_argument("--lora-dropout", type=float, default=d["lora_dropout"].default)
     p.add_argument("--lora-target-modules", default=d["lora_target_modules"].default,
                    help="Comma-separated module names; empty → \"all-linear\".")
-    p.add_argument("--save-every", type=int, default=d["save_every"].default)
+    p.add_argument("--save-every", type=int, default=d["save_every"].default,
+                   help="Mid-training save cadence (in optimizer steps). "
+                        "Default 0 = save only once at the end of training "
+                        "(= one ckpt per iter under iterate.py).")
     p.add_argument("--keep-last", type=int, default=d["keep_last"].default,
                    help="Keep at most this many step_* checkpoints (0 = all)")
     p.add_argument("--log-every", type=int, default=d["log_every"].default)
@@ -943,7 +951,7 @@ def main() -> None:
                         "elapsed_s": round(elapsed, 1),
                     }) + "\n")
                     metrics_log.flush()
-                if step % cfg.save_every == 0:
+                if cfg.save_every > 0 and step % cfg.save_every == 0:
                     save_checkpoint(acc, model, optimizer, scheduler,
                                     step, ppo_epoch, cfg, output_dir)
                 micro_metrics = {}
