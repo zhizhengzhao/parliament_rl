@@ -6,8 +6,11 @@ Knobs that shape the training data produced by `rl/extract.py`.
 
 | File | Purpose |
 |---|---|
-| `prompt_intro.txt` | Opening line of each user message; `{name}` is the actor's anonymized name. |
-| `config.json` | All other knobs (templates, score visibility, advantage normalization). |
+| `config.json` | The few knobs that aren't templates: `min_content_chars`, `anonymize_identity`, `advantage_baseline`, `advantage_scale`. |
+
+All wrapping templates live as a multi-variant pool in
+`rl/extract.py:TEMPLATE_POOL` (~107 unique strings across 12 keys —
+see that module's docstring for the full list).
 
 The actor name pool that Parliament uses at generation time lives in
 `../Parliament_context/config.json`. Extract reads that pool as the
@@ -15,32 +18,66 @@ single source of truth for the session → name mapping, so the headers
 it renders always match what the LLM actually saw during the Parliament
 run.
 
-## Templates
+## Template augmentation (extract-side)
 
-`post_header` and `comment_header` are formatted with `{local_id}`,
-`{author}`, `{is_you}` (and `{local_post_id}` for comments).
-`score_suffix` is appended only when scores are visible (per the rules
-below).
+Why: with a single fixed wrapper, the model learns a brittle binding
+between literal strings ("[V on P_3] by Anonymous Scientist:") and
+their semantics.  Diverse wrappers force the model to read the
+information fields rather than memorise the wrapper, which both
+reduces overfitting (Khan et al. 2026 "Prompt Augmentation Scales up
+GRPO Training on Mathematical Reasoning") and makes inference robust
+to query-format drift.
+
+**What we augment**: section headers, prompt intros, post headers,
+comment headers, vote-event lines, anonymous voter labels, `[you]`
+self markers, "no new content" fallbacks.
+
+**What stays fixed**: information fields ({local_id}, {author},
+{value}, {cur}, …) — only the surrounding text varies.  The model
+must read the data to reason; the wrapper is decorative.
+
+**Determinism contract**:
+
+- Whole-message templates (`prompt_intro`, `section_*`,
+  `no_new_content`) are seeded by `session.title` only — one
+  consistent variant per session, so a single user message stays
+  internally coherent.
+- Per-entry templates (`post_header`, `comment_header`, `vote_event`,
+  `anonymous_voter`, `you_marker`, etc.) are seeded by
+  `(session.title, entry_id)` — different posts/comments/votes inside
+  the same user message draw different wrappers, maximising diversity.
+- The 2×2 cells share `session.title`, so the same problem always
+  draws the same wrappers — template choice is never a confounder in
+  cell comparisons.
+
+**Disabling**: `python -m rl.extract --no-template-augment` forces
+every key to its first variant (byte-stable output, useful for
+ablation against an augmented run).
+
+## Vote events (cell-aware)
+
+Vote events appear as standalone timeline entries (matching the
+rollout-time format the LLM saw, e.g. `[V on P_3] by Anonymous
+Scientist: +2 vote, current score of P_3: +5`) only when the session's
+actor-side content references voting.  The `session_uses_vote_language`
+heuristic checks posts (always) and comments (Parliament cells only),
+and the vote pool is filtered by cell:
+
+- A (Parliament): keep all visible votes (actor + judge)
+- B (BlindParliament): drop judge votes; only actor mutual votes survive
+- C (Solo): keep judge votes; no actor votes exist (no vote tool in solo)
+- D (BlindSolo): no votes at all
+
+The cumulative `current score` on each vote event is re-computed from
+the visible-vote pool, so judges never leak through the score field
+in cells that hide them.
 
 ## Identity anonymization (`anonymize_identity`)
 
-When `true` (default), extract applies the same `session_id` → name
-mapping that harness used, so the anonymized cast appears consistently
-in the training headers. When `false`, headers show the raw DB names
-(`Scientist_1`, `Scientist_2`, …) — useful for debugging against the
-DB.
-
-## Score visibility (`score_visibility`)
-
-Three modes:
-
-- `auto` (default) — scores are kept only in sessions whose actor posts
-  meta-reference Parliament scoring (e.g. "vote consensus", "+9 for
-  P_5", "Anonymous Scientist"). Sessions where the discussion never
-  mentions scores have headers without `(score: ±N)`, eliminating the
-  train-vs-inference distribution shift.
-- `always` — scores always shown.
-- `never` — scores always hidden.
+When `true` (default), extract applies the same `session.title` →
+name mapping that harness used, so the anonymized cast appears
+consistently in the training headers. When `false`, headers show the
+raw DB names (`Scientist_1`, `Scientist_2`, …) — useful for debugging.
 
 ## Advantage normalization
 
@@ -53,10 +90,11 @@ signal), then normalize per session:
 2. session normalize     A  = (r' - baseline) / scale       # extract.py:compute_advantages
 ```
 
-`slope` is fitted globally from all sessions (early-half vs late-half
-mean reward gap, mapped to a 0→1 span). `t` is the post's normalized
-position in its session [0, 1]. At the midpoint the correction is
-zero; early posts are boosted, late posts are reduced.
+`slope` is the closed-form OLS estimate from every actor post's
+`(t, r)` pair across all sessions with ≥4 actor posts. `t` is the
+post's normalized position in its session [0, 1]. At the midpoint
+the correction is zero; early posts are boosted, late posts are
+reduced.
 
 | Key | Options | Default | Semantics |
 |---|---|---|---|
@@ -65,9 +103,16 @@ zero; early posts are boosted, late posts are reduced.
 
 **Safety floor**: session std is floored at `1.0` so a degenerate
 session (all posts got identical reward) can't produce infinite
-advantages. With rewards in ±10, this keeps `|A|` bounded below 10 even
-for the noisiest case. `extract.py` then applies `advantage_clip = 2.0`
-inside the trainer (`rl/train.py:RLDataset`).
+advantages. With rewards in ±10 (3 judges × ±3) this keeps `|A|`
+bounded below ~10 even for the noisiest case.
+
+`rl/train.py:RLDataset` accepts an optional further `--advantage-clip`
+clamp; defaults to **0 (disabled)**, matching mainline projects (TRL,
+OpenRLHF, Verl, DeepSeek-R1, DAPO) which rely on zscore normalization
++ PPO ratio clipping for gradient stability rather than a second
+`|A|` cap.  An explicit clamp can squash legitimate high-reward
+outliers (mid200 measurement: 3.82% of turns had `|A|>2`, all genuine
+high-quality posts whose signal we want learned at full strength).
 
 ### Defaults explained
 

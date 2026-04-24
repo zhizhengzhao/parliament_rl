@@ -1,21 +1,7 @@
 {
-  "_description": "Templates and parameters for reconstructing RL training context from parliament.db",
+  "_description": "Parameters for reconstructing RL training context from parliament.db. All wrapping templates (intros, section headers, post/comment/vote formats, [you] marker, anonymous voter labels) live as a multi-variant pool in rl/extract.py:TEMPLATE_POOL. See that module's docstring for sampling logic.",
 
   "min_content_chars": 20,
-
-  "section_headers": {
-    "problem": "## Problem",
-    "discussion": "## Discussion",
-    "next_contribution": "## Your Next Contribution"
-  },
-
-  "you_marker": " [you]",
-
-  "post_header": "[P_{local_id}] by {author}{is_you}",
-  "comment_header": "[C_{local_id}] on P_{local_post_id} by {author}{is_you}",
-  "score_suffix": " (score: {score})",
-
-  "score_visibility": "auto",
 
   "anonymize_identity": true,
 

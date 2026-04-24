@@ -4,7 +4,10 @@
   "agent": {
     "max_rounds": 30,
     "max_consecutive_errors": 3,
-    "llm_timeout_s": 300
+    "llm_timeout_s": 300,
+    "step_limit": 20,
+    "max_no_tool_retries": 3,
+    "max_tokens": 2048
   },
 
   "actor_context_coupled": true,

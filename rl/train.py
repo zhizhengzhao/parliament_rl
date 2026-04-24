@@ -21,14 +21,14 @@ Defaults follow the 2025 DAPO-adjacent middle ground:
 
 Why recompute `π_old` on the training side instead of saving logprobs
 from vLLM rollouts?  `rl/extract.py` re-renders every prompt from
-`parliament.db` (anonymized names, custom headers, `[you]` markers,
-score-visibility gating, 2×2-cell context switching).  The training
-prompt-token sequence therefore differs from what the rollout actually
-saw, so any ratio against the rollout's old log-prob would be against
-the wrong distribution.  Instead we pre-forward the policy once at the
-start of the iter, freeze that as `π_old`, and use it across all
-`ppo_epochs` passes.  This gives a clean trust region for the multi-
-epoch SGD while keeping the rollout-side code unchanged.
+`parliament.db` (anonymized names, augmented wrapper templates, vote
+events injected from filtered cell-aware vote pools, etc.).  The
+training prompt-token sequence therefore differs from what the
+rollout actually saw, so any ratio against the rollout's old log-prob
+would be against the wrong distribution.  Instead we pre-forward the
+policy once at the start of the iter, freeze that as `π_old`, and use
+it across all `ppo_epochs` passes.  This gives a clean trust region
+for the multi-epoch SGD while keeping the rollout-side code unchanged.
 
 Why token-level aggregation?  `sum / mask.sum()` over the whole batch
 (DAPO-style) gives every response token equal weight.  Per-sequence
@@ -127,7 +127,14 @@ class TrainConfig:
     # DAPO-adjacent range while still preventing long-term drift.
     # Set to 0 to run KL-free (DAPO style) when reward is fully verifiable.
     beta_kl: float = 0.005
-    advantage_clip: float = 2.0         # clamp |A| per turn to ±this
+    # Per-turn |A| clamp.  0 disables (default — main-line projects don't
+    # explicitly clip advantages: zscore normalization + PPO ratio clip
+    # already cap the gradient scale, and additional clipping mostly
+    # squashes legitimate high-reward outliers (mid200: 3.82% of turns
+    # had |A|>2, all of them genuine high-quality posts whose signal we
+    # want the policy to learn from at full strength).  Set a positive
+    # value as a safety net only when reward magnitudes can't be bounded.
+    advantage_clip: float = 0.0
     # 0 = no truncation; >0 = clean truncation at the nearest user-turn
     # boundary so the cut never splits an assistant response.
     max_seq_len: int = 8192
@@ -156,13 +163,18 @@ class TrainConfig:
 
 # ── Tokenization & dataset ───────────────────────────────
 
-# Special tokens for Qwen3.5
+# Special tokens for Qwen3.5 — verified against the model tokenizer
+# (see commit history); double-newline `\n\n` is a single merged token
+# (271) and single newline `\n` is 198.  `make_response_mask` skips
+# *any* number of trailing newlines so the masking stays correct even
+# if a future tokenizer revision splits `\n\n` into two `\n`.
 IM_START_ID = 248045
 IM_END_ID = 248046
 THINK_ID = 248068
 END_THINK_ID = 248069
 ASSISTANT_ID = 74455
 USER_ID = 846
+NEWLINE_IDS = (198, 271)   # `\n` and `\n\n` — both treated as whitespace
 DEFAULT_PAD_ID = 248044    # <|endoftext|>
 
 
@@ -199,11 +211,16 @@ def make_response_mask(input_ids: torch.Tensor
     """Mark all assistant content tokens and assign turn indices.
 
     Each assistant turn gets a segment index (1, 2, 3, …).  The chat
-    template puts ``<|im_start|>assistant\n…<|im_end|>`` for every turn;
-    intermediate turns contain just the response, and the final turn
-    additionally has a ``<think>\n\n</think>\n\n`` prefix.  We mask the
-    actual content tokens only, skipping the role header and any think
-    block.
+    template puts ``<|im_start|>assistant\n[<think>…</think>\n\n]…<|im_end|>``
+    around each assistant turn.  We mask **only** the actual response
+    content — the role header, the optional think block, and all
+    surrounding newline tokens are excluded.
+
+    Whitespace handling is tokenizer-agnostic: after the role marker
+    (and after `</think>` if present) we skip any number of consecutive
+    newline tokens (``\\n`` = 198 or ``\\n\\n`` = 271 in Qwen3.5),
+    so a tokenizer revision that splits or merges newlines won't
+    break this code.
     """
     L = input_ids.size(0)
     mask = torch.zeros_like(input_ids)
@@ -212,29 +229,39 @@ def make_response_mask(input_ids: torch.Tensor
     im_starts = (input_ids == IM_START_ID).nonzero(as_tuple=True)[0]
     im_ends = (input_ids == IM_END_ID).nonzero(as_tuple=True)[0]
 
+    def _skip_newlines(pos: int) -> int:
+        """Advance past any \\n / \\n\\n tokens at `pos`."""
+        while pos < L and input_ids[pos].item() in NEWLINE_IDS:
+            pos += 1
+        return pos
+
     turn = 0
     for s_pos in im_starts:
         s = s_pos.item()
         if s + 2 >= L:
             continue
-        # Identify role: <|im_start|> <role_id> \n …
+        # Layout: <|im_start|>(s) assistant(s+1) \n(s+2) [<think>…</think>\n\n]content
         if input_ids[s + 1].item() != ASSISTANT_ID:
             continue
 
-        # Content begins after `\n` (s+2) by default.
-        response_start = s + 3
+        # Content begins after the role newline; skip however many
+        # newline tokens the tokenizer emitted there.
+        response_start = _skip_newlines(s + 2)
 
-        # If the immediately-following content is `<think>` block, skip it.
-        # Layout: <|im_start|>(s) assistant(s+1) \n(s+2) <think>(s+3) ...
-        #         </think>(k) \n\n(k+1) content...
+        # Optional <think>…</think> block — skip the whole thing plus
+        # any trailing newlines before the real content.
         if response_start < L and input_ids[response_start].item() == THINK_ID:
-            think_end = (input_ids[response_start:] == END_THINK_ID).nonzero(
-                as_tuple=True)[0]
+            think_end = (input_ids[response_start:] == END_THINK_ID
+                         ).nonzero(as_tuple=True)[0]
             if len(think_end) > 0:
-                # Skip </think> + whitespace token (\n\n)
-                response_start = response_start + think_end[0].item() + 2
+                # Land just past </think>, then skip trailing newlines.
+                response_start = _skip_newlines(
+                    response_start + think_end[0].item() + 1)
 
-        # Find the next <|im_end|> after response_start.
+        # End at the next <|im_end|>.  Newlines immediately before
+        # <|im_end|> belong to the content (rare — template doesn't
+        # add trailing whitespace) and are kept; the <|im_end|> itself
+        # is excluded by the half-open slice below.
         ie = im_ends[im_ends >= response_start]
         response_end = ie[0].item() if len(ie) > 0 else L
         if response_end <= response_start:
@@ -256,7 +283,7 @@ class RLDataset(Dataset):
     """
 
     def __init__(self, jsonl_path: str, tokenizer,
-                 advantage_clip: float = 2.0,
+                 advantage_clip: float = 0.0,
                  max_seq_len: int = 8192):
         """Over-length trajectories are truncated at the nearest user-turn
         boundary (so the cut never splits an assistant response), with
@@ -275,6 +302,13 @@ class RLDataset(Dataset):
                 turn_advs = [max(-advantage_clip, min(advantage_clip, a))
                              for a in turn_advs]
 
+            # Per-turn trainability — short posts are kept in the chat
+            # context for distribution faithfulness but masked out of
+            # the loss.  Old jsonl files (pre-flag) default to
+            # all-trainable for backward compatibility.
+            turn_trainable = s.get("turn_trainable",
+                                   [True] * len(turn_advs))
+
             text = tokenizer.apply_chat_template(
                 s["messages"], tokenize=False, add_generation_prompt=False)
             ids_list = tokenizer(text, add_special_tokens=False).input_ids
@@ -285,9 +319,6 @@ class RLDataset(Dataset):
 
             ids = torch.tensor(ids_list, dtype=torch.long)
             mask, segments = make_response_mask(ids)
-            if mask.sum() == 0:
-                skipped_nomask += 1
-                continue
 
             n_turns = int(segments.max().item())
             # Truncation drops leading assistant turns; keep the last n_turns.
@@ -295,6 +326,20 @@ class RLDataset(Dataset):
                 skipped_mismatch += 1
                 continue
             kept_advs = turn_advs[-n_turns:]
+            kept_trainable = turn_trainable[-n_turns:]
+
+            # Zero out the response mask for non-trainable turns: their
+            # tokens still inform the model's input distribution but
+            # contribute zero loss / zero KL.
+            for t in range(n_turns):
+                if not kept_trainable[t]:
+                    mask[segments == (t + 1)] = 0
+
+            # Re-check after masking — if every kept turn was non-trainable
+            # the sample carries no learning signal at all.
+            if mask.sum() == 0:
+                skipped_nomask += 1
+                continue
 
             adv_per_tok = torch.zeros(len(ids), dtype=torch.float32)
             for t in range(n_turns):
@@ -722,7 +767,10 @@ def parse_args() -> TrainConfig:
                         "(default 0.25; DAPO-style asymmetric)")
     p.add_argument("--advantage-clip", type=float,
                    default=d["advantage_clip"].default,
-                   help="Clamp |advantage| ≤ this (set 0 to disable)")
+                   help="Clamp |advantage| ≤ this; 0 (default) disables. "
+                        "Mainline projects (TRL/OpenRLHF/Verl/DeepSeek-R1/"
+                        "DAPO) don't explicitly clip — zscore + PPO ratio "
+                        "clip already control gradient scale.")
     p.add_argument("--max-seq-len", type=int, default=d["max_seq_len"].default,
                    help="Truncate over-length samples at the nearest "
                         "user-turn boundary (0 = keep full length). "

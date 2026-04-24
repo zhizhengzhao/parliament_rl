@@ -123,20 +123,29 @@ as CLI flags:
 - **Identity anonymization**: `anonymize_identity: true/false` in
   `RL_context/config.json` — if false, training headers show the raw
   `Scientist_N` instead of names (useful for debugging).
-- **Score visibility in training context**: `score_visibility:
-  "auto"|"always"|"never"` in `RL_context/config.json`.
+- **Template augmentation**: every training-side wrapper string
+  (section header, post header, vote event line, anonymous voter
+  label, etc.) is sampled from a 107-string pool in
+  `rl/extract.py:TEMPLATE_POOL`. `python -m rl.extract
+  --no-template-augment` falls back to a single fixed wrapper for
+  ablation against the augmented version.
+- **Vote events** appear in training context only when the session's
+  actor-side content references voting (`session_uses_vote_language`),
+  and only carry vote sources visible to the actor at rollout
+  (filtered by cell flags read from `experiment.json`).
 - **Advantage shape**: `advantage_baseline` ∈ {0, `mean_session`,
   `mean_global`, any number}, `advantage_scale` ∈ {`session_std`,
   `global_std`, `none`, any number} in `RL_context/config.json`.
 - **PPO clip**: `rl/train.py --clip-ratio-low 0.2 --clip-ratio-high 0.25`
   sets the asymmetric trust-region bounds; `--no-use-ppo-clip`
-  degenerates to vanilla RWR.
+  degenerates to vanilla RWR for ablation.
 - **KL anchor**: `--beta-kl 0` drops the base-model anchor entirely
-  (DAPO-style reference-free); `--beta-kl 0.02` is our original
-  conservative setting.
-- **Other loss knobs**: `--advantage-clip 2.0` clamps per-turn
-  advantages to ±2; `--max-seq-len 8192` truncates over-length
-  trajectories at the nearest user-turn edge.
+  (DAPO-style reference-free); `--beta-kl 0.005` (default) is the
+  DeepSeek-R1-final / DAPO-adjacent middle ground.
+- **Other loss knobs**: `--advantage-clip 0` (default; off — main-line
+  projects don't explicitly clip) or any positive cap;
+  `--max-seq-len 8192` truncates over-length trajectories at the
+  nearest user-turn edge.
 - **Per-iter overrides**: `scripts/iterate.py --train-extra "..."`
   forwards any flag into every iter's `rl.train` invocation. Common
   uses: `"--ppo-epochs 2 --beta-kl 0.005 --clip-ratio-high 0.25

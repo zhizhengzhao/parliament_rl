@@ -55,14 +55,15 @@ def _slot_index(name: str) -> int:
         return -1
 
 
-def pick_persona(name: str, role: str, session_id: str) -> str:
-    """Sample a persona for (name, role) seeded by session_id.
+def pick_persona(name: str, role: str, session_key: str) -> str:
+    """Sample a persona for (name, role) seeded by `session_key`.
 
     Each session draws N distinct personas without replacement (rng.sample)
-    seeded by `session_id:role`. Deterministic per (session_id, role, slot)
-    — same agent in same session always sees the same persona, but
-    different sessions see different draws and different agents in one
-    session see different personas.
+    seeded by `session_key:role`.  `session_key` should be a stable
+    identifier shared across 2×2 cells for the same question — we pass
+    the problem title, which iterate.py's seeded pool draw guarantees
+    is byte-identical across cells.  This removes persona as a
+    confounding variable in cell-vs-cell comparisons.
     """
     pools = get_config().get("persona_pools", {})
     role_key = "judge" if role == "judge" else "scientist"
@@ -74,7 +75,7 @@ def pick_persona(name: str, role: str, session_id: str) -> str:
     if slot < 0:
         return ""
 
-    rng = random.Random(f"{session_id}:{role_key}")
+    rng = random.Random(f"{session_key}:{role_key}")
     k = min(len(pool), _MAX_AGENTS_PER_ROLE)
     sampled = rng.sample(pool, k)
     return sampled[slot] if slot < k else ""
@@ -82,26 +83,24 @@ def pick_persona(name: str, role: str, session_id: str) -> str:
 
 # ── Actor & judge name sampling ──────────────────────────
 
-def assign_session_names(session_id: str) -> dict[str, str]:
-    """Map Scientist_1..n and Judge_1..n to deterministic per-session names.
+def assign_session_names(session_key: str) -> dict[str, str]:
+    """Map Scientist_1..n and Judge_1..n to deterministic per-question names.
 
     A single `rng.sample(pool, 2N)` draw partitions into:
         Scientist_1..N  ← sampled[0 : N]
         Judge_1..N      ← sampled[N : 2N]
-    where N = `_MAX_AGENTS_PER_ROLE` (32). The fixed layout means any
-    given (session_id, slot) always maps to the same name regardless of
-    how many actors/judges the session actually has.
+    where N = `_MAX_AGENTS_PER_ROLE` (32).
 
-    The single-sample guarantees no two agents — actor or judge — share
-    a name within one session. Judges are named because
-    `"You are Elena, a judge on Science Parliament"` reads cleaner than
-    `"You are Judge_1, a judge …"`. Judge names never leak to actors
-    (judge votes are anonymized as "Anonymous Scientist").
+    Like `pick_persona`, the seed is a stable question-level key (the
+    problem title) so the same question shows the same actor/judge
+    roster in every 2×2 cell.  The single-sample guarantees no two
+    agents share a name within one question.  Judge names never leak
+    to actors (judge votes are anonymized as "Anonymous Scientist").
     """
     pool = get_config().get("name_pool", [])
     if not pool:
         return {}
-    rng = random.Random(f"name:{session_id}")
+    rng = random.Random(f"name:{session_key}")
     total = min(2 * _MAX_AGENTS_PER_ROLE, len(pool))
     sampled = rng.sample(pool, total)
     mapping: dict[str, str] = {}
@@ -125,12 +124,16 @@ def apply_name_map(items: list[dict], name_map: dict[str, str]) -> None:
 # ── System prompt ────────────────────────────────────────
 
 def build_system_prompt(name: str, role: str, session_title: str,
-                        reference_solution: str = "",
-                        session_id: str = "") -> str:
-    """Build the system prompt — both actors and judges see anonymized names."""
+                        reference_solution: str = "") -> str:
+    """Build the system prompt — both actors and judges see anonymized names.
+
+    Persona and per-session name are seeded by `session_title` (the
+    problem text), so 4 cells running the same question see the same
+    actor/judge roster — makes 2×2 comparisons confounder-free.
+    """
     cfg = get_config()
-    persona = pick_persona(name, role, session_id)
-    display_name = assign_session_names(session_id).get(name, name)
+    persona = pick_persona(name, role, session_title)
+    display_name = assign_session_names(session_title).get(name, name)
     if role == "judge":
         return cfg["judge_prompt"].format(
             name=display_name, session_title=session_title,

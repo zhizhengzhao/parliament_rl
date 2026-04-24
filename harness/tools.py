@@ -135,9 +135,11 @@ _COUPLED_ACTOR_TOOLS = [
                 "post": {
                     "type": "string",
                     "description": (
-                        "A focused, verifiable logical step. "
-                        "Reference the discussion (e.g. 'Building on P_3, ...'). "
-                        "Omit if you only want to comment."),
+                        "A focused, verifiable reasoning move — one new "
+                        "fact, lemma, observation, calculation, or "
+                        "sub-result. Write it naturally, no required "
+                        "opening or template. Omit if you only want to "
+                        "comment."),
                 },
             },
         },
@@ -155,16 +157,17 @@ _INDEPENDENT_ACTOR_TOOLS = [
     {"type": "function", "function": {
         "name": "submit",
         "description": ("Record one reasoning step in your derivation. "
-                        "ENDS your turn — anonymous reviewers may score it."),
+                        "ENDS your turn — it may be silently scored."),
         "parameters": {
             "type": "object",
             "properties": {
                 "step": {
                     "type": "string",
                     "description": (
-                        "A focused, verifiable reasoning step — one logical "
-                        "move from a previous claim to a new one. Reference "
-                        "earlier steps by index (e.g. 'Building on P_3, ...')."),
+                        "A focused, verifiable reasoning move — one new "
+                        "fact, lemma, observation, calculation, or "
+                        "sub-result. Write it naturally, no required "
+                        "opening or template."),
                 },
             },
             "required": ["step"],

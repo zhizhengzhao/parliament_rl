@@ -12,11 +12,20 @@ for judges to finish before finalizing.
 Two `config.json` flags drive the 2×2 ablation:
   actor_context_coupled (bool)  — distribute peers' posts/comments/votes
                                   to actors? false ⇒ each actor sees only
-                                  its own history (and judge votes if
-                                  visible). Default true.
+                                  its own history (and judge votes on
+                                  their own posts if visible). Default true.
   judge_votes_visible   (bool)  — push judge votes to actors? Default true.
                                   Override at launch with
                                   PRL_JUDGE_VOTES_VISIBLE=0 (or =false).
+
+Per-actor isolation in solo (independent) cells:
+  When ``actor_context_coupled=False`` each actor gets its own IdMap so
+  ``P_1, P_2, …`` are *always* the actor's own posts in chronological
+  order — no global P_id gaps that would reveal peers' existence.
+  Judge-vote distribution is also filtered per actor: only votes whose
+  target post was authored by *this* actor get pushed.  Coupled cells
+  keep a single session-shared IdMap (peers' posts are visible, so
+  shared global numbering is the natural choice).
 """
 
 from __future__ import annotations
@@ -102,11 +111,34 @@ def _api_sync(base_url: str, method: str, path: str, key: str) -> dict | list:
 
 # ── Fetch & shape ─────────────────────────────────────────
 
-def _build_score_lookup(all_posts: list[dict]) -> tuple[dict[int, int], dict[int, int]]:
-    posts = {p["post_id"]: p.get("score", 0) for p in all_posts}
-    comments = {c["comment_id"]: c.get("score", 0)
-                for p in all_posts for c in p.get("comments", [])}
-    return posts, comments
+def _build_score_lookup(all_votes: list[dict], judge_visible: bool
+                        ) -> tuple[dict[int, int], dict[int, int]]:
+    """Compute cumulative post / comment scores from the visible-vote pool.
+
+    The server's stored `post.score` is the unconditional `SUM(value)`
+    across **all** voters (actor + judge).  In ``judge_visible=False``
+    cells (BlindParliament / BlindSolo) we cannot use it directly: the
+    actor sees `current score of P_3: +X` on every vote event we
+    distribute, and X must reflect only votes the actor was allowed to
+    see.  Otherwise judges leak through the score field even when their
+    own vote events are filtered out.
+
+    We therefore re-aggregate from the raw votes here, applying the
+    same visibility rule we use for ``_distribute``.
+    """
+    post_scores: dict[int, int] = {}
+    comment_scores: dict[int, int] = {}
+    for v in all_votes:
+        if not judge_visible and v.get("role") == "judge":
+            continue                                 # exclude from cumulative
+        val = v.get("value", 0)
+        if v.get("post_id"):
+            pid = v["post_id"]
+            post_scores[pid] = post_scores.get(pid, 0) + val
+        elif v.get("comment_id"):
+            cid = v["comment_id"]
+            comment_scores[cid] = comment_scores.get(cid, 0) + val
+    return post_scores, comment_scores
 
 
 def _shape_posts(all_posts: list[dict], after: int) -> tuple[list[dict], int]:
@@ -163,8 +195,15 @@ def _shape_votes(all_votes: list[dict], after: int,
 
 async def _fetch_new_content(http: aiohttp.ClientSession, parliament_url: str,
                              admin_key: str, session_id: str,
-                             cursors: Cursors) -> Fetched:
-    """Pull all new posts/comments/votes since the given cursors."""
+                             cursors: Cursors,
+                             judge_visible: bool) -> Fetched:
+    """Pull all new posts/comments/votes since the given cursors.
+
+    ``judge_visible`` controls how cumulative scores attached to vote
+    events are computed: when False, judges' votes are excluded from
+    the running totals so the score field never reveals judge influence
+    to actors in BlindParliament / BlindSolo.
+    """
     headers = {"Authorization": f"Bearer {admin_key}",
                "Content-Type": "application/json"}
 
@@ -184,7 +223,8 @@ async def _fetch_new_content(http: aiohttp.ClientSession, parliament_url: str,
 
     posts, new_pid = _shape_posts(all_posts, cursors.post)
     comments, new_cid = _shape_comments(all_posts, cursors.comment)
-    post_scores, comment_scores = _build_score_lookup(all_posts)
+    # Visibility-aware score aggregation — see `_build_score_lookup`.
+    post_scores, comment_scores = _build_score_lookup(all_votes, judge_visible)
     actor_votes, judge_votes, new_vid = _shape_votes(
         all_votes, cursors.vote, post_scores, comment_scores)
 
@@ -194,10 +234,15 @@ async def _fetch_new_content(http: aiohttp.ClientSession, parliament_url: str,
 
 # ── Distribution ──────────────────────────────────────────
 
-def _distribute(queues: dict[str, asyncio.Queue],
-                tasks: dict[str, asyncio.Task],
-                recipients: set[str], items: list[dict]) -> None:
-    """Put `items` into each recipient's queue, filtering self-authored."""
+def _distribute_shared(queues: dict[str, asyncio.Queue],
+                       tasks: dict[str, asyncio.Task],
+                       recipients: set[str], items: list[dict]) -> None:
+    """Push pre-localized ``items`` (shared IdMap) to recipients.
+
+    Used by the coupled path and the judges' fan-out, where every
+    recipient sees the same global ID numbering.  Items must already
+    have been ``id_map.localize_content``-converted before this call.
+    """
     for name in recipients:
         if tasks[name].done():
             continue
@@ -207,21 +252,70 @@ def _distribute(queues: dict[str, asyncio.Queue],
             queues[name].put_nowait(to_push)
 
 
-def _nudge_actors(queues: dict[str, asyncio.Queue], names: list[str],
-                  coupled: bool = True) -> None:
+def _distribute_per_actor(queues: dict[str, asyncio.Queue],
+                          tasks: dict[str, asyncio.Task],
+                          actor_name: str,
+                          actor_id_map: "IdMap",
+                          name_map: dict[str, str],
+                          payload_global: list[dict]) -> bool:
+    """Solo-path: localize ``payload_global`` with this actor's own IdMap
+    and push.  Returns True iff anything was pushed.
+
+    Items in ``payload_global`` carry **global** IDs; we deep-copy then
+    apply ``actor_id_map.localize_content`` so each actor's queue is
+    numbered from their own P_1.  Self-authored items are filtered last.
+    """
+    if tasks[actor_name].done() or not payload_global:
+        return False
+    items = [{**i} for i in payload_global if i.get("author") != actor_name]
+    if not items:
+        return False
+    actor_id_map.localize_content(items)
+    apply_name_map(items, name_map)
+    items.sort(key=lambda x: (TYPE_ORDER.get(x["type"], 9), x["id"]))
+    queues[actor_name].put_nowait(items)
+    return True
+
+
+# ── Per-cell nudge messages ───────────────────────────────
+#
+# Each 2×2 cell needs a different "nothing happened" prompt because the
+# actor's *expectation* of what could arrive differs:
+#   A coupled+visible    : peers + judge votes can arrive  → talk silence
+#   B coupled+blind      : peers can comment/post (no scores) → same as A
+#   C solo+judge_visible : only anonymous scores can arrive → "no votes yet"
+#   D solo+blind         : nothing can ever arrive          → pure self-prompt
+
+_NUDGE_COUPLED = (
+    "No new posts or comments from anyone. All scientists are waiting. "
+    "Break the silence with your next move, or post the final move if "
+    "the chain is settled."
+)
+_NUDGE_SOLO_JUDGE = (
+    "No anonymous scores have arrived yet — they may or may not come. "
+    "Continue with your next reasoning move, or call leave if the chain "
+    "is settled."
+)
+_NUDGE_SOLO_BLIND = (
+    "You are working alone — no external feedback will arrive. "
+    "Continue your derivation independently, or call leave when the "
+    "answer chain is settled."
+)
+
+
+def _nudge_actors(queues: dict[str, asyncio.Queue], names: list[str], *,
+                  coupled: bool, judge_visible: bool) -> None:
     """Push a "do something" prompt when actors stall.
 
-    Coupled mode: implies "the room is silent, break it" — references
-    peers explicitly (the actor expects them).
-    Independent mode: no peers exist; nudge is a pure self-prompt.
+    Wording is cell-aware so the actor never receives a hint that
+    contradicts what they could possibly observe at rollout time.
     """
     if coupled:
-        msg = ("No new posts or comments from anyone. All scientists are "
-               "waiting. Break the silence — post your next analysis step "
-               "or summarize the final answer.")
+        msg = _NUDGE_COUPLED
+    elif judge_visible:
+        msg = _NUDGE_SOLO_JUDGE
     else:
-        msg = ("No new feedback. Continue your derivation: submit the "
-               "next reasoning step, or call leave if the chain is settled.")
+        msg = _NUDGE_SOLO_BLIND
     for n in names:
         queues[n].put_nowait(msg)
 
@@ -236,6 +330,8 @@ def _spawn_agent_task(http: aiohttp.ClientSession, agent: dict, role: str,
                       processing: set[str], id_map: IdMap,
                       max_rounds: int, llm_log_dir: Path | None,
                       discard_dir: Path | None) -> asyncio.Task:
+    """Wire up one agent's coroutine.  ``id_map`` should be that agent's
+    own IdMap (per-actor in solo cells, session-shared in coupled)."""
     return asyncio.create_task(run_agent(
         name=agent["name"], role=role, api_key=agent["api_key"],
         session_id=session["session_id"], session_title=session["title"],
@@ -325,11 +421,38 @@ async def run_session(
     events = {n: asyncio.Event() for n in actor_names | judge_names}
     actor_processing: set[str] = set(actor_names)
     judge_processing: set[str] = set()
-    id_map = IdMap()
+
     # Per-session anonymization map (Scientist_N → real name). Applied to
     # every fetched item's `author` field before distribution so the LLM
     # never sees "Scientist_N" in either the prompt or any prior message.
-    name_map = assign_session_names(sid)
+    # Seeded by `title` (= the problem text) rather than `session_id`, so
+    # all 2×2 cells running the same question get the same roster —
+    # removes persona/identity as a cell-comparison confounder.
+    name_map = assign_session_names(session["title"])
+
+    # IdMap topology depends on the cell:
+    #   Coupled  → one shared IdMap so every actor sees the same global
+    #              P_id (peers are visible, shared numbering is natural).
+    #   Solo     → per-actor IdMap so each actor's queue is numbered
+    #              from their own P_1, P_2, …  Without this, an actor
+    #              who submits the 3rd global post would see P_3 with
+    #              no preceding P_1 / P_2 in their context — leaking
+    #              the existence of peers.
+    #   Judges always share one IdMap among themselves (they read every
+    #   post by design).
+    if actor_context_coupled:
+        shared_id_map = IdMap()
+        actor_id_maps: dict[str, IdMap] = {n: shared_id_map for n in actor_names}
+        judge_id_map: IdMap = shared_id_map
+    else:
+        actor_id_maps = {n: IdMap() for n in actor_names}
+        judge_id_map = IdMap()
+
+    # Track each actor's own posts (global IDs) so solo-cell judge-vote
+    # filtering can keep only votes whose target post belongs to *this*
+    # actor.  Coupled cells don't need this — peer posts are visible
+    # there, so peer-targeted votes are fine.
+    actor_post_ids: dict[str, set[int]] = {n: set() for n in actor_names}
 
     cohorts = (
         (actors, "actor", "", actor_processing),
@@ -340,7 +463,8 @@ async def run_session(
         tasks: dict[str, asyncio.Task] = {
             agent["name"]: _spawn_agent_task(
                 http, agent, role, session, ref, parliament_url, endpoint,
-                model_name, queues, events, processing, id_map,
+                model_name, queues, events, processing,
+                actor_id_maps[agent["name"]] if role == "actor" else judge_id_map,
                 max_rounds, session_llm_dir, session_discard_dir)
             for cohort, role, ref, processing in cohorts
             for agent in cohort
@@ -359,47 +483,79 @@ async def run_session(
                 e.clear()
 
             fetched = await _fetch_new_content(
-                http, parliament_url, admin_key, sid, cursors)
+                http, parliament_url, admin_key, sid, cursors,
+                judge_visible=judge_votes_visible)
 
             if fetched.has_discussion:
                 cursors = fetched.cursors
-                id_map.localize_content(fetched.posts)
-                id_map.localize_content(fetched.comments)
-                id_map.localize_content(fetched.actor_votes)
-                id_map.localize_content(fetched.judge_votes)
-                apply_name_map(fetched.posts, name_map)
-                apply_name_map(fetched.comments, name_map)
-                apply_name_map(fetched.actor_votes, name_map)
 
-                _distribute(queues, tasks, judge_names,
-                            fetched.posts + fetched.comments)
+                # Update per-actor own-post bookkeeping (global IDs)
+                # before any distribution touches the items.
+                for p in fetched.posts:
+                    if p.get("author") in actor_post_ids:
+                        actor_post_ids[p["author"]].add(p["id"])
+
+                # ── Judges: shared IdMap, see every post + comment ──
+                judge_items = [{**i} for i in fetched.posts + fetched.comments]
+                judge_id_map.localize_content(judge_items)
+                apply_name_map(judge_items, name_map)
+                _distribute_shared(queues, tasks, judge_names, judge_items)
+
                 # Stagger actor distribution so judges queue first
                 # (they'll start scoring while actors are still processing).
                 await asyncio.sleep(DISTRIBUTION_DELAY_S)
 
-                # Coupled mode (Parliament / BlindParliament): actors see
-                # peers' posts, comments, and inter-actor votes.
-                # Independent mode (Solo / BlindSolo): actors only see
-                # judge feedback on their own steps; everything else stays
-                # invisible (peers do not exist from this actor's POV).
-                if actor_context_coupled:
-                    actor_payload = (fetched.posts + fetched.comments
-                                     + fetched.actor_votes)
-                else:
-                    actor_payload = []
-                if judge_votes_visible:
-                    actor_payload += [{**v, "author": ANONYMOUS_VOTER}
-                                      for v in fetched.judge_votes]
-                _distribute(queues, tasks, actor_names, actor_payload)
-                # Independent mode: when nothing landed in the actor's
-                # queue (BlindSolo, or Solo with no fresh judge votes
-                # this round), nudge so the actor doesn't burn 60 s on
-                # an empty queue waiting for peers that don't exist.
-                if not actor_context_coupled and not actor_payload:
-                    _nudge_actors(
-                        queues,
-                        [n for n in actor_names if not tasks[n].done()],
-                        coupled=False)
+                # ── Actors: per-actor distribution ──
+                # Coupled (Parliament/BlindParliament): actors see peers'
+                # posts, comments, and inter-actor votes; one shared
+                # IdMap means every actor sees the same P_id numbering.
+                # Solo (Solo/BlindSolo): actors only see judge feedback
+                # *on their own posts*; per-actor IdMap renumbers from
+                # P_1 so peers stay invisible by construction.
+                pushed_anything: dict[str, bool] = {n: False for n in actor_names}
+                for actor_name in actor_names:
+                    if tasks[actor_name].done():
+                        continue
+                    if actor_context_coupled:
+                        payload = (list(fetched.posts) + list(fetched.comments)
+                                   + list(fetched.actor_votes))
+                        if judge_votes_visible:
+                            payload += [{**v, "author": ANONYMOUS_VOTER}
+                                        for v in fetched.judge_votes]
+                    else:
+                        # Solo cell: hide peers entirely.  Only push
+                        # judge votes whose target post is authored by
+                        # *this* actor (own_pids).  Self-authored items
+                        # never need echoing — the actor already saw the
+                        # local P_id from `submit`'s response, and our
+                        # per-actor IdMap means that numbering is theirs.
+                        own_pids = actor_post_ids[actor_name]
+                        payload = []
+                        if judge_votes_visible:
+                            own_judge_votes = [
+                                v for v in fetched.judge_votes
+                                if v.get("target_type") == "post"
+                                and v.get("target_id") in own_pids
+                            ]
+                            payload = [{**v, "author": ANONYMOUS_VOTER}
+                                       for v in own_judge_votes]
+
+                    pushed = _distribute_per_actor(
+                        queues, tasks, actor_name,
+                        actor_id_maps[actor_name], name_map, payload)
+                    pushed_anything[actor_name] = pushed
+
+                # Solo cell: nudge actors who got an empty queue this
+                # round (e.g. BlindSolo always, Solo when no judge vote
+                # landed on their post).  Coupled cells nudge later via
+                # the idle-round path.
+                if not actor_context_coupled:
+                    silent = [n for n in actor_names
+                              if not pushed_anything[n] and not tasks[n].done()]
+                    if silent:
+                        _nudge_actors(queues, silent,
+                                      coupled=False,
+                                      judge_visible=judge_votes_visible)
 
                 idle_rounds = 0
                 print(f"  [{_ts()}] Session {sid[:8]} round={round_num} "
@@ -411,7 +567,9 @@ async def run_session(
                 idle_rounds += 1
                 active = [n for n in actor_names if not tasks[n].done()]
                 if idle_rounds <= 1 and active:
-                    _nudge_actors(queues, active, coupled=actor_context_coupled)
+                    _nudge_actors(queues, active,
+                                  coupled=actor_context_coupled,
+                                  judge_visible=judge_votes_visible)
                     print(f"  [{_ts()}] Session {sid[:8]} round={round_num} "
                           f"nudged actors (idle={idle_rounds})", flush=True)
                 elif idle_rounds > 1:

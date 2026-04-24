@@ -32,22 +32,34 @@ import aiohttp
 from .prompts import build_system_prompt, format_new_content, get_config
 from .tools import IdMap, ToolExecutor, get_tools, python_exec
 
-# ── Per-round limits (overridable via context_config) ─────
+# ── Per-round limits (fully overridable via context_config `agent` block) ─
 
-STEP_LIMIT = 20
-MAX_NO_TOOL_RETRIES = 3
-MAX_TOKENS = 2048                 # one reasoning step rarely needs more
+# Defaults used only when the context's config.json omits a field.  Keep
+# these in sync with `context_configs/*/config.json` → `agent`.
+_DEFAULTS = {
+    "max_rounds": 30,              # actor-round cap (judges run unbounded)
+    "max_consecutive_errors": 3,   # LLM errors before retiring the round
+    "llm_timeout_s": 300,          # per LLM call
+    "step_limit": 20,              # max LLM calls within a single round
+    "max_no_tool_retries": 3,      # no-tool responses tolerated per round
+    "max_tokens": 2048,            # completion-token cap per LLM response
+}
 
 
-def _agent_defaults() -> tuple[int, int, int]:
+def _agent_cfg() -> dict:
     try:
-        c = get_config()["agent"]
-        return c["max_rounds"], c["max_consecutive_errors"], c["llm_timeout_s"]
+        return {**_DEFAULTS, **get_config().get("agent", {})}
     except Exception:
-        return 30, 3, 120
+        return dict(_DEFAULTS)
 
 
-MAX_ROUNDS, MAX_CONSECUTIVE_ERRORS, LLM_TIMEOUT_S = _agent_defaults()
+_CFG = _agent_cfg()
+MAX_ROUNDS = _CFG["max_rounds"]
+MAX_CONSECUTIVE_ERRORS = _CFG["max_consecutive_errors"]
+LLM_TIMEOUT_S = _CFG["llm_timeout_s"]
+STEP_LIMIT = _CFG["step_limit"]
+MAX_NO_TOOL_RETRIES = _CFG["max_no_tool_retries"]
+MAX_TOKENS = _CFG["max_tokens"]
 
 _TOOL_PRIORITY = {"python_exec": 0, "vote": 1, "submit": 2,
                   "wait": 3, "leave": 3}
@@ -498,15 +510,16 @@ async def _run_agent_inner(
     messages: list[dict[str, Any]] = [{
         "role": "system",
         "content": build_system_prompt(name, role, session_title,
-                                       reference_solution,
-                                       session_id=session_id),
+                                       reference_solution),
     }]
 
     coupled = bool(get_config().get("actor_context_coupled", True))
-    round_0_prompt = ("Parliament is empty. No one has posted yet. Begin."
-                      if coupled
-                      else "You are starting from a blank slate. "
-                           "Submit your first reasoning step.")
+    round_0_prompt = (
+        "The forum is empty — this is the very first contribution. Begin."
+        if coupled
+        else "You are starting from a blank slate — no previous steps yet. "
+             "Submit your first reasoning move."
+    )
 
     start = time.time()
     round_num = 0
