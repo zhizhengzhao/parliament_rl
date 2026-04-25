@@ -91,16 +91,52 @@ def wait_ready(url: str, timeout: int = 1800) -> bool:
 # ── Cleanup ──────────────────────────────────────────────
 
 def kill_port(port: int) -> None:
+    """Kill anything listening on `port`, by every available mechanism.
+
+    `ss -tlnp` only prints owner pid when the caller has CAP_NET_ADMIN
+    or owns the socket — in containers that often returns rows with no
+    `pid=` field, so we miss the kill.  We also try `fuser` (which uses
+    /proc), and finally `pkill -9 -f 'parliament.server'` to catch any
+    Parliament uvicorn that might have orphaned children.  Running all
+    three is harmless if some find nothing.
+    """
+    killed_any = False
+    # 1. ss -tlnp (works when we have permission to see the pid)
     try:
         out = subprocess.run(["ss", "-tlnp"],
                              capture_output=True, text=True).stdout
         for line in out.splitlines():
             if f":{port} " in line and "pid=" in line:
                 pid = int(line.split("pid=")[1].split(",")[0])
-                os.kill(pid, signal.SIGKILL)
-                print(f"  Killed pid {pid} on port {port}")
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    killed_any = True
+                    print(f"  Killed pid {pid} on port {port} (via ss)")
+                except ProcessLookupError:
+                    pass
     except Exception:
         pass
+    # 2. fuser -k (uses /proc, often works when ss doesn't)
+    try:
+        r = subprocess.run(
+            ["fuser", "-k", "-9", f"{port}/tcp"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            killed_any = True
+            print(f"  Killed listener on port {port} (via fuser)")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    # 3. pkill any Parliament uvicorn (catches orphan children)
+    subprocess.run(
+        ["pkill", "-9", "-f", "parliament.server"],
+        capture_output=True,
+    )
+    # Linux often holds the port in TIME_WAIT briefly after the listener
+    # exits — wait a moment to give the next bind a clean port.
+    time.sleep(2)
+    if not killed_any:
+        print(f"  No listener detected on port {port}")
 
 
 def stop_vllm() -> None:
@@ -389,7 +425,6 @@ def main() -> None:
     print("[3/3] Harness")
     from harness.runner import run_experiment
 
-    keep_parliament = False
     try:
         rc = asyncio.run(run_experiment(
             parliament_url=parliament_url,
@@ -405,16 +440,20 @@ def main() -> None:
         if rc != 0:
             print(f"\n  FATAL: Experiment failed with code {rc}")
             sys.exit(rc)
-        keep_parliament = True
     finally:
-        if keep_parliament:
-            stop_vllm()
-        else:
-            stop_parliament(parliament_proc)
+        # Always tear down both Parliament and vLLM at the end of an iter,
+        # whether the experiment succeeded or failed.  An earlier version
+        # left Parliament running on success "for the web UI" — but in the
+        # iterate.py loop the next iter immediately restarts Parliament,
+        # and any leftover instance from the previous iter would race the
+        # new bind on 0.0.0.0:8080 and crash the next iter (observed in
+        # smokeA Iter 3).  Tearing down unconditionally is the only safe
+        # contract when the same port is reused across iters.
+        stop_parliament(parliament_proc)
+        stop_vllm()
 
     print(f"\n  Experiment finished.")
-    print(f"  Web UI:        http://127.0.0.1:{args.port}")
-    print(f"  Parliament:    still running")
+    print(f"  Parliament:    stopped")
     print(f"  vLLM:          stopped")
     print(f"  Output:        {run_dir}")
 
