@@ -140,6 +140,18 @@ def kill_port(port: int) -> None:
 
 
 def stop_vllm() -> None:
+    """Tear down every vLLM instance launched by `ensure_vllm`.
+
+    Three layers of belt-and-braces, because vLLM forks a small
+    process tree (entrypoint + EngineCore_DP* + Worker_TP* +
+    multiprocessing.spawn pool) and only the entrypoint cmdline
+    matches "vllm.entrypoints".  An earlier version killed only the
+    tmux session and pkill'd "vllm.entrypoints", which left orphan
+    workers holding `:7999..:8006` open.  When the next iter's vLLM
+    tried to bind the same port it crashed with `[Errno 98]
+    Address already in use`.  We now also `fuser -k -9` every vLLM
+    port (7999..8006).
+    """
     out = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
                          capture_output=True, text=True).stdout
     killed = 0
@@ -150,9 +162,17 @@ def stop_vllm() -> None:
             killed += 1
     if killed:
         print(f"  Killed {killed} vLLM tmux session(s)")
-    # Belt-and-braces: kill any orphaned vllm processes by name
+    # Layer 2: pkill by name (catches main entrypoint process).
     subprocess.run(["pkill", "-9", "-f", "vllm.entrypoints"],
                    capture_output=True)
+    # Layer 3: fuser-kill every vLLM port (catches orphan workers
+    # whose cmdline doesn't match "vllm.entrypoints" but still hold
+    # the listening socket).
+    for port in range(7999, 8007):  # 7999..8006 inclusive (8 GPUs)
+        subprocess.run(
+            ["fuser", "-k", "-9", f"{port}/tcp"],
+            capture_output=True, timeout=10,
+        )
     time.sleep(3)
 
 
