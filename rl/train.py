@@ -80,7 +80,7 @@ from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.utils import set_seed
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader, Dataset, Sampler
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = os.environ.get("PRL_MODEL_PATH", "Qwen/Qwen3.5-9B")
@@ -690,6 +690,32 @@ def load_checkpoint(acc: Accelerator, model, optimizer, scheduler,
 # ── Model loading ────────────────────────────────────────
 
 def load_model(model_path: str, dtype: torch.dtype = torch.bfloat16):
+    """Load text-only causal LM from a checkpoint.
+
+    Handles multimodal-preview checkpoints (e.g. Qwen3.5
+    `Qwen3_5ForConditionalGeneration` whose root config nests `text_config`
+    + `vision_config`) by routing to the model-specific text-only
+    `*ForCausalLM` class instead of `AutoModelForCausalLM` (which would
+    instantiate the multimodal wrapper and trip on the missing root-level
+    `vocab_size`).
+    """
+    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    is_nested_multimodal = hasattr(cfg, "text_config") and not hasattr(cfg, "vocab_size")
+    if is_nested_multimodal:
+        import importlib
+        mod_name = f"transformers.models.{cfg.model_type}"
+        try:
+            mod = importlib.import_module(mod_name)
+            text_only_cls = next(
+                getattr(mod, n) for n in dir(mod)
+                if n.endswith("ForCausalLM") and not n.startswith("_")
+            )
+            return text_only_cls.from_pretrained(
+                model_path, torch_dtype=dtype,
+                attn_implementation="sdpa", trust_remote_code=True,
+            )
+        except (ImportError, StopIteration):
+            pass
     return AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=dtype,

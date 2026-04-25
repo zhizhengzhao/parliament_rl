@@ -29,7 +29,35 @@ from pathlib import Path
 import torch
 from peft import PeftModel
 from safetensors.torch import load_file, save_file
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+
+def _load_text_only_causal_lm(model_path: str):
+    """Load text-only causal LM, routing around multimodal-preview wrappers.
+
+    Mirrors `rl/train.py:load_model` so train and export agree on which
+    backbone class to instantiate.
+    """
+    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    is_nested_multimodal = hasattr(cfg, "text_config") and not hasattr(cfg, "vocab_size")
+    if is_nested_multimodal:
+        import importlib
+        try:
+            mod = importlib.import_module(f"transformers.models.{cfg.model_type}")
+            text_only_cls = next(
+                getattr(mod, n) for n in dir(mod)
+                if n.endswith("ForCausalLM") and not n.startswith("_")
+            )
+            return text_only_cls.from_pretrained(
+                model_path, torch_dtype=torch.bfloat16,
+                attn_implementation="sdpa", trust_remote_code=True,
+            )
+        except (ImportError, StopIteration):
+            pass
+    return AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa", trust_remote_code=True,
+    )
 
 
 def copy_aux(model_path: str, out_dir: Path) -> None:
@@ -82,9 +110,7 @@ def _patch_missing_weights(base_path: str, out_dir: Path) -> None:
 def export_lora(ckpt_dir: Path, out_dir: Path, model_path: str,
                 meta: dict) -> None:
     print(f"Loading base from {model_path}")
-    base = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa", trust_remote_code=True)
+    base = _load_text_only_causal_lm(model_path)
     print(f"Loading adapter from {ckpt_dir / 'adapter'}")
     model = PeftModel.from_pretrained(base, str(ckpt_dir / "adapter"))
     print("Merging adapter into base")
@@ -116,9 +142,7 @@ def export_fsdp(ckpt_dir: Path, out_dir: Path, model_path: str,
     if acc.is_main_process:
         out_dir.mkdir(parents=True, exist_ok=True)
         acc.print(f"Loading shell from {model_path}")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa", trust_remote_code=True)
+    model = _load_text_only_causal_lm(model_path)
     dummy_optim = torch.optim.AdamW(model.parameters(), lr=0.0)
     model, _ = acc.prepare(model, dummy_optim)
     acc.print(f"Loading sharded weights from {ckpt_dir}")

@@ -96,9 +96,28 @@ BACKUP_FILES = ("metrics.json", "train.jsonl", "experiment.json")
 # ── Shell helpers ────────────────────────────────────────
 
 def run(cmd: list[str], cwd: Path = PROJECT_DIR) -> None:
-    """Run subprocess, inherit stdout/stderr, raise on non-zero exit."""
+    """Run subprocess, route child stdout+stderr through our Tee'd sys.stdout
+    so they land in iterate.log too, and raise on non-zero exit.
+
+    Plain `subprocess.run(..., check=True)` would inherit fd 0/1/2 from the
+    Python interpreter, bypassing the in-process Tee on `sys.stdout/stderr`
+    that we set up to mirror everything to `iterate.log`.  That meant
+    crashes inside `accelerate launch -m rl.train` left an iterate.log with
+    only the `$ <cmd>` line and no traceback at all — a debugging black
+    hole.  Piping + line-by-line relay restores full capture.
+    """
     print(f"\n$ {shlex.join(cmd)}\n", flush=True)
-    subprocess.run(cmd, check=True, cwd=str(cwd))
+    proc = subprocess.Popen(
+        cmd, cwd=str(cwd),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
 def _find_run_dir(name_prefix: str) -> Path | None:
