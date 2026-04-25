@@ -178,8 +178,14 @@ def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH) -> list[int]:
 
     First-vLLM timeout: ``wait_ready`` default (1800 s) — covers slow
     NFS + first-boot ``torch.compile``.
-    Later-vLLMs timeout: 600 s (cache-hit path, with a generous safety
-    margin for transient NFS hiccups).
+    Later-vLLMs timeout: also 1800 s.  We originally tried 600 s on the
+    assumption that warm OS-page-cache hits make subsequent boots fast,
+    but observed that when several smoke runs share the same NFS
+    backend (e.g. /pfs being hammered by parallel cells in the 2x2
+    ablation) even later instances can stall well past 600 s.  Using
+    1800 s for everything is harmless when the load is light (the
+    poller still returns as soon as the server is up) and prevents
+    spurious cascading failures under heavy NFS pressure.
     """
     ports: list[int] = []
     for i, gpu in enumerate(gpus):
@@ -198,7 +204,7 @@ def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH) -> list[int]:
         )
         subprocess.run(["tmux", "new-session", "-d", "-s", session_name, cmd],
                        capture_output=True)
-        timeout = 1800 if i == 0 else 600     # first vs cache-hit
+        timeout = 1800                        # uniform; see wait_ready docstring
         print(f"  GPU {gpu} → :{port} launching"
               f" ({'cold' if i == 0 else 'warm'}, timeout={timeout}s)...",
               flush=True)
