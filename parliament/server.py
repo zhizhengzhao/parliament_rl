@@ -121,8 +121,21 @@ def create_app(name: str | None = None, port: int = PORT,
                        request: Request, user: dict) -> dict:
         body = await _read_body(request)
         value = _get_int(body, "value", "vote", "score", "rating")
-        if not value or abs(value) > 3:
-            raise HTTPException(400, "value must be between -3 and +3 (not 0)")
+        # Defence in depth: harness/tools.py:ToolExecutor already
+        # enforces actor ±1 / judge ±1..±3 client-side, but a client
+        # that bypasses the executor (curl, an external orchestrator)
+        # could otherwise let an actor cast ±3.  Enforce role-aware
+        # bounds server-side so the cell-fairness invariant cannot be
+        # broken from the outside.
+        if not value:
+            raise HTTPException(400, "value is required and must be non-zero")
+        role = user.get("role", "actor")
+        max_abs = 3 if role == "judge" else 1
+        if abs(value) > max_abs:
+            allowed = "±1..±3" if role == "judge" else "±1"
+            raise HTTPException(
+                400,
+                f"value must be in {allowed} for role={role!r} (got {value})")
 
         if target_type == "post":
             target = store.get_post(target_id)

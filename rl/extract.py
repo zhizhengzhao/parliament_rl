@@ -77,7 +77,7 @@ from statistics import pstdev
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 RL_CONTEXT = PROJECT_DIR / "context_configs" / "RL_context"
-PARLIAMENT_CONTEXT = PROJECT_DIR / "context_configs" / "Parliament_context"
+SHARED_CONTEXT = PROJECT_DIR / "context_configs" / "shared"
 
 # Make `harness.prompts` importable when extract.py is run as `python -m rl.extract`
 # from the project root. Parliament's session name map is the single source
@@ -102,11 +102,11 @@ SCIENTIST_RE = re.compile(r"\bScientist_(\d+)\b")
 def load_rl_config() -> dict:
     cfg = json.loads((RL_CONTEXT / "config.json").read_text())
     # `name_pool` is the single source of truth for session casting and
-    # is identical across all 2×2 cells (Parliament_context and
-    # Solo_context share it), so we always read Parliament_context here
-    # regardless of which cell produced the data.
-    parl_cfg = json.loads((PARLIAMENT_CONTEXT / "config.json").read_text())
-    cfg["name_pool"] = parl_cfg.get("name_pool", [])
+    # lives in `context_configs/shared/config.json` so all 2×2 cells
+    # (Parliament_context, Solo_context, ...) read the same byte-identical
+    # cast roster, regardless of which cell produced this DB.
+    shared_cfg = json.loads((SHARED_CONTEXT / "config.json").read_text())
+    cfg["name_pool"] = shared_cfg.get("name_pool", [])
     return cfg
 
 
@@ -671,7 +671,9 @@ def extract_session(session: dict, posts: list[dict],
                     rewards: dict[int, float],
                     advantages: dict[int, float],
                     actor_coupled: bool = True,
-                    judge_visible: bool = True) -> list[dict]:
+                    judge_visible: bool = True,
+                    strip_vote_events: bool = True,
+                    drop_stats: dict[str, int] | None = None) -> list[dict]:
     """Build per-actor trajectory samples for one session.
 
     Returns one dict per actor.  The view is built independently per
@@ -686,12 +688,25 @@ def extract_session(session: dict, posts: list[dict],
 
     Local IDs (``P_1, P_2, …``) are assigned over *this view's posts
     only*, so a solo actor sees their own posts numbered consecutively
-    from 1 — no gaps that would betray the existence of peers.  Vote
-    target IDs resolve against the same per-actor map.
+    from 1 — no gaps that would betray the existence of peers.
 
-    Vote events appear *only* when this actor's own content references
-    voting (``session_uses_vote_language``); vote-language-free actors
-    keep a completely score-free training context.
+    **Vote-event handling** (``strip_vote_events``, default True):
+
+    * ``True`` (recommended for main experiments) — vote events are
+      *never* rendered into the training context. The reward signal
+      reaches the trainer purely through ``turn_advantages``; the
+      input context contains only posts (and comments, in coupled
+      cells), not vote/score hints. This removes a spurious feature
+      ("read judge votes to predict reward") that would otherwise let
+      the model fit to a signal absent at zero-shot inference time.
+      It also makes the training-context *form* of cells A vs B
+      almost identical (cells differ only in *quality* of trajectory
+      that emerged from rollout-time visibility) — a cleaner
+      visibility ablation than letting B silently differ in form.
+    * ``False`` (legacy / ablation) — fall back to the heuristic that
+      includes vote events whenever the actor's own content
+      references voting, so an actor's stray "I notice +2 on P_3"
+      stays grounded by a real vote line.
 
     Each assistant turn has its own reward and advantage; the trainer
     broadcasts these to per-token tensors via segment masks.
@@ -739,15 +754,21 @@ def extract_session(session: dict, posts: list[dict],
         # 2) Per-actor local IDs over this actor's view (deep-copied).
         v_posts, v_comments = assign_local_ids_view(v_posts, v_comments)
 
-        # 3) Vote events appear only when this actor's own content
-        #    references voting (kept score-free otherwise).
-        include_vote_events = bool(v_votes) and session_uses_vote_language(
-            v_posts, v_comments, actor_coupled)
+        # 3) Vote events: default OFF (training context stays score-free,
+        #    reward flows only through turn_advantages).  Legacy heuristic
+        #    (include votes when actor's own content references voting)
+        #    available via --no-strip-vote-events.
+        if strip_vote_events:
+            include_vote_events = False
+        else:
+            include_vote_events = bool(v_votes) and session_uses_vote_language(
+                v_posts, v_comments, actor_coupled)
 
         # 4) Anonymize vote authors per-vote — judge votes draw a
         #    variant from `anonymous_voter`, actor votes carry the
-        #    voter's anonymized session name.
-        anon_votes = [
+        #    voter's anonymized session name.  Skipped entirely when
+        #    `include_vote_events` is False (no votes will be rendered).
+        anon_votes = [] if not include_vote_events else [
             {**v, "author": (
                 sample_template("anonymous_voter", session_seed,
                                 f"V{v['vote_id']}")
@@ -859,12 +880,24 @@ def extract_session(session: dict, posts: list[dict],
                 # the next user message.
                 pending_updates.append(entry)
 
-        # Drop the actor entirely only when they posted nothing at all
-        # (length-zero turn list).  When at least one turn exists but
-        # none are trainable (all posts < min_chars), the sample stays
-        # in the JSONL — the trainer masks it out and the empty-mask
-        # filter in `RLDataset` does the final drop.
+        # Two drop reasons:
+        #   1) zero-turn  — actor posted nothing at all
+        #   2) all-short  — every turn's content is shorter than
+        #                   min_content_chars, so every turn is
+        #                   non-trainable (mask=0).  The trainer
+        #                   would drop these via its empty-mask
+        #                   filter anyway, but doing so silently
+        #                   makes the extract-time "Samples: N"
+        #                   count inconsistent with what the trainer
+        #                   actually sees.  Drop here and tally so
+        #                   the run summary is honest.
         if not turn_rewards:
+            if drop_stats is not None:
+                drop_stats["zero_turns"] = drop_stats.get("zero_turns", 0) + 1
+            continue
+        if not any(turn_trainable):
+            if drop_stats is not None:
+                drop_stats["all_short"] = drop_stats.get("all_short", 0) + 1
             continue
 
         samples.append({
@@ -1043,6 +1076,17 @@ def main() -> None:
                         help="Disable template-pool sampling (every key "
                              "uses the first variant — byte-stable output, "
                              "useful for ablation against the augmented run)")
+    parser.add_argument(
+        "--strip-vote-events",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="(default ON) Remove vote events from the rendered training "
+             "context so the input contains only posts (+ comments in "
+             "coupled cells), never score/judge hints.  Reward still "
+             "reaches the trainer through `turn_advantages`.  Use "
+             "`--no-strip-vote-events` to fall back to the legacy "
+             "heuristic (insert vote events when an actor's own content "
+             "references voting).")
     args = parser.parse_args()
 
     global _DETERMINISTIC_BASELINE
@@ -1062,6 +1106,8 @@ def main() -> None:
     n_variants = sum(len(v) for v in TEMPLATE_POOL.values())
     print(f"Templates:       {'augmented' if not _DETERMINISTIC_BASELINE else 'baseline (first variant only)'}"
           f"  ({n_variants} variants across {len(TEMPLATE_POOL)} keys)")
+    print(f"Vote events:     "
+          f"{'STRIPPED (default; reward only via turn_advantages)' if args.strip_vote_events else 'INCLUDED via legacy heuristic (--no-strip-vote-events)'}")
 
     conn = connect(args.db)
     session_ids = load_session_ids(conn)
@@ -1093,13 +1139,16 @@ def main() -> None:
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     total_samples = skipped_sessions = 0
     sessions_with_vote_events = 0
+    drop_stats: dict[str, int] = {"zero_turns": 0, "all_short": 0}
     with open(args.output, "w") as f:
         for i, sid in enumerate(session_ids):
             session, posts, comments, votes, rewards = cache[sid]
             samples = extract_session(session, posts, comments, votes,
                                       rewards, advantages,
                                       actor_coupled=actor_coupled,
-                                      judge_visible=judge_visible)
+                                      judge_visible=judge_visible,
+                                      strip_vote_events=args.strip_vote_events,
+                                      drop_stats=drop_stats)
             if len(samples) < args.min_posts:
                 skipped_sessions += 1
                 continue
@@ -1116,8 +1165,10 @@ def main() -> None:
 
     print(f"\nDone:")
     print(f"  Sessions:        {len(session_ids) - skipped_sessions} "
-          f"({skipped_sessions} skipped)")
+          f"({skipped_sessions} skipped via --min-posts)")
     print(f"  Samples:         {total_samples}")
+    print(f"  Dropped actors:  {drop_stats['zero_turns']} (zero turns) "
+          f"+ {drop_stats['all_short']} (all turns < min_chars={cfg()['min_content_chars']})")
     print(f"  Vote-event sess: {sessions_with_vote_events} "
           f"(rest had no actor reference to voting)")
     print(f"  Anonymized:      {cfg().get('anonymize_identity', False)}")

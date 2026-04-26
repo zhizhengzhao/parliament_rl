@@ -114,7 +114,9 @@ The DB still stores everything as `post` rows, so `rl/extract.py` and
 sample format (`messages`, `turn_rewards`, `turn_advantages`) is
 isomorphic by construction.
 
-## Fairness checklist
+## What is held identical, and what is intentionally not
+
+### Algorithmic budget held identical (the explicit knobs)
 
 | dimension | how identical |
 |---|---|
@@ -123,14 +125,56 @@ isomorphic by construction.
 | number of judges | same `--judges` |
 | max rounds | same `--max-turns`, same `agent.max_rounds` |
 | token budget | same `MAX_TOKENS` (2048) |
-| reward source | same judge cohort, same scoring rubric |
+| reward source | same judge cohort, same scoring rubric, same `reward = Σ judge votes on the actor's post` |
 | advantage formula | `rl/extract.py` unchanged (mean_session + position debias) |
 | training loss | `rl/train.py` unchanged (PPO clip + KL-to-base) |
 | PPO hyperparams | same `--ppo-epochs`, `--clip-ratio-low/high`, `--beta-kl` |
 | trajectory format | per-actor multi-turn chat in all cells |
 | KL anchor | base model fixed across iters in every cell |
+| persona / name draws | same `session.title`-seeded sample, so cast and personalities match across cells for each problem |
+| template wrappers | same `(session.title, entry_id)`-seeded draw, so wrappers are byte-identical across cells |
 
-The only intended difference is the **actor's information access**.
+### What is **not** controlled — and shouldn't be
+
+The cells differ on two rollout-context axes, and the **emergent
+properties of the rollout** are themselves part of what we are
+measuring. We deliberately do not "control these away" because
+they *are* the contribution of each setting:
+
+* **Trajectory length / density.** Coupled cells naturally produce
+  longer, more interleaved discussions (a Scientist who sees an
+  active forum keeps engaging until the chain is settled); solo
+  cells produce shorter, more independent traces (each Scientist
+  decides on its own when to `leave`). This length difference is
+  not a confounder — it is the kind of trajectory that *that*
+  context setting tends to generate. Trying to truncate or pad to a
+  uniform length would erase the very effect under study.
+* **Visibility of judge feedback shapes the reasoning style.**
+  Cells that show judge votes inside the rollout (A, C) let
+  Scientists course-correct in real time; cells that hide them
+  (B, D) cannot. Whatever reasoning patterns emerge from these
+  different feedback regimes are exactly what the ablation is
+  trying to surface.
+* **Per-session sample count and advantage statistics follow
+  from the above.** A session with more actor posts has a more
+  reliable per-session mean / std for GRPO normalization; a session
+  with fewer posts has noisier estimates (we cap with a `1.0` std
+  floor). This is acknowledged: when interpreting per-cell results,
+  treat the advantage signal in solo cells as noisier — but again,
+  do not patch it, because doing so would be applying *different*
+  algorithmic treatments to different cells.
+
+The comparison the 2×2 ablation supports, then, is:
+
+> *Given the same algorithmic budget (same `--ppo-epochs`,
+> `--seed`, `--total-questions`, `--clip-*`, `--beta-kl`,
+> `--lora-*`, same reward / advantage formula, same KL anchor),
+> which contextual setting produces a stronger downstream policy?*
+
+It does **not** support the claim that the two settings differ only
+in "what the actor sees" — they also differ in the kind of
+trajectory that emerges from what the actor sees, and that is on
+purpose.
 
 ## Where things differ at runtime
 

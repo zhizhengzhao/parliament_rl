@@ -140,13 +140,17 @@ class TrainConfig:
     max_seq_len: int = 8192
 
     # LoRA (DDP-friendly; base doubles as π_ref via `disable_adapter()`).
-    # r=32 / α=64 on 9B is the sweet spot — larger r over-parameterizes
-    # the perturbation and lets KL drift; smaller starves capacity.
+    # r=64 / α=128 is the main-experiment configuration: it gives the
+    # adapter enough capacity to absorb the full reasoning-style shift
+    # the 2×2 ablation produces, while still keeping the perturbation
+    # bounded by the KL anchor.  r=32 / α=64 (the previous default)
+    # works for smoke / mid-sized runs but starves capacity at the
+    # 1000-question / 2-epoch scale of the main study.
     # Targeting only attention (q,v,o) keeps base-model knowledge intact;
     # adding gate/up/down regresses MLP behaviour on every step.
     use_lora: bool = True
-    lora_r: int = 32
-    lora_alpha: int = 64
+    lora_r: int = 64
+    lora_alpha: int = 128
     lora_dropout: float = 0.0
     lora_target_modules: str = "q_proj,v_proj,o_proj"
 
@@ -528,12 +532,23 @@ def compute_loss(model, batch: dict, cfg: TrainConfig) -> tuple[torch.Tensor, di
             1.0 - cfg.clip_ratio_low, 1.0 + cfg.clip_ratio_high)
         pg_per_tok = torch.maximum(pg_unclip, pg_clip)
         clipfrac = _masked_mean((pg_clip > pg_unclip).float(), mask, n_tok)
+        # Split the clipfrac into upper / lower edges so we can tell
+        # which side is more active.  Upper = ratio > 1+ε_hi (encourage
+        # too-confident); lower = ratio < 1-ε_lo (suppress too-strong).
+        # When upper » lower, advantages are dominated by positive
+        # samples; when lower » upper, by negative samples.
+        clipfrac_high = _masked_mean(
+            (ratio > 1.0 + cfg.clip_ratio_high).float(), mask, n_tok)
+        clipfrac_low = _masked_mean(
+            (ratio < 1.0 - cfg.clip_ratio_low).float(), mask, n_tok)
         # Schulman's low-variance estimator of KL(π_θ‖π_old) — drift metric.
         approx_kl_old = _masked_mean(
             0.5 * (logp - old_logp).float().pow(2), mask, n_tok)
     else:                                                   # RWR fallback
         pg_per_tok = -advantages * logp
         clipfrac = torch.zeros((), device=input_ids.device)
+        clipfrac_high = torch.zeros((), device=input_ids.device)
+        clipfrac_low = torch.zeros((), device=input_ids.device)
         approx_kl_old = torch.zeros((), device=input_ids.device)
     pg_loss = _masked_mean(pg_per_tok, mask, n_tok)
 
@@ -553,14 +568,28 @@ def compute_loss(model, batch: dict, cfg: TrainConfig) -> tuple[torch.Tensor, di
         # a safe gradient instead of corrupting AdamW's moving averages.
         total = pg_loss if torch.isfinite(pg_loss) else torch.zeros(
             (), device=input_ids.device, requires_grad=True)
+    # Extra observability — all cheap (single-batch reductions).
+    n_resp_tok = float(n_tok.detach())
+    n_total_tok = float(input_ids.numel())
+    pad_frac = 1.0 - (float(batch["attention_mask"].sum().detach()) / n_total_tok)
     return total, {
+        # Loss components
         "pg_loss": float(pg_loss.detach()),
         "kl_loss": float(kl_loss.detach()),
         "total": float(total.detach()),
+        # Per-token statistics over the response mask
         "mean_logp_resp": float(_masked_mean(logp, mask, n_tok).detach()),
         "mean_adv": float(_masked_mean(advantages, mask, n_tok).detach()),
+        "abs_adv": float(_masked_mean(advantages.abs(), mask, n_tok).detach()),
+        # Trust-region diagnostics
         "clipfrac": float(clipfrac.detach()),
+        "clipfrac_high": float(clipfrac_high.detach()),
+        "clipfrac_low": float(clipfrac_low.detach()),
         "approx_kl_old": float(approx_kl_old.detach()),
+        # Batch shape — useful for spotting padding waste / OOM precursors
+        "n_response_tokens": n_resp_tok,
+        "n_total_tokens": n_total_tok,
+        "pad_frac": pad_frac,
     }
 
 
@@ -579,46 +608,153 @@ def _forward_log_prob(net, ids: torch.Tensor) -> torch.Tensor:
     return F.pad(lp, (1, 0), value=0.0)
 
 
-def precompute_log_probs(model, dataset: "RLDataset", device: torch.device,
+def _shard_indices(n: int, world: int, rank: int) -> list[int]:
+    """Round-robin partition of `range(n)` into `world` shards.
+
+    Round-robin (rather than contiguous split) keeps long-vs-short
+    samples roughly balanced across ranks: ``LengthGroupedSampler``
+    sorts ``dataset.samples`` by length, so a contiguous slice would
+    give one rank all the long samples → that rank's forwards would
+    take far longer than the others, wasting GPU-minutes on idle
+    waiting at ``wait_for_everyone``.
+    """
+    return list(range(rank, n, world))
+
+
+def _compute_local_log_probs(model, dataset: "RLDataset", device: torch.device,
+                             indices: list[int],
+                             lora_unwrap=None, ref_model=None,
+                             need_old: bool = True,
+                             need_ref: bool = True) -> dict[int, dict]:
+    """Run forwards over a subset of `dataset.samples`; return a
+    {idx: {"old"?: lp, "ref"?: lp}} dict (CPU float32 tensors).
+
+    Pure logic — no distributed coordination, no disk I/O.  The two
+    callers (single-rank fast path, multi-rank shard path) feed it
+    different `indices` lists.
+    """
+    out: dict[int, dict] = {}
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for idx in indices:
+                ids = dataset.samples[idx]["input_ids"].unsqueeze(0).to(device)
+                entry: dict = {}
+                if need_old:
+                    entry["old"] = _forward_log_prob(model, ids)
+                if need_ref:
+                    if lora_unwrap is not None:
+                        with lora_unwrap.disable_adapter():
+                            entry["ref"] = _forward_log_prob(model, ids)
+                    elif ref_model is not None:
+                        entry["ref"] = _forward_log_prob(ref_model, ids)
+                out[idx] = entry
+    finally:
+        if was_training:
+            model.train()
+    return out
+
+
+def _attach_log_probs(dataset: "RLDataset", merged: dict[int, dict]) -> None:
+    """Write the gathered cache into ``dataset.samples[idx]`` fields."""
+    for idx, entry in merged.items():
+        if "old" in entry:
+            dataset.samples[idx]["old_log_prob"] = entry["old"]
+        if "ref" in entry:
+            dataset.samples[idx]["ref_log_prob"] = entry["ref"]
+
+
+def precompute_log_probs(model, dataset: "RLDataset", accelerator,
                          lora_unwrap=None, ref_model=None,
-                         need_old: bool = True, need_ref: bool = True) -> None:
+                         need_old: bool = True, need_ref: bool = True,
+                         cache_dir: "os.PathLike | None" = None) -> None:
     """Cache π_old and π_ref per-token log-probs into ``dataset.samples``.
 
     Fills ``dataset.samples[i]["old_log_prob"]`` and ``["ref_log_prob"]``
     with length-T CPU float32 tensors that the PPO-clip loss reads
-    later. Semantics:
+    later.  Semantics:
 
     * ``old_log_prob`` = the current policy's log-prob at the moment
       this pre-compute runs (i.e. just before the PPO epochs begin).
       Frozen across all ``ppo_epochs`` → the π_old of the PPO ratio.
       Matches verl's ``actor.compute_log_prob``.
     * ``ref_log_prob`` = the frozen-base log-prob, used in the KL
-      anchor. LoRA path: same model with the adapter disabled. Full-FT
-      path: a separate ``ref_model``.
+      anchor.  LoRA path: same model with the adapter disabled.
+      Full-FT path: a separate ``ref_model``.
 
-    Each rank fills its own copy (no distributed sampler) — the
-    tensors are tiny (T floats/sample) and the forward cost is
-    dominated by rollout anyway. ~1 min on one A100 for 200 questions.
+    **DDP shard mode.**  Under ``accelerator.num_processes > 1`` we
+    split the dataset round-robin across ranks so each forward is
+    done exactly once total (rather than once per rank, as the
+    legacy implementation did).  Every rank writes its local shard
+    to ``cache_dir/rank_{i}.pt``, waits at ``wait_for_everyone``,
+    then reads every other rank's shard so the full cache is
+    available for the SGD pass that follows.  Disk-based gather
+    keeps us out of NCCL variable-length-tensor land; the cache
+    is small (~10 MB / 200 samples) so this is bandwidth-irrelevant.
+
+    Single-rank stays on a fast in-memory path (no disk roundtrip).
+
+    `cache_dir` defaults to a unique tempdir on the main process and
+    is broadcast to all ranks via ``accelerator.wait_for_everyone``
+    + filesystem visibility.  The directory is removed by the main
+    process at the end of the call.
     """
     if not (need_old or need_ref):
         return
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            for s in dataset.samples:
-                ids = s["input_ids"].unsqueeze(0).to(device)
-                if need_old:
-                    s["old_log_prob"] = _forward_log_prob(model, ids)
-                if need_ref:
-                    if lora_unwrap is not None:
-                        with lora_unwrap.disable_adapter():
-                            s["ref_log_prob"] = _forward_log_prob(model, ids)
-                    elif ref_model is not None:
-                        s["ref_log_prob"] = _forward_log_prob(ref_model, ids)
-    finally:
-        if was_training:
-            model.train()
+    world = accelerator.num_processes
+    rank = accelerator.process_index
+    n = len(dataset.samples)
+    my_indices = _shard_indices(n, world, rank)
+
+    local = _compute_local_log_probs(
+        model, dataset, accelerator.device, my_indices,
+        lora_unwrap=lora_unwrap, ref_model=ref_model,
+        need_old=need_old, need_ref=need_ref,
+    )
+
+    # Single-rank: skip the disk roundtrip entirely.
+    if world == 1:
+        _attach_log_probs(dataset, local)
+        return
+
+    # Multi-rank: agree on a shared cache dir.  Caller-supplied path
+    # takes precedence (e.g. inside the run dir); otherwise the main
+    # process picks a fresh tempdir and the path is recovered on each
+    # rank via the same deterministic naming convention.
+    if cache_dir is None:
+        # We need a path all ranks can derive without communication.
+        # ``os.environ.get("ACCELERATE_*")`` is not stable enough; use
+        # the model's id() — same on all ranks since the model object
+        # is identical (DDP-wrapped weights, but same Python object id
+        # within a process is rank-specific, so this would diverge).
+        # Cleanest: caller MUST pass cache_dir for multi-rank.  Fail
+        # loudly so the bug is obvious instead of silently wrong.
+        raise ValueError(
+            "precompute_log_probs: cache_dir must be supplied when "
+            "num_processes > 1 (no portable path-derivation across ranks)"
+        )
+    cache_dir = Path(cache_dir)
+    if accelerator.is_main_process:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+
+    # Each rank dumps its own shard.
+    shard_path = cache_dir / f"rank_{rank}.pt"
+    torch.save(local, shard_path)
+    accelerator.wait_for_everyone()
+
+    # All ranks read every shard; cache size is ~10 MB / 200 samples
+    # so duplicating across ranks costs nothing.
+    merged: dict[int, dict] = {}
+    for r in range(world):
+        merged.update(torch.load(cache_dir / f"rank_{r}.pt",
+                                 map_location="cpu"))
+    _attach_log_probs(dataset, merged)
+
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
 
 # ── Checkpointing ────────────────────────────────────────
@@ -927,9 +1063,12 @@ def main() -> None:
         acc.print(f"Pre-computing log-probs "
                   f"(old={need_old}, ref={need_ref}) on {len(dataset)} samples...")
         precompute_log_probs(
-            model, dataset, acc.device,
+            model, dataset, acc,
             lora_unwrap=lora_unwrap, ref_model=ref_model,
-            need_old=need_old, need_ref=need_ref)
+            need_old=need_old, need_ref=need_ref,
+            # Cache lives inside the run dir so accidentally re-running
+            # mid-iter doesn't collide with another iter's tempdir.
+            cache_dir=output_dir / "log_prob_cache")
         acc.print(f"  done in {time.time() - pc_t0:.0f}s\n")
 
     # Training loop
@@ -960,14 +1099,20 @@ def main() -> None:
                 if step % cfg.log_every == 0 and acc.is_main_process:
                     avg = {k: v / micro_count for k, v in micro_metrics.items()}
                     elapsed = time.time() - t0
+                    # Compact one-liner. Layout grouped: loss → policy
+                    # signal → trust region → batch shape → schedule.
                     line = (f"step={step:5d} ppo_ep={ppo_epoch} "
                             f"pg={avg['pg_loss']:+.4f} "
                             f"kl={avg['kl_loss']:+.4f} "
                             f"L={avg['total']:+.4f} "
                             f"logp={avg['mean_logp_resp']:+.3f} "
-                            f"adv={avg['mean_adv']:+.3f} "
-                            f"clip%={avg.get('clipfrac', 0.0) * 100:.1f} "
+                            f"adv={avg['mean_adv']:+.3f}±{avg.get('abs_adv', 0.0):.2f} "
+                            f"clip%={avg.get('clipfrac', 0.0) * 100:.1f}"
+                            f"(↑{avg.get('clipfrac_high', 0.0) * 100:.1f}"
+                            f"/↓{avg.get('clipfrac_low', 0.0) * 100:.1f}) "
                             f"kl_old={avg.get('approx_kl_old', 0.0):.3f} "
+                            f"resp_tok={avg.get('n_response_tokens', 0.0):.0f} "
+                            f"pad={avg.get('pad_frac', 0.0) * 100:.0f}% "
                             f"lr={scheduler.get_last_lr()[0]:.2e} "
                             f"{elapsed:.0f}s")
                     acc.print(line)

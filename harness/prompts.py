@@ -20,6 +20,7 @@ from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 CONTEXT_NAME = os.environ.get("PRL_CONTEXT", "Parliament")
+SHARED_DIR = PROJECT_DIR / "context_configs" / "shared"
 PARLIAMENT_CONTEXT = PROJECT_DIR / "context_configs" / f"{CONTEXT_NAME}_context"
 
 _MAX_AGENTS_PER_ROLE = 32  # per-role cap on `rng.sample` size
@@ -28,10 +29,22 @@ _MAX_AGENTS_PER_ROLE = 32  # per-role cap on `rng.sample` size
 # ── Config loading ────────────────────────────────────────
 
 def load_context_config() -> dict:
-    config = json.loads((PARLIAMENT_CONTEXT / "config.json").read_text())
+    """Load (shared ⊕ cell) config + actor / judge prompts.
+
+    Layered read so cross-cell-identical resources (`name_pool`,
+    `persona_pools`, agent limits, the judge prompt) live in
+    ``context_configs/shared/`` as the single source of truth, and
+    each cell directory only carries cell-specific overrides
+    (currently just ``actor_context_coupled`` and the cell-specific
+    actor prompt).  Cell fields take precedence over shared fields.
+    """
+    shared = json.loads((SHARED_DIR / "config.json").read_text())
+    cell = json.loads((PARLIAMENT_CONTEXT / "config.json").read_text())
+    config = {**shared, **cell}
     config["_dir"] = str(PARLIAMENT_CONTEXT)
+    config["_shared_dir"] = str(SHARED_DIR)
     config["actor_prompt"] = (PARLIAMENT_CONTEXT / "actor_prompt.txt").read_text()
-    config["judge_prompt"] = (PARLIAMENT_CONTEXT / "judge_prompt.txt").read_text()
+    config["judge_prompt"] = (SHARED_DIR / "judge_prompt.txt").read_text()
     return config
 
 

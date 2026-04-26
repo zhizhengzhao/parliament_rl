@@ -1,45 +1,61 @@
 #!/usr/bin/env python3
 """One-click iterative PPO-clip training (ReST-style, GRPO-compatible).
 
-Data design (no more shard files — all cells share a deterministic schedule):
+Architecture
+------------
 
-    1.  `--pool` points at a full question bank (e.g. the merged
-        sciencepedia_train_*.json, ~4k questions).
-    2.  At launch we deterministically draw `total_questions` from the
-        pool using `--seed`; the draw is split into rounds of
-        `sampling_batch_size` each.  Every 2×2 cell with the same seed
-        sees the exact same batches at the exact same positions.
-    3.  One `iter` = one rollout round.  `total_epochs` cycles the
-        drawn schedule from the top, so the same batches are seen
-        again with a stronger policy.
+    +─── iterate.py main process ─────────────────────────────────────+
+    |                                                                  |
+    |   for iter in range(N):                                          |
+    |                                                                  |
+    |     ─ vLLM fleet (DP=N, TP=1 each, 1 process per GPU)            |
+    |        ─ started fresh each iter from the *previous iter's       |
+    |          merged folder* (or the original base on iter 1)         |
+    |        ─ cudagraphs ON, prefix caching ON, gpu-mem-util=0.90     |
+    |        ─ NO ``--enable-lora``: vLLM serves the merged model as   |
+    |          a plain HF checkpoint, full speed                       |
+    |                                                                  |
+    |     ─ rollout phase                                              |
+    |        a. start Parliament + load shard                          |
+    |        b. asyncio.run(harness.run_experiment(model=<merged>…))   |
+    |           — agents POST to vLLMs over HTTP                       |
+    |        c. stop Parliament                                        |
+    |                                                                  |
+    |     ─ training phase                                             |
+    |        d. ``stop_vllm()``: free ~80 GB / GPU for the trainer     |
+    |        e. ``accelerate launch -m rl.train`` (DDP, LoRA)          |
+    |           → ckpt/step_K/adapter/ (~110 MB PEFT folder)           |
+    |        f. ``rl.export``: merge LoRA into base + patch any        |
+    |           visual/mtp weights → run_dir/merged/ (~19 GB)          |
+    |        g. (vLLM stays down until the next iter's rollout)        |
+    |                                                                  |
+    |     ─ next iter: ``ensure_vllm(model=run_dir/merged)`` and       |
+    |       repeat from (a)                                            |
+    +──────────────────────────────────────────────────────────────────+
 
-    total_iters  = total_epochs × rounds_per_epoch
-    rounds_per_epoch = total_questions / sampling_batch_size
+Why merge+reload, not LoRA hot-swap
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Inside each iter:
+vLLM 0.19.1 supports ``/v1/load_lora_adapter`` for hot-swap, which on
+paper would save ~30 s/iter of merge time and the 19 GB merged folder
+on disk.  In practice we measured LoRA-mode generation at ~2 tokens/s
+on 15-23 K-token contexts (vs 40+ tokens/s on the merged base) and 0%
+prefix-cache hit rate (LoRA scope invalidates the shared system-prompt
+prefix every request).  At rollout-dominated ~85% of iter wall-time,
+the LoRA path costs more than 30 s of merge skip would save.  We keep
+the merged-checkpoint pipeline until upstream vLLM closes that gap.
 
-    1. scripts/run.py  →  vLLM + Parliament + harness  →  parliament.db
-    2. rl.extract      →  train.jsonl (per-actor trajectory)
-    3. metrics_step    →  reward/advantage stats printed to stdout
-    4. rl.train        →  ckpt/step_K  (PPO clip + KL-anchor; DDP + LoRA)
-    5. rl.export       →  merged/      (LoRA merged, vLLM-loadable)
-    6. eval.gpqa       →  optional, --no-eval skips
-    7. merged/ becomes the next iter's actor policy.  KL anchor (=
-       `--initial-model`) is fixed across every iter so drift never
-       compounds.
+The DP=N + TP=1 inference layout (one independent vLLM per GPU) is the
+canonical RLHF rollout configuration in OpenRLHF / verl — for ≤ 13B
+models data parallelism beats tensor parallelism on long contexts
+because TP's per-layer NCCL all-reduces dominate decode latency.
 
-Disk hygiene — one merged per total_epoch: after each iter exports its
-~19 GB merged/, the *previous* iter's merged/ is pruned unless it sits
-on an outer-epoch boundary (`iter % rounds_per_epoch == 0`).  At any
-time the tree holds: every completed epoch's final merged + the
-in-flight iter's merged (= ~2 × 19 GB steady state).
-
-Backups — `backups/<run>_<ts>/ep{E}.round{R}/`: each iter's small
-artifacts (metrics.json, train.jsonl, training-step metrics,
-train_config.json) are copied here the moment the iter finishes, plus
-a rolling `state.json` snapshot at the top level.  Large files
-(parliament.db, merged/, llm_logs) are NEVER copied — those live in
-data/ until pruned.
+Disk hygiene — `ckpt/step_K/`: trainer ckpts pruned after merge
+succeeds.  Old ``merged/`` folders (~19 GB each) pruned at every iter
+except total-epoch boundaries, which are kept as archival snapshots.
+Backups under `backups/<run>/` carry only the small metadata
+(metrics.json, train.jsonl, train_metrics.jsonl) — large artifacts
+stay in ``data/`` until pruned.
 
 Resume: re-invoking the same command picks up where state.json left
 off.  Every sub-step inside an iter is idempotent (skip if its output
@@ -48,10 +64,7 @@ already exists) so partial crashes don't redo expensive work.
 Usage:
     python scripts/iterate.py \\
         --name main_A \\
-        --pool datasets/sciencepedia_train_part1.json,\\
-datasets/sciencepedia_train_part2.json,\\
-datasets/sciencepedia_train_part3.json,\\
-datasets/sciencepedia_train_part4.json \\
+        --pool datasets/sciencepedia_train_part1.json \\
         --total-questions 1000 \\
         --sampling-batch-size 200 \\
         --total-epochs 2 \\
@@ -65,6 +78,7 @@ Stop: tmux kill-session -t parliament-iterate
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import random
@@ -77,34 +91,44 @@ from datetime import datetime
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-
 sys.path.insert(0, str(PROJECT_DIR / "scripts"))
+sys.path.insert(0, str(PROJECT_DIR))
+
 from _common import Tee, env_prefix  # noqa: E402
+
+# Reuse the vLLM lifecycle helpers + control-plane API wrappers from
+# scripts/run.py — that file is the single source of truth for "how
+# to bring up / tear down / sleep / wake / hot-swap-LoRA on a vLLM
+# fleet".  Anything iterate.py needs about vLLM goes through it.
+import scripts.run as run  # noqa: E402
 
 BASE_MODEL = os.environ.get("PRL_MODEL_PATH", "Qwen/Qwen3.5-9B")
 ACCELERATE = os.environ.get(
     "PRL_ACCELERATE", shutil.which("accelerate") or "accelerate")
 PYTHON_ENV = os.environ.get("PRL_PYTHON", sys.executable)
 ITERATE_TMUX = "parliament-iterate"
+ADMIN_KEY = run.ADMIN_KEY
+PARLIAMENT_PORT = 8080
 
 # Files per iter that get copied into backups/ for offline analysis.
-# Large files (parliament.db, merged/, llm_logs) are intentionally
+# Large files (parliament.db, ckpt/, llm_logs) are intentionally
 # excluded — the backup dir is meant to stay small and archival.
 BACKUP_FILES = ("metrics.json", "train.jsonl", "experiment.json")
 
 
 # ── Shell helpers ────────────────────────────────────────
 
-def run(cmd: list[str], cwd: Path = PROJECT_DIR) -> None:
-    """Run subprocess, route child stdout+stderr through our Tee'd sys.stdout
+def shell_run(cmd: list[str], cwd: Path = PROJECT_DIR) -> None:
+    """Run subprocess, stream stdout+stderr into our Tee'd sys.stdout
     so they land in iterate.log too, and raise on non-zero exit.
 
-    Plain `subprocess.run(..., check=True)` would inherit fd 0/1/2 from the
-    Python interpreter, bypassing the in-process Tee on `sys.stdout/stderr`
-    that we set up to mirror everything to `iterate.log`.  That meant
-    crashes inside `accelerate launch -m rl.train` left an iterate.log with
-    only the `$ <cmd>` line and no traceback at all — a debugging black
-    hole.  Piping + line-by-line relay restores full capture.
+    Plain ``subprocess.run(check=True)`` would inherit fd 0/1/2 from
+    the Python interpreter, bypassing our Tee on
+    ``sys.stdout/stderr`` that mirrors everything to ``iterate.log``.
+    That meant crashes inside ``accelerate launch -m rl.train`` left
+    an iterate.log with only the ``$ <cmd>`` line and no traceback at
+    all — a debugging black hole.  Piping + line-by-line relay
+    restores full capture.
     """
     print(f"\n$ {shlex.join(cmd)}\n", flush=True)
     proc = subprocess.Popen(
@@ -128,19 +152,89 @@ def _find_run_dir(name_prefix: str) -> Path | None:
 
 
 def _find_last_ckpt(ckpt_dir: Path) -> Path | None:
-    """Highest-numbered `step_*` under ckpt_dir, or None."""
+    """Highest-numbered ``step_*`` under ``ckpt_dir``, or None."""
     steps = [int(p.name.split("_", 1)[1])
              for p in ckpt_dir.glob("step_*")
              if p.name.split("_", 1)[1].isdigit()]
     return (ckpt_dir / f"step_{max(steps)}") if steps else None
 
 
+def _adapter_complete(adapter_dir: Path) -> bool:
+    """True iff ``adapter_dir`` is a complete PEFT adapter folder.
+
+    PEFT writes both ``adapter_config.json`` and the weights file
+    (``adapter_model.safetensors`` for our LoRA setup).  Used as a
+    sanity check that the trainer's checkpoint is intact before we
+    feed it to ``rl.export`` for the merge step.
+    """
+    return (adapter_dir.is_dir()
+            and (adapter_dir / "adapter_config.json").exists()
+            and (adapter_dir / "adapter_model.safetensors").exists())
+
+
 def _merged_complete(merged: Path) -> bool:
-    """True if `merged/` is a valid vLLM-loadable HF folder."""
-    return (merged.is_dir()
+    """True iff ``merged/`` is a vLLM-loadable HF folder.
+
+    Stricter than "config.json + ANY safetensors + tokenizer": when
+    an index file is present (multi-shard model), every shard listed
+    in the weight_map must actually exist on disk.  An interrupted
+    ``rl.export`` can leave a partial set of shards plus a complete
+    index, which would pass a naive check but break vLLM at load time.
+    """
+    if not (merged.is_dir()
             and (merged / "config.json").exists()
-            and any(merged.glob("*.safetensors"))
-            and (merged / "tokenizer_config.json").exists())
+            and (merged / "tokenizer_config.json").exists()
+            and any(merged.glob("*.safetensors"))):
+        return False
+    idx_path = merged / "model.safetensors.index.json"
+    if not idx_path.exists():
+        return True
+    try:
+        idx = json.loads(idx_path.read_text())
+        declared = set(idx.get("weight_map", {}).values())
+    except (OSError, json.JSONDecodeError):
+        return False
+    for shard in declared:
+        if not (merged / shard).exists():
+            return False
+    return True
+
+
+def _train_jsonl_complete(path: Path, min_bytes: int = 100) -> bool:
+    """True if ``path`` is a non-empty jsonl with structurally valid records.
+
+    Sniffs the first and last line: both must be valid JSON, both must
+    carry ``turn_advantages`` and ``messages`` (the two fields
+    ``rl/train.py:RLDataset`` actually reads).  Cheap (only two small
+    lines parsed regardless of file size).  Catches the case where a
+    crashed extract leaves a half-written tail — without this check
+    iterate.py would happily reuse it on resume and the trainer would
+    crash on the malformed last line.
+    """
+    try:
+        if not path.exists() or path.stat().st_size < min_bytes:
+            return False
+    except OSError:
+        return False
+    try:
+        with open(path, "rb") as f:
+            first_line = f.readline().decode("utf-8")
+            if not first_line.strip():
+                return False
+            f.seek(0, 2)
+            file_size = f.tell()
+            tail_size = min(file_size, 64 * 1024)
+            f.seek(file_size - tail_size, 0)
+            tail = f.read().decode("utf-8", errors="replace")
+            last_line = next((ln for ln in reversed(tail.splitlines())
+                              if ln.strip()), "")
+        for ln in (first_line, last_line):
+            obj = json.loads(ln)
+            if "messages" not in obj or "turn_advantages" not in obj:
+                return False
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, StopIteration):
+        return False
+    return True
 
 
 # ── Deterministic question schedule ──────────────────────
@@ -150,10 +244,6 @@ def build_schedule(pool_paths: list[str], total_questions: int,
                    ) -> list[list[dict]]:
     """Load + concatenate the pool(s), draw `total_questions`
     (seeded), split into batches of `sampling_batch_size` each.
-
-    Multiple pool paths are concatenated in the given order before
-    sampling; the seed alone determines which questions end up where,
-    so the list order is irrelevant for reproducibility.
 
     Same seed ⇒ same batches ⇒ fair comparison across the 2×2 cells.
     """
@@ -175,96 +265,135 @@ def build_schedule(pool_paths: list[str], total_questions: int,
 
 # ── Sub-step runners ─────────────────────────────────────
 
-def sample_step(shard: Path, model: str, name: str, cfg: dict) -> Path:
-    """scripts/run.py: cleanup → vLLM → Parliament → harness → DB."""
-    run([
-        PYTHON_ENV, "scripts/run.py", "--in-tmux",
-        "--gpus", cfg["gpus"],
-        "--sessions-per-gpu", str(cfg["sessions_per_gpu"]),
-        "--actors", str(cfg["actors"]),
-        "--judges", str(cfg["judges"]),
-        "--dataset", str(shard),
-        "--name", name,
-        "--model", model,
-        "--max-turns", str(cfg["max_turns"]),
-    ])
-    run_dir = _find_run_dir(name)
-    if run_dir is None:
-        raise RuntimeError(f"scripts/run.py finished but data/{name}_* "
-                           f"was not created")
+def rollout_step(shard_path: Path, model_name: str, run_name: str,
+                 cfg: dict, gpu_endpoints: list[str]) -> Path:
+    """Start Parliament, load the shard, run harness against existing vLLMs.
+
+    Differs from the legacy ``sample_step`` (which forked
+    ``scripts/run.py`` and made it bring up vLLMs from scratch) in two
+    ways:
+
+    1. ``vLLM is already up`` — iterate.py owns its lifecycle for the
+       whole training run, so this function only manages Parliament +
+       the dataset + harness.  No vLLM cleanup, no vLLM startup.
+    2. ``model_name`` is the *vLLM-side LoRA name*, not the file path.
+       At iter 0 we pass the base model id; at iter k>0 we pass
+       ``LORA_NAME`` and the request gets routed to whichever LoRA was
+       most recently ``/v1/load_lora_adapter``-ed in.
+    """
+    run_dir = (PROJECT_DIR / "data"
+               / f"{run_name}_{time.strftime('%m%d_%H%M%S')}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Parliament cleanup: the previous iter's parliament.server is
+    # already gone (we always stop it at iter end), but a stale port
+    # binding can linger in TIME_WAIT for a few seconds — kill_port
+    # is idempotent and cheap.
+    run.kill_port(PARLIAMENT_PORT)
+
+    parliament_url = f"http://127.0.0.1:{PARLIAMENT_PORT}"
+    parliament_proc = run.start_parliament(
+        run_name, cfg["actors"], cfg["judges"], PARLIAMENT_PORT,
+        log_path=run_dir / "parliament.log", db_dir=str(run_dir))
+
+    try:
+        loaded = run.load_dataset(str(shard_path), parliament_url, 0)
+        if loaded == 0:
+            raise RuntimeError("no questions loaded into Parliament")
+
+        from harness.runner import run_experiment
+
+        rc = asyncio.run(run_experiment(
+            parliament_url=parliament_url,
+            admin_key=ADMIN_KEY,
+            gpu_endpoints=gpu_endpoints,
+            sessions_per_gpu=cfg["sessions_per_gpu"],
+            num_actors=cfg["actors"],
+            num_judges=cfg["judges"],
+            model_name=model_name,
+            max_rounds=cfg["max_turns"],
+            output_path=str(run_dir / "experiment.json"),
+        ))
+        if rc != 0:
+            raise RuntimeError(f"harness.run_experiment returned {rc}")
+    finally:
+        run.stop_parliament(parliament_proc)
+
     return run_dir
 
 
 def extract_step(run_dir: Path) -> Path:
-    """parliament.db → per-actor trajectory JSONL."""
+    """parliament.db → per-actor trajectory JSONL (subprocess)."""
     train_jsonl = run_dir / "train.jsonl"
-    run([PYTHON_ENV, "-m", "rl.extract",
-         "--db", str(run_dir / "parliament.db"),
-         "--output", str(train_jsonl)])
+    shell_run([PYTHON_ENV, "-m", "rl.extract",
+               "--db", str(run_dir / "parliament.db"),
+               "--output", str(train_jsonl)])
     return train_jsonl
 
 
-def train_step(train_jsonl: Path, model: str, run_dir: Path,
+def train_step(train_jsonl: Path, base_model: str, run_dir: Path,
                num_gpus: int, extra: list[str]) -> Path:
-    """accelerate launch rl.train (DDP + LoRA + PPO clip + KL anchor)."""
+    """``accelerate launch rl.train`` (DDP + LoRA + PPO clip + KL anchor).
+
+    Returns the path to the produced ``adapter/`` folder.  The actual
+    HF-format ``merged/`` folder we hand to vLLM is produced by
+    ``export_step`` running afterwards.
+    """
     ckpt_dir = run_dir / "ckpt"
-    run([
+    shell_run([
         ACCELERATE, "launch",
         "--config_file", "rl/accelerate_ddp.yaml",
         "--num_processes", str(num_gpus),
         "-m", "rl.train",
         "--data", str(train_jsonl),
         "--output", str(ckpt_dir),
-        "--model", model,
-        "--ref-model", model,
+        "--model", base_model,
+        "--ref-model", base_model,
         *extra,
     ])
-    return ckpt_dir
+    last = _find_last_ckpt(ckpt_dir)
+    if last is None:
+        raise RuntimeError(f"No checkpoint found in {ckpt_dir} after train")
+    adapter_dir = last / "adapter"
+    if not _adapter_complete(adapter_dir):
+        raise RuntimeError(
+            f"Trainer finished but {adapter_dir} is missing PEFT files "
+            f"(adapter_config.json or adapter_model.safetensors)")
+    return adapter_dir
 
 
-def export_step(ckpt_dir: Path, run_dir: Path, num_gpus: int) -> Path:
-    """LoRA merge (single-process) or FSDP gather (legacy accelerate)."""
+def export_step(ckpt_dir: Path, run_dir: Path) -> Path:
+    """LoRA merge: ``ckpt/step_K/adapter/`` + base → ``merged/``.
+
+    Single-process — the merge is just ``W += alpha * BA`` for each
+    LoRA-adapted layer, plus copying the base's tokenizer / preprocessor
+    configs and patching in the visual/mtp weights that
+    ``AutoModelForCausalLM`` doesn't load.  ~30 s on an 80 GB A100,
+    output is ~19 GB (a vLLM-loadable HF folder).
+    """
     merged = run_dir / "merged"
     last = _find_last_ckpt(ckpt_dir)
     if last is None:
         raise RuntimeError(f"No checkpoints in {ckpt_dir}")
-    if (last / "adapter").exists():
-        run([PYTHON_ENV, "-m", "rl.export",
-             "--ckpt", str(last), "--output", str(merged)])
-    else:
-        run([ACCELERATE, "launch",
-             "--config_file", "rl/accelerate_ddp.yaml",
-             "--num_processes", str(num_gpus),
-             "-m", "rl.export",
-             "--ckpt", str(last), "--output", str(merged)])
+    if not (last / "adapter").exists():
+        raise RuntimeError(
+            f"{last}/adapter missing — merge requires a PEFT-format "
+            f"adapter, but only the legacy FSDP layout is present")
+    shell_run([PYTHON_ENV, "-m", "rl.export",
+               "--ckpt", str(last), "--output", str(merged)])
     return merged
-
-
-def eval_step(model_path: str, run_dir: Path, eval_gpu: int,
-              max_model_len: int = 16384) -> float | None:
-    """GPQA Diamond on one GPU; returns accuracy or None on failure."""
-    out_path = run_dir / "gpqa_diamond.json"
-    cmd = [PYTHON_ENV, "-m", "eval.gpqa",
-           "--model", model_path, "--output", str(out_path),
-           "--max-model-len", str(max_model_len)]
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(eval_gpu)
-    print(f"\n$ CUDA_VISIBLE_DEVICES={eval_gpu} {shlex.join(cmd)}\n", flush=True)
-    r = subprocess.run(cmd, cwd=str(PROJECT_DIR), env=env)
-    if r.returncode != 0:
-        print(f"  WARN: eval failed (rc={r.returncode}); continuing loop")
-        return None
-    try:
-        return float(json.loads(out_path.read_text())["accuracy"])
-    except Exception as e:
-        print(f"  WARN: could not parse {out_path}: {e}")
-        return None
 
 
 # ── Disk hygiene ─────────────────────────────────────────
 
 def prune_sharded_ckpt(ckpt_dir: Path) -> None:
-    """Delete step_* directories once the merged export succeeds."""
+    """Delete ``step_*/`` directories once the merged export succeeds.
+
+    The trainer's optimizer / scheduler / accelerate state inside
+    each ``step_*/`` is ~700 MB and only useful for mid-iter resume.
+    Once the iter has produced a valid ``merged/`` folder, the
+    sharded checkpoints are no longer needed.
+    """
     for d in ckpt_dir.glob("step_*"):
         shutil.rmtree(d, ignore_errors=True)
     print(f"  Pruned sharded checkpoints in {ckpt_dir}")
@@ -272,18 +401,23 @@ def prune_sharded_ckpt(ckpt_dir: Path) -> None:
 
 def prune_old_merged(name_prefix: str, current_iter: int,
                      rounds_per_epoch: int) -> None:
-    """Drop the previous iter's merged/ unless it's an epoch boundary.
+    """Drop the previous iter's ``merged/`` unless it's an epoch boundary.
 
-    After iter `k` finishes exporting, we delete iter `k-1`'s merged/
-    unless `k-1` was the last round of its total_epoch (i.e.
-    `(k-1) % rounds_per_epoch == 0`), in which case we keep it as
-    an archival snapshot of that epoch's final policy.
+    After iter ``k`` finishes exporting, we delete iter ``k-1``'s
+    ``merged/`` (~19 GB) unless ``k-1`` was the last round of its
+    total_epoch (i.e. ``(k-1) % rounds_per_epoch == 0``), in which
+    case we keep it as an archival snapshot of that epoch's final
+    policy.  At any time the tree holds: every completed epoch's
+    final merged + the current iter's merged (~2 × 19 GB steady).
+
+    NOTE: do not delete the *current* iter's ``merged/`` — the next
+    iter's vLLM will load it as ``--model``.
     """
     if current_iter <= 1:
         return
     prev = current_iter - 1
     if prev % rounds_per_epoch == 0:
-        return  # epoch boundary — preserve
+        return
     prev_run = _find_run_dir(f"{name_prefix}_iter{prev:02d}")
     if prev_run is None:
         return
@@ -330,17 +464,18 @@ def metrics_step(train_jsonl: Path, run_dir: Path) -> dict:
           f"r̄={summary['reward_mean']:+.3f}  "
           f"r>0={summary['reward_pos_pct']:.1f}%  "
           f"|A|̄={summary['advantage_abs_mean']:.3f}  "
-          f"A∈[{summary['advantage_p10']:+.2f}, {summary['advantage_p90']:+.2f}]")
+          f"A∈[{summary['advantage_p10']:+.2f}, "
+          f"{summary['advantage_p90']:+.2f}]")
     return summary
 
 
 def backup_iter(backup_dir: Path, run_dir: Path,
                 total_epoch: int, round_n: int) -> None:
-    """Copy this iter's small artifacts into `backups/<run>/ep{E}.round{R}/`.
+    """Copy this iter's small artifacts into ``backups/<run>/ep{E}.round{R}/``.
 
-    Uses `BACKUP_FILES` for iter-level files and additionally pulls the
-    training-side `ckpt/metrics.jsonl` and `ckpt/config.json` for full
-    reproducibility. Large files (parliament.db, merged/, llm_logs)
+    Uses ``BACKUP_FILES`` for iter-level files and additionally pulls
+    the training-side ``ckpt/metrics.jsonl`` and ``ckpt/config.json``
+    for full reproducibility. Large files (parliament.db, llm_logs)
     are intentionally skipped.
     """
     dest = backup_dir / f"ep{total_epoch}.round{round_n}"
@@ -361,23 +496,42 @@ def backup_iter(backup_dir: Path, run_dir: Path,
 
 def run_one_iteration(iter_n: int, total: int, shard_path: Path,
                       actor_model: str, train_anchor_model: str,
-                      name_prefix: str, cfg: dict, train_extra: list[str],
-                      do_eval: bool, rounds_per_epoch: int
-                      ) -> tuple[str, dict]:
-    """One iter: rollout → extract → train → export → optional eval.
+                      name_prefix: str, cfg: dict,
+                      train_extra: list[str], rounds_per_epoch: int,
+                      gpus: list[int]) -> tuple[str, dict]:
+    """One iter: rollout → extract → train → export.
 
-    Every sub-step is idempotent: if its output artifact already
-    exists from a prior crashed run we skip the work and reuse it.
+    Returns ``(new_merged_path, summary)``.
 
-    `actor_model` is served by vLLM for Parliament.
-    `train_anchor_model` is the fixed base used as both `--model` and
-    `--ref-model`; the KL anchor therefore always points at the original
-    checkpoint regardless of how far the policy has drifted.
+    Pre-conditions:
+      - No vLLM is currently running (the previous iter's stop_vllm
+        was called at the end of train).  This iter starts vLLM
+        with ``actor_model`` as the rollout policy.
+      - ``actor_model`` is the path to the previous iter's merged
+        folder (or the original base on iter 1).
+      - ``train_anchor_model`` is the original base path; it stays
+        constant across all iters as the KL-anchor reference.
+
+    What this iter does:
+      1. Start vLLM fleet with ``actor_model`` as ``--model``
+         (no LoRA flags — full speed inference).
+      2. Run the rollout (Parliament + harness) against vLLMs.
+      3. Stop vLLMs to release all GPU memory for the trainer.
+      4. Run the DDP trainer subprocess (~5-7 min on 4-8 A100).
+      5. Run rl.export to merge the LoRA into ``train_anchor_model``,
+         producing ``run_dir/merged/`` (the next iter's actor).
+      6. Prune intermediate state (sharded ckpts + old merged folders).
+
+    Sub-step idempotency: each step skips if its output artifact
+    already exists from a prior crashed run.  vLLM is NOT left
+    running across iters — the next iter brings it back up with the
+    freshly-merged policy.
     """
     t0 = time.time()
     name = f"{name_prefix}_iter{iter_n:02d}"
-    num_gpus = len(cfg["gpus"].split(","))
-    eval_gpu = int(cfg["gpus"].split(",")[0])
+    num_gpus = len(gpus)
+    gpu_ports = [run.gpu_to_port(g) for g in gpus]
+    gpu_endpoints = [f"http://127.0.0.1:{p}/v1" for p in gpu_ports]
     print(f"\n{'=' * 72}")
     print(f"Iter {iter_n}/{total}  shard={shard_path.name}")
     print(f"  Actor:      {actor_model}")
@@ -387,49 +541,73 @@ def run_one_iteration(iter_n: int, total: int, shard_path: Path,
 
     # 1. Rollout (skip if parliament.db + experiment.json already there)
     existing = _find_run_dir(name)
-    if existing and (existing / "parliament.db").exists() \
-            and (existing / "experiment.json").exists():
+    rollout_done = bool(
+        existing
+        and (existing / "parliament.db").exists()
+        and (existing / "experiment.json").exists()
+    )
+    if rollout_done:
         print(f"  [skip] rollout — reusing {existing.name}")
         run_dir = existing
     else:
-        run_dir = sample_step(shard_path, actor_model, name, cfg)
+        # Bring the vLLM fleet up with this iter's actor as ``--model``.
+        # ``ensure_vllm`` is idempotent: if vLLMs are already running
+        # (e.g. a manual resume on the same iter) it just polls
+        # /v1/models and returns the existing port list.
+        run.ensure_vllm(gpus, actor_model, enable_lora=False)
+        run_dir = rollout_step(shard_path, actor_model, name, cfg,
+                               gpu_endpoints)
 
-    # 2. Extract (skip if train.jsonl non-empty)
+    # 2. Extract (skip if train.jsonl is structurally complete)
     train_jsonl = run_dir / "train.jsonl"
-    if train_jsonl.exists() and train_jsonl.stat().st_size > 100:
+    if _train_jsonl_complete(train_jsonl):
         print(f"  [skip] extract — {train_jsonl.name} "
-              f"({train_jsonl.stat().st_size // 1024} KB)")
+              f"({train_jsonl.stat().st_size // 1024} KB, validated)")
     else:
+        if train_jsonl.exists():
+            print(f"  [redo] extract — existing {train_jsonl.name} "
+                  f"failed validation, regenerating")
         train_jsonl = extract_step(run_dir)
 
     metrics = metrics_step(train_jsonl, run_dir)
 
-    # 3. Train (resume from latest step_* if present)
+    # 3. Train: stop vLLM to free ~80 GB / GPU for the trainer.
+    #    The trainer always uses ``train_anchor_model`` (the original
+    #    base) as both ``--model`` and ``--ref-model``, so the KL
+    #    anchor stays at the unmoved base regardless of how far the
+    #    policy has drifted.
     ckpt_dir = run_dir / "ckpt"
-    extra = list(train_extra)
     last = _find_last_ckpt(ckpt_dir)
-    if last is not None:
-        print(f"  [resume] train — from {last.name}")
-        extra += ["--resume", str(last)]
-    train_step(train_jsonl, train_anchor_model, run_dir, num_gpus, extra)
+    if last is not None and _adapter_complete(last / "adapter"):
+        print(f"  [skip] train — {last.name}/adapter already valid")
+    else:
+        print("  [vllm] stopping fleet to free GPU memory for trainer…")
+        run.stop_vllm()
+        time.sleep(3)
+        extra = list(train_extra)
+        if last is not None:
+            print(f"  [resume] train — from {last.name}")
+            extra += ["--resume", str(last)]
+        train_step(train_jsonl, train_anchor_model, run_dir, num_gpus, extra)
 
-    # 4. Export (skip if merged/ already valid)
+    # 4. Export: merge LoRA → base, output run_dir/merged/.  This is
+    #    what next iter's vLLM will load as ``--model``.  Skip if
+    #    a complete merged folder already exists (resume case).
     merged = run_dir / "merged"
     if _merged_complete(merged):
         print(f"  [skip] export — merged/ already complete")
     else:
-        merged = export_step(ckpt_dir, run_dir, num_gpus)
+        merged = export_step(ckpt_dir, run_dir)
+
+    # 5. Disk hygiene: drop sharded ckpts (no longer needed once
+    #    merged/ is built) and the previous iter's merged/ unless
+    #    it sits on a total-epoch boundary.
     prune_sharded_ckpt(ckpt_dir)
     prune_old_merged(name_prefix, iter_n, rounds_per_epoch)
 
-    # 5. Eval (optional)
-    acc = eval_step(str(merged), run_dir, eval_gpu) if do_eval else None
-
-    dur = (time.time() - t0) / 60
-    print(f"\n  Iter {iter_n} done in {dur:.0f} min → {merged}")
-    if acc is not None:
-        print(f"  GPQA Diamond: {acc:.4f}\n")
-    return str(merged), {"metrics": metrics, "gpqa_acc": acc, "minutes": dur}
+    dur_min = (time.time() - t0) / 60
+    print(f"\n  Iter {iter_n} done in {dur_min:.0f} min → {merged}")
+    return str(merged), {"metrics": metrics, "minutes": dur_min}
 
 
 # ── State file ──────────────────────────────────────────
@@ -439,9 +617,8 @@ def load_state(path: Path, initial_model: str) -> dict:
         return json.loads(path.read_text())
     return {
         "completed": 0,
-        "current_model": initial_model,   # actor for next iter
+        "current_model": initial_model,   # actor for the next iter
         "base_model": initial_model,      # fixed KL anchor
-        "base_gpqa": None,                # baseline accuracy, filled once
         "history": [],
     }
 
@@ -483,8 +660,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--name", required=True, help="Run name")
     p.add_argument("--pool", required=True,
                    help="Question pool JSON path, or comma-separated list "
-                        "of JSONs that will be concatenated (e.g. the 4 "
-                        "sciencepedia_train_part*.json files)")
+                        "of JSONs that will be concatenated")
     p.add_argument("--total-questions", type=int, required=True,
                    help="Questions drawn from --pool (single draw at launch)")
     p.add_argument("--sampling-batch-size", type=int, required=True,
@@ -495,7 +671,9 @@ def parse_args() -> argparse.Namespace:
                    help="Pool sampling seed — same seed ⇒ same schedule "
                         "across all 4 cells for fair ablation.")
     p.add_argument("--initial-model", default=BASE_MODEL,
-                   help="Starting policy; also the fixed KL-anchor target.")
+                   help="Base model (frozen for the entire run; LoRA on top "
+                        "accumulates the policy update). Also doubles as "
+                        "the KL anchor inside rl.train.")
     p.add_argument("--gpus", default="0,1,2,3,4,5,6,7")
     p.add_argument("--sessions-per-gpu", type=int, default=2)
     p.add_argument("--actors", type=int, default=3)
@@ -506,7 +684,10 @@ def parse_args() -> argparse.Namespace:
                         "\"--ppo-epochs 2 --clip-ratio-high 0.25 "
                         "--beta-kl 0.005\"")
     p.add_argument("--no-eval", action="store_true",
-                   help="Skip per-iter GPQA eval (saves ~10 min/iter)")
+                   help="Skip per-iter eval. Currently always implied "
+                        "(eval/gpqa.py is not wired into the new "
+                        "iterate.py loop yet) — accepted for backward "
+                        "compatibility with launch scripts that pass it.")
     p.add_argument("--in-tmux", action="store_true",
                    help="Internal: skip tmux relaunch")
     return p.parse_args()
@@ -555,7 +736,6 @@ def main() -> None:
     rounds_per_epoch = args.total_questions // args.sampling_batch_size
     total_iters = args.total_epochs * rounds_per_epoch
 
-    # Top-level dirs and logging
     out_dir = _resolve_out_dir(args.name)
     state_file = out_dir / "state.json"
     shard_dir = out_dir / "shards"
@@ -578,7 +758,6 @@ def main() -> None:
     train_extra = shlex.split(args.train_extra) if args.train_extra else []
     state = load_state(state_file, args.initial_model)
 
-    # Deterministic schedule — identical across all cells with same seed.
     schedule = build_schedule(pool_paths, args.total_questions,
                               args.sampling_batch_size, args.seed)
     assert len(schedule) == rounds_per_epoch
@@ -595,6 +774,7 @@ def main() -> None:
         "initial_model": args.initial_model,
         "train_extra": args.train_extra,
         "started_at": datetime.now().isoformat(),
+        "architecture": "http_dp8_lora_hot_swap",
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     (backup_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -605,89 +785,90 @@ def main() -> None:
     print(f"  Output:            {out_dir}")
     print(f"  Backups:           {backup_dir}")
     print(f"  Pool:              {', '.join(pool_paths)}")
-    print(f"  Draw:              {args.total_questions} q × "
-          f"seed={args.seed}")
+    print(f"  Draw:              {args.total_questions} q × seed={args.seed}")
     print(f"  Sampling batch:    {args.sampling_batch_size}  "
           f"→ {rounds_per_epoch} rounds/epoch")
     print(f"  Total epochs:      {args.total_epochs}")
     print(f"  Total iters:       {total_iters}")
-    print(f"  Actor / KL anchor: {state['current_model']} / {state['base_model']}")
+    print(f"  Base model:        {args.initial_model}")
+    n_gpus = len(cfg['gpus'].split(','))
+    print(f"  Base model:        {args.initial_model}")
+    print(f"  GPUs:              {cfg['gpus']} (DP={n_gpus}, TP=1 each)")
+    print(f"  Sessions/GPU:      {args.sessions_per_gpu}")
+    print(f"  Actor:             {state['current_model']}")
+    print(f"  KL anchor:         {state['base_model']}")
     print(f"  Completed:         {state['completed']}/{total_iters}")
     print(f"  Train extra:       {args.train_extra}")
-    print(f"  GPUs:              {cfg['gpus']}")
-    print(f"  Per-iter eval:     {'off' if args.no_eval else 'GPQA Diamond'}")
     print(f"  Started:           {datetime.now().isoformat()}")
     print(f"{'=' * 72}\n")
 
-    # Baseline GPQA on the original base — runs once before iter 1.
-    if state["completed"] == 0 and state["base_gpqa"] is None and not args.no_eval:
-        eval_gpu = int(cfg["gpus"].split(",")[0])
-        baseline_dir = out_dir / "baseline_eval"
-        baseline_dir.mkdir(exist_ok=True)
-        print(f"--- Baseline GPQA on {state['base_model']} ---")
-        state["base_gpqa"] = eval_step(
-            state["base_model"], baseline_dir, eval_gpu)
-        save_state(state_file, state)
+    gpus = [int(g) for g in cfg["gpus"].split(",")]
 
-    t_start = time.time()
-    for total_epoch in range(1, args.total_epochs + 1):
-        for round_idx in range(rounds_per_epoch):
-            iter_n = (total_epoch - 1) * rounds_per_epoch + round_idx + 1
-            if iter_n <= state["completed"]:
-                print(f"Skipping iter {iter_n} (already completed)")
-                continue
+    # Pre-flight: kill anything left over from a previous crashed run
+    # (vLLM tmux sessions, port 8080, etc.).  vLLM itself is brought
+    # up inside ``run_one_iteration`` per iter using the iter's actor
+    # model — we don't keep it alive across iters because each iter
+    # must serve a different merged checkpoint as ``--model``.
+    run.cleanup_all(gpus, PARLIAMENT_PORT)
 
-            # Materialise this round's shard file on disk (idempotent).
-            shard_path = shard_dir / f"ep{total_epoch}.round{round_idx + 1}.json"
-            if not shard_path.exists():
-                shard_path.write_text(
-                    json.dumps(schedule[round_idx], ensure_ascii=False))
+    try:
+        t_start = time.time()
+        for total_epoch in range(1, args.total_epochs + 1):
+            for round_idx in range(rounds_per_epoch):
+                iter_n = (total_epoch - 1) * rounds_per_epoch + round_idx + 1
+                if iter_n <= state["completed"]:
+                    print(f"Skipping iter {iter_n} (already completed)")
+                    continue
 
-            merged, summary = run_one_iteration(
-                iter_n, total_iters, shard_path,
-                actor_model=state["current_model"],
-                train_anchor_model=state["base_model"],
-                name_prefix=args.name, cfg=cfg, train_extra=train_extra,
-                do_eval=not args.no_eval,
-                rounds_per_epoch=rounds_per_epoch)
+                shard_path = (shard_dir
+                              / f"ep{total_epoch}.round{round_idx + 1}.json")
+                if not shard_path.exists():
+                    shard_path.write_text(
+                        json.dumps(schedule[round_idx], ensure_ascii=False))
 
-            run_dir = _find_run_dir(f"{args.name}_iter{iter_n:02d}")
-            if run_dir is not None:
-                backup_iter(backup_dir, run_dir, total_epoch, round_idx + 1)
+                new_merged, summary = run_one_iteration(
+                    iter_n, total_iters, shard_path,
+                    actor_model=state["current_model"],
+                    train_anchor_model=state["base_model"],
+                    name_prefix=args.name, cfg=cfg,
+                    train_extra=train_extra,
+                    rounds_per_epoch=rounds_per_epoch,
+                    gpus=gpus,
+                )
 
-            state = {
-                **state,
-                "completed": iter_n,
-                "current_model": merged,
-                "history": state["history"] + [{
-                    "iter": iter_n,
-                    "total_epoch": total_epoch,
-                    "round": round_idx + 1,
-                    "shard": str(shard_path),
-                    "merged": merged,
-                    "timestamp": datetime.now().isoformat(),
-                    "metrics": summary["metrics"],
-                    "gpqa_acc": summary["gpqa_acc"],
-                    "minutes": round(summary["minutes"], 1),
-                }],
-            }
-            save_state(state_file, state)
-            shutil.copy(state_file, backup_dir / "state.json")
+                run_dir = _find_run_dir(f"{args.name}_iter{iter_n:02d}")
+                if run_dir is not None:
+                    backup_iter(backup_dir, run_dir, total_epoch,
+                                round_idx + 1)
 
-    total_min = (time.time() - t_start) / 60
-    print(f"\n{'=' * 72}")
-    print(f"All {total_iters} iters done in {total_min:.0f} min "
-          f"({args.total_epochs} epoch × {rounds_per_epoch} rounds).")
-    print(f"Final policy: {state['current_model']}")
-    print(f"Backups:      {backup_dir}")
-    if state.get("base_gpqa") is not None:
-        print(f"\n  Base GPQA: {state['base_gpqa']:.4f}")
-    for h in state["history"]:
-        if h.get("gpqa_acc") is not None:
-            tag = f"ep{h['total_epoch']}.round{h['round']}"
-            print(f"  {tag}: GPQA = {h['gpqa_acc']:.4f}  "
-                  f"(|A|̄ = {h['metrics'].get('advantage_abs_mean', 0):.3f})")
-    print(f"{'=' * 72}\n")
+                state = {
+                    **state,
+                    "completed": iter_n,
+                    "current_model": new_merged,
+                    "history": state["history"] + [{
+                        "iter": iter_n,
+                        "total_epoch": total_epoch,
+                        "round": round_idx + 1,
+                        "shard": str(shard_path),
+                        "merged": new_merged,
+                        "timestamp": datetime.now().isoformat(),
+                        "metrics": summary["metrics"],
+                        "minutes": round(summary["minutes"], 1),
+                    }],
+                }
+                save_state(state_file, state)
+                shutil.copy(state_file, backup_dir / "state.json")
+
+        total_min = (time.time() - t_start) / 60
+        print(f"\n{'=' * 72}")
+        print(f"All {total_iters} iters done in {total_min:.0f} min "
+              f"({args.total_epochs} epoch × {rounds_per_epoch} rounds).")
+        print(f"Final policy: {state['current_model']}")
+        print(f"Backups:      {backup_dir}")
+        print(f"{'=' * 72}\n")
+    finally:
+        print("\n[shutdown] tearing down vLLM fleet…", flush=True)
+        run.stop_vllm()
 
 
 if __name__ == "__main__":

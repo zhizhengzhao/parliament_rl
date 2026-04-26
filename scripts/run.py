@@ -167,12 +167,18 @@ def stop_vllm() -> None:
                    capture_output=True)
     # Layer 3: fuser-kill every vLLM port (catches orphan workers
     # whose cmdline doesn't match "vllm.entrypoints" but still hold
-    # the listening socket).
+    # the listening socket).  Wrapped in FileNotFoundError because
+    # minimal containers (e.g. our k8s-launched A100 pod) ship without
+    # ``psmisc`` and ``fuser`` is missing — we don't want a missing
+    # binary to crash the entire iter.
     for port in range(7999, 8007):  # 7999..8006 inclusive (8 GPUs)
-        subprocess.run(
-            ["fuser", "-k", "-9", f"{port}/tcp"],
-            capture_output=True, timeout=10,
-        )
+        try:
+            subprocess.run(
+                ["fuser", "-k", "-9", f"{port}/tcp"],
+                capture_output=True, timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
     time.sleep(3)
 
 
@@ -216,7 +222,8 @@ def gpu_to_port(gpu: int) -> int:
     return 7999 + gpu
 
 
-def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH) -> list[int]:
+def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH,
+                enable_lora: bool = False) -> list[int]:
     """Bring up one vLLM API per GPU in this pod, *sequentially*.
 
     Within a single pod the 8 vLLM processes all read the same 19 GB
@@ -242,6 +249,23 @@ def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH) -> list[int]:
     1800 s for everything is harmless when the load is light (the
     poller still returns as soon as the server is up) and prevents
     spurious cascading failures under heavy NFS pressure.
+
+    LoRA-runtime support (``enable_lora=True``, off by default):
+      Adds ``--enable-lora`` and exports ``VLLM_ALLOW_RUNTIME_LORA_UPDATING=True``.
+      In principle this lets iterate.py hot-swap PEFT adapters via
+      ``/v1/load_lora_adapter`` without ever restarting vLLM, saving
+      ~30 s of merge time per iter.
+
+      In practice we keep this **off** because vLLM 0.19.1 LoRA
+      inference is ~5-10× slower than the base model on long contexts
+      (multi-turn sessions hit ~2.4 tokens/s decode under LoRA vs
+      40+ tokens/s on the merged base).  The merged base path also
+      keeps prefix caching effective; LoRA scope shows 0% prefix-cache
+      hit rate.  iterate.py therefore uses the legacy merge+reload
+      pipeline (``rl.export`` produces a vLLM-loadable HF folder per
+      iter, vLLM is restarted with that folder as ``--model``).
+      Set ``enable_lora=True`` only for experiments that explicitly
+      want the hot-swap path.
     """
     ports: list[int] = []
     for i, gpu in enumerate(gpus):
@@ -250,12 +274,47 @@ def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH) -> list[int]:
         session_name = f"{TMUX_PREFIX}{gpu}"
         subprocess.run(["tmux", "kill-session", "-t", session_name],
                        capture_output=True)
+        # LoRA flags are additive: ``enable_lora=False`` keeps the
+        # cmdline minimal for pods that only need plain inference
+        # (e.g. eval). iterate.py always passes ``True`` because it
+        # uses ``/v1/load_lora_adapter`` to hot-swap adapters between
+        # training iters.
+        #
+        # ``--max-model-len 32768`` controls both KV cache budget AND
+        # cudagraph capture window: vLLM 0.19+ removed the separate
+        # ``--max-seq-len-to-capture`` flag (PR #25543) and now uses
+        # ``max_model_len`` directly.  Our multi-turn sessions hit
+        # 15-23K tokens of accumulated context, so 32768 keeps every
+        # sequence inside cudagraph mode (else throughput drops 5-10×).
+        #
+        # ``--gpu-memory-utilization 0.90`` reserves ~80 GB / A100 for
+        # this vLLM (model weights ~18 GB + ~60 GB KV cache + small
+        # buffers), so we can batch many concurrent long-context
+        # rollout requests.
+        #
+        # cudagraphs and prefix caching are default-on in vLLM 0.19+
+        # — both critical for multi-turn rollout speed (system prompt
+        # of ~2 KB is shared across every actor turn within a session).
+        #
+        # vLLM 0.19.1 LoRA + cudagraph + long context has a decode
+        # throughput cliff (~2 tokens/s vs 40+ on merged base).  We
+        # therefore default ``enable_lora=False`` and merge the LoRA
+        # into the base on every iter (see ``rl.export``).  Set
+        # ``enable_lora=True`` only for experiments that explicitly
+        # want LoRA hot-swap.
+        if enable_lora:
+            lora_args = "--enable-lora --max-loras 4 --max-lora-rank 64 "
+            env_prefix = "VLLM_ALLOW_RUNTIME_LORA_UPDATING=True "
+        else:
+            lora_args = ""
+            env_prefix = ""
         cmd = (
-            f"CUDA_VISIBLE_DEVICES={gpu} {VLLM_PYTHON} "
+            f"CUDA_VISIBLE_DEVICES={gpu} {env_prefix}{VLLM_PYTHON} "
             f"-m vllm.entrypoints.openai.api_server "
             f"--model {model_path} --port {port} "
             f"--max-model-len 32768 --gpu-memory-utilization 0.90 "
             f"--enable-auto-tool-choice --tool-call-parser hermes "
+            f"{lora_args}"
             f"--dtype auto 2>&1 | tee /tmp/vllm_gpu{gpu}.log"
         )
         subprocess.run(["tmux", "new-session", "-d", "-s", session_name, cmd],
@@ -270,7 +329,8 @@ def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH) -> list[int]:
             stop_vllm()
             sys.exit(1)
         print(f"  GPU {gpu} → :{port} ready", flush=True)
-    print(f"  All {len(ports)} vLLM instances ready")
+    print(f"  All {len(ports)} vLLM instances ready"
+          f"{' (with LoRA + sleep mode)' if enable_lora else ''}")
     return ports
 
 

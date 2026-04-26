@@ -1,34 +1,44 @@
-# Parliament RL — Python dependencies
+# Parliament RL — pip dependencies.
 #
-# Install:
-#   pip install -r requirements.txt
+# This file is kept for legacy workflows (`pip install -r requirements.txt`).
+# The single source of truth for project metadata + dependencies is
+# `pyproject.toml`; prefer:
+#
+#     pip install -e .              # core
+#     pip install -e ".[fast]"      # + fused attention kernels
+#     pip install -e ".[dev]"       # + pytest
+#
+# After install, every CLI is on $PATH (prl-server, prl-iterate, …).
+# See `pyproject.toml:[project.scripts]` for the full list.
 #
 # Lower bounds reflect what's actually been validated on the A100 dev box.
-# A "known-good" pin set is recorded as comments — use those if you need
-# bit-identical behaviour for reproducing results.
+# Pinned "known-good" versions are recorded in pyproject.toml comments —
+# use those if you need bit-identical behaviour for reproducing results.
 
 # Parliament server + harness (data collection)
-fastapi>=0.135            # known-good: 0.135.1
-uvicorn>=0.41             # known-good: 0.41.0
-aiohttp>=3.13             # known-good: 3.13.3
+fastapi>=0.135
+uvicorn>=0.41
+aiohttp>=3.13
+pydantic>=2.0
 
-# RL training (rl/train.py + rl/export.py)
-torch>=2.10               # known-good: 2.10.0+cu128 (CUDA 12.8 wheel)
-transformers>=5.5         # known-good: 5.5.4
-accelerate>=1.13          # known-good: 1.13.0
-peft>=0.19                # known-good: 0.19.1
-safetensors>=0.7          # known-good: 0.7.0
+# RL training (rl/train.py — outputs PEFT LoRA adapter directly,
+# vLLM hot-swaps via /v1/load_lora_adapter so no separate merge step)
+torch>=2.10
+transformers>=5.5
+accelerate>=1.13
+peft>=0.19
+safetensors>=0.7
 
-# Inference (vLLM serving for data generation)
-# scripts/run.py uses the generic `hermes` tool-call parser which is
-# supported across vllm 0.17-0.19.
-vllm>=0.17                # known-good: 0.17.1 (A100 box), 0.19.1 (KS box)
+# Inference (vLLM HTTP server with --enable-lora + --enable-sleep-mode;
+# DP=8 + TP=1 across all 8 GPUs is the canonical RLHF rollout config —
+# see OpenRLHF / verl docs)
+vllm>=0.17
 
-# Optional: fused kernels for Qwen3.5 hybrid attention (~2-3x vLLM speedup)
-# All three have prebuilt wheels for the torch 2.10 / cu128 combo above.
-flash-linear-attention>=0.4   # known-good: 0.4.2 (pure Triton, no compile)
-causal-conv1d>=1.6            # known-good: 1.6.1
-flash-attn>=2.7               # known-good: 2.7.4.post1
+# Optional fused kernels (~2-3x vLLM speedup on Qwen3.5 hybrid attention).
+# Comment these out if your platform lacks pre-built wheels.
+flash-linear-attention>=0.4
+causal-conv1d>=1.6
+flash-attn>=2.7
 
 # Implicit but worth noting (pulled in by torch / transformers):
 #   triton 3.6.0

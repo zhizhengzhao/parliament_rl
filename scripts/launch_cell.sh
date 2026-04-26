@@ -1,6 +1,12 @@
 #!/bin/bash
 # scripts/launch_cell.sh — one-click launch of one 2x2 cell on a single pod.
 #
+# Architecture: iterate.py orchestrates a fleet of 8 vLLM HTTP servers
+# (one per GPU, TP=1 each) plus a Parliament HTTP server, both as
+# subprocesses.  vLLMs stay alive across all training iters; LoRA
+# adapters hot-swap via /v1/load_lora_adapter and KV cache is freed
+# during training via /sleep + /wake_up.
+#
 # Usage:
 #   bash scripts/launch_cell.sh <CELL> <PROJECT_DIR> <PYTHON> <MODEL_PATH> [iterate.py extra args...]
 #
@@ -11,15 +17,15 @@
 #   D = BlindSolo        (PRL_CONTEXT=Solo,       judge votes hidden)
 #
 # What it does:
-#   1. Pre-flight: kill any leftover iterate/run/vllm/keepalive procs.
-#   2. Launch iterate.py inside tmux session 'parliament-iterate' (detached).
-#      `iterate.py --in-tmux` then forks vllm-gpuN tmux sessions itself.
-#   3. Launch a second tmux 'keepalive-watcher' that monitors the iterate
-#      process and, once it exits (success or crash), runs gpu_keepalive.py
-#      to keep the pod from being reclaimed by the cluster.
+#   1. Pre-flight: kill leftover iterate / parliament / vllm processes
+#      and tmux sessions, including any vllm-gpuN tmux sessions from
+#      a previous run (iterate.py's run.ensure_vllm() launches one
+#      tmux per GPU as 'vllm-gpu{N}').
+#   2. Launch iterate.py in tmux 'parliament-iterate' (detached).
+#   3. Launch a 'keepalive-watcher' tmux that takes over the pod
+#      with gpu_keepalive.py once the training run finishes.
 #
-# All paths are absolute so this can be invoked from anywhere.
-# All env-vars (PRL_CONTEXT etc.) are baked into the iterate cmdline so they
+# All env-vars (PRL_CONTEXT etc.) are baked into the cmdline so they
 # survive the tmux session boundary.
 
 set -euo pipefail
@@ -27,10 +33,11 @@ set -euo pipefail
 if [[ $# -lt 4 ]]; then
   echo "Usage: $0 <A|B|C|D> <PROJECT_DIR> <PYTHON> <MODEL_PATH> [iterate.py extra args...]"
   echo "Example:"
-  echo "  $0 A /pfs/zhizheng/parliament_rl /pfs/zhizheng/parliament_env/bin/python /pfs/zhizheng/Qwen3.5-9B \\"
+  echo "  $0 A /path/to/parliament_rl /path/to/python_env/bin/python /path/to/Qwen3.5-9B \\"
   echo "    --name smokeA --pool datasets/sciencepedia_train_part1.json \\"
-  echo "    --total-questions 400 --sampling-batch-size 100 --total-epochs 3 --seed 42 \\"
-  echo "    --gpus 0,1,2,3,4,5,6,7 --sessions-per-gpu 2 --actors 3 --judges 3 --max-turns 30"
+  echo "    --total-questions 200 --sampling-batch-size 200 --total-epochs 8 --seed 42 \\"
+  echo "    --gpus 0,1,2,3,4,5,6,7 --sessions-per-gpu 4 \\"
+  echo "    --max-concurrent-sessions 16 --actors 3 --judges 3 --max-turns 30"
   exit 1
 fi
 
@@ -67,13 +74,17 @@ echo "============================================================"
 
 echo "[1/3] Cleanup leftover processes..."
 pkill -9 -f 'iterate.py'         2>/dev/null || true
-pkill -9 -f 'scripts/run.py'     2>/dev/null || true
+pkill -9 -f 'parliament.server'  2>/dev/null || true
 pkill -9 -f 'vllm.entrypoints'   2>/dev/null || true
+pkill -9 -f 'VLLM::EngineCore'   2>/dev/null || true
 pkill -9 -f 'gpu_keepalive'      2>/dev/null || true
 pkill -9 -f 'keepalive_watcher'  2>/dev/null || true
 tmux kill-session -t parliament-iterate 2>/dev/null || true
 tmux kill-session -t keepalive-watcher  2>/dev/null || true
-for i in 0 1 2 3 4 5 6 7; do tmux kill-session -t "vllm-gpu${i}" 2>/dev/null || true; done
+# Per-GPU vLLM tmux sessions (one per card, named vllm-gpu{N})
+for i in 0 1 2 3 4 5 6 7; do
+  tmux kill-session -t "vllm-gpu${i}" 2>/dev/null || true
+done
 sleep 3
 echo "  GPU memory after cleanup:"
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | sed 's/^/    /'
@@ -96,8 +107,7 @@ LOG=/tmp/keepalive_watcher_${CELL}.log
 echo "[\$(date)] watcher start (cell ${CELL})" > "\$LOG"
 while true; do
   if ! pgrep -f 'iterate.py'        > /dev/null \\
-   && ! pgrep -f 'scripts/run.py'   > /dev/null \\
-   && ! pgrep -f 'vllm.entrypoints' > /dev/null; then
+   && ! pgrep -f 'parliament.server' > /dev/null; then
     echo "[\$(date)] iterate done, exec gpu_keepalive on all 8 GPUs" >> "\$LOG"
     cd "$PROJECT_DIR"
     exec "$PYTHON" scripts/gpu_keepalive.py --gpus 0,1,2,3,4,5,6,7

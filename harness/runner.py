@@ -382,8 +382,15 @@ def _print_session_summary(sid: str, gpu_port: str, dur: float,
              "llm_errors": "!", "step_limit": "S", "no_tool": "N"}
     for r in results:
         icon = icons.get(r.exit_reason, "?")
+        # ``r.rounds`` = total attempts; ``S/F`` = successful/failed split.
+        # When F is large vs S the session was LLM-API-throttled, not
+        # actor-decided.  This distinguishes "short session because
+        # framework let actor leave early" (F=0) from "short session
+        # because half the rounds errored out" (F≫0).
         print(f"    [{icon}] {r.name:15s} {r.role:6s} "
-              f"{r.exit_reason:15s} {r.rounds:2d}r {r.llm_calls:2d}llm "
+              f"{r.exit_reason:15s} {r.rounds:2d}r "
+              f"(S{r.successful_rounds}/F{r.failed_rounds}) "
+              f"{r.llm_calls:2d}llm "
               f"{r.posts_created}p {r.comments_created}c {r.votes_cast}v "
               f"{r.duration:.0f}s tok={r.total_prompt_tokens}+{r.total_completion_tokens} "
               f"fb={r.fallback_parses} err={r.api_errors},{r.llm_errors} "
@@ -481,6 +488,21 @@ async def run_session(
             await _wait_for_actor_event(actor_names, events, tasks)
             for e in events.values():
                 e.clear()
+
+            # Defensive prune: if an agent task crashed without
+            # reaching its ``processing.discard(name)`` cleanup (e.g.
+            # python_exec subprocess deadlock, asyncio gather race),
+            # the name lingers in the processing set and the
+            # ``not actor_processing`` idle-detection check below never
+            # fires — the session then drags out to max_rounds with
+            # no productive work.  ``task.done()`` is the asyncio
+            # ground truth: a True result means the coroutine has
+            # finished or raised, so the name has no business sitting
+            # in ``processing`` anymore.
+            stale_actors = {n for n in actor_processing if tasks[n].done()}
+            stale_judges = {n for n in judge_processing if tasks[n].done()}
+            actor_processing -= stale_actors
+            judge_processing -= stale_judges
 
             fetched = await _fetch_new_content(
                 http, parliament_url, admin_key, sid, cursors,

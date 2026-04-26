@@ -6,7 +6,7 @@ Excludes code-answer questions (unsuitable for forum discussion).
 
 Usage:
     python scripts/sample_dataset.py \
-        --input /root/zhizheng/datasets/parliament/sciencepedia_final.json \
+        --input <path/to/full_dataset.json> \
         --output-dir datasets \
         --seed 42
 """

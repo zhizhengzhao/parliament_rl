@@ -76,7 +76,16 @@ class AgentResult:
     name: str
     role: str
     session_id: str
+    # ``rounds`` counts *attempts* (every loop iteration, including those
+    # that bailed out because the LLM call failed).  ``successful_rounds``
+    # and ``failed_rounds`` partition this — a session that looks short
+    # because the LLM API was flaky shows up as ``successful_rounds <<
+    # rounds``, while a session that's short because the actor decided
+    # to leave shows ``failed_rounds == 0``.  Always:
+    #     rounds == successful_rounds + failed_rounds
     rounds: int = 0
+    successful_rounds: int = 0
+    failed_rounds: int = 0
     llm_calls: int = 0
     duration: float = 0
     exit_reason: str = ""
@@ -557,6 +566,10 @@ async def _run_agent_inner(
         # LLM errors (round_result is None) can't keep an actor looping
         # forever — `max_rounds` is an upper bound on *attempts*.
         round_num += 1
+        if round_result is None:
+            result.failed_rounds += 1
+        else:
+            result.successful_rounds += 1
 
         if round_result is None:
             if result.exit_reason == "context_overflow":

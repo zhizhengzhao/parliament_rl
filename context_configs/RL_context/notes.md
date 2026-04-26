@@ -54,23 +54,38 @@ must read the data to reason; the wrapper is decorative.
 every key to its first variant (byte-stable output, useful for
 ablation against an augmented run).
 
-## Vote events (cell-aware)
+## Vote events (default: stripped)
 
-Vote events appear as standalone timeline entries (matching the
-rollout-time format the LLM saw, e.g. `[V on P_3] by Anonymous
-Scientist: +2 vote, current score of P_3: +5`) only when the session's
-actor-side content references voting.  The `session_uses_vote_language`
-heuristic checks posts (always) and comments (Parliament cells only),
-and the vote pool is filtered by cell:
+`rl/extract.py` accepts `--strip-vote-events / --no-strip-vote-events`
+(default **ON**).
 
-- A (Parliament): keep all visible votes (actor + judge)
-- B (BlindParliament): drop judge votes; only actor mutual votes survive
-- C (Solo): keep judge votes; no actor votes exist (no vote tool in solo)
-- D (BlindSolo): no votes at all
+When stripped (the recommended main-experiment setting), no vote
+events ever enter the rendered training context.  The reward
+signal is delivered to the trainer purely via `turn_advantages`
+per assistant turn; the input context contains only posts (plus
+comments in coupled cells).  This:
 
-The cumulative `current score` on each vote event is re-computed from
-the visible-vote pool, so judges never leak through the score field
-in cells that hide them.
+* removes the spurious "read the vote field to predict reward"
+  shortcut (the field is absent at zero-shot inference time);
+* makes the training-context *form* of A vs B nearly identical,
+  so the visibility ablation tests *trajectory quality* rather
+  than *form*;
+* aligns training-input form with evaluation-input form
+  (GPQA/MC100 inputs carry no vote events).
+
+When `--no-strip-vote-events` (legacy / fairness ablation), vote
+events are inserted only when the session's actor-side content
+references voting (`session_uses_vote_language` heuristic), and
+the surviving vote pool is filtered by cell:
+
+- A (Parliament):       keep all visible votes (actor + judge)
+- B (BlindParliament):  drop judge votes; only actor mutual votes survive
+- C (Solo):             keep judge votes (own posts only); no actor votes (no vote tool)
+- D (BlindSolo):        no votes at all
+
+The cumulative `current score` on each vote event is re-computed
+from the visible-vote pool, so judges never leak through the score
+field in cells that hide them.
 
 ## Identity anonymization (`anonymize_identity`)
 

@@ -1,0 +1,143 @@
+# Parliament RL — packaging.
+#
+# Install (editable, recommended for dev):
+#   pip install -e .
+#
+# Install (with the optional fast-attention kernels):
+#   pip install -e ".[fast]"
+#
+# Install (with dev / test extras):
+#   pip install -e ".[dev]"
+#
+# Once installed, every CLI is on $PATH (see [project.scripts] below):
+#   prl-server         (parliament uvicorn API)
+#   prl-run            (one-shot data collection: vLLM HTTP fleet +
+#                       Parliament + harness)
+#   prl-iterate        (outer training loop: one merge+reload cycle
+#                       per iter, vLLM started fresh from each iter's
+#                       merged checkpoint)
+#   prl-extract        (parliament.db → train.jsonl)
+#   prl-train          (offline RL trainer; outputs PEFT LoRA adapter)
+#   prl-export         (merge LoRA into base + patch visual/mtp weights
+#                       → vLLM-loadable HF folder for the next iter)
+#   prl-eval-gpqa      (GPQA Diamond zero-shot CoT)
+#   prl-eval-mc        (Sciencepedia held-out MC100 zero-shot)
+#   prl-eval-frame     (in-frame eval with secretary)
+#   prl-compare-policies   (multi-policy reward comparison on one shard)
+#   prl-sample-dataset (depth-5 category-uniform train/test split)
+#
+# Lower bounds reflect what's actually been validated on the A100 dev box.
+# Pinned "known-good" versions are recorded as a comment near each line —
+# use those if you need bit-identical behaviour for reproducing results.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parliament-rl"
+version = "0.1.0"
+description = "A multi-agent scientific forum + offline RL pipeline (Parliament + Solo cells, PPO clip + KL anchor, vLLM-served rollouts)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Zhao Zhizheng"},
+]
+keywords = [
+    "reinforcement-learning",
+    "multi-agent",
+    "language-models",
+    "scientific-reasoning",
+    "ppo",
+    "grpo",
+    "lora",
+    "vllm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Runtime dependencies — `pip install -e .` installs everything below
+# in one shot.  Heavy GPU stack (torch, vllm, flash_attn) is included
+# because the project does not run without them.
+dependencies = [
+    # Parliament server + harness
+    "fastapi>=0.135",        # known-good: 0.135.1
+    "uvicorn>=0.41",         # known-good: 0.41.0
+    "aiohttp>=3.13",         # known-good: 3.13.3
+    "pydantic>=2.0",
+
+    # RL training (rl/train.py)
+    "torch>=2.10",           # known-good: 2.10.0+cu128
+    "transformers>=5.5",     # known-good: 5.5.4 (qwen3_5 needs 5.x)
+    "accelerate>=1.13",      # known-good: 1.13.0
+    "peft>=0.19",             # known-good: 0.19.1
+    "safetensors>=0.7",       # known-good: 0.7.0
+
+    # Inference (in-process vLLM AsyncLLM driven by harness/llm_engine.py;
+    # no HTTP server in the loop anymore — the engine is co-located with
+    # iterate.py's asyncio loop and adapters are hot-swapped via add_lora).
+    "vllm>=0.17",             # known-good: 0.17.1 (A100), 0.19.1 (KS)
+]
+
+[project.optional-dependencies]
+# Optional fused kernels — ~2-3x vLLM speedup on Qwen3.5 hybrid attention.
+# Pre-built wheels exist for the torch 2.10 / cu128 combo.  Skip on CPU-only
+# install.
+fast = [
+    "flash-linear-attention>=0.4",   # known-good: 0.4.2 (pure Triton, no compile)
+    "causal-conv1d>=1.6",            # known-good: 1.6.1
+    "flash-attn>=2.7",               # known-good: 2.7.4.post1
+]
+
+# Dev: minimal test runner.  Tests in tests/ are pure-Python unit tests
+# against the cell-agnostic logic (eval/secretary.py, rl/extract.py
+# session shaping) — no GPU, no vLLM, no model weights required.
+dev = [
+    "pytest>=7",
+]
+
+[project.scripts]
+# Server (Parliament HTTP API)
+prl-server          = "parliament.server:main"
+# Top-level orchestrators
+prl-run             = "scripts.run:main"
+prl-iterate         = "scripts.iterate:main"
+prl-compare-policies = "scripts.eval_policy_on_shard:main"
+prl-sample-dataset  = "scripts.sample_dataset:main"
+# RL pipeline
+prl-extract         = "rl.extract:main"
+prl-train           = "rl.train:main"
+prl-export          = "rl.export:main"
+# Evaluations
+prl-eval-gpqa       = "eval.gpqa:main"
+prl-eval-mc         = "eval.sciencepedia_mc:main"
+prl-eval-frame      = "eval.frame:main"
+
+[project.urls]
+Repository = "https://github.com/zhizhengzhao/parliament_rl"
+
+# ── Setuptools configuration ─────────────────────────────────────
+
+[tool.setuptools]
+# Top-level packages are flat (no src/ layout).  Each is a regular
+# Python package with an __init__.py module-level docstring.
+packages = ["parliament", "harness", "rl", "eval", "scripts"]
+
+[tool.setuptools.package-data]
+# Ship Parliament's tiny static admin UI inside the wheel so
+# `prl-server` works after `pip install` from the source tree.
+parliament = ["static/*.html", "static/*.css", "static/*.js"]
+
+# ── Pytest ───────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-q --strict-markers"
