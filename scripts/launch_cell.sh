@@ -118,7 +118,9 @@ RUNNER=/tmp/iterate_runner_${CELL}.sh
   echo "export PRL_JUDGE_VOTES_VISIBLE=$(printf '%q' "$PRL_JUDGE_VOTES_VISIBLE")"
   echo 'export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=7200'
   echo 'export PYTORCH_ALLOC_CONF=expandable_segments:True'
-  printf 'exec %q scripts/iterate.py' "$PYTHON"
+  # --in-tmux tells iterate.py to skip its self-launch-into-tmux step
+  # (we're already running it from inside our own 'parliament-iterate' tmux).
+  printf 'exec %q scripts/iterate.py --in-tmux' "$PYTHON"
   for arg in "${ITERATE_EXTRA[@]}"; do
     printf ' %q' "$arg"
   done
