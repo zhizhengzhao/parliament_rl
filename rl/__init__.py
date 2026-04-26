@@ -1,6 +1,6 @@
-"""Offline RL pipeline — data extraction + training.
+"""Offline RL pipeline — data extraction + training + export.
 
-Two CLIs, run in order by ``scripts/iterate.py``:
+Three CLIs, run in order by ``scripts/iterate.py``:
 
 * ``rl.extract`` — ``parliament.db`` → per-actor multi-turn
   trajectory ``train.jsonl``; cell-aware view rebuild + position
@@ -8,11 +8,10 @@ Two CLIs, run in order by ``scripts/iterate.py``:
 * ``rl.train`` — DDP + LoRA + token-level PPO ratio + asymmetric
   clip + KL anchor to the frozen base. ``π_old`` and ``π_ref`` are
   pre-computed at the start of each iter and frozen across all
-  ``ppo_epochs``. Outputs a PEFT adapter folder directly loadable
-  by vLLM via ``add_lora`` — no separate merge / export step.
-
-Stage 2 (current): the merged-checkpoint export step (``rl.export``)
-was removed because vLLM hot-swaps adapters in-process; merging
-the 0.7 GB LoRA into the 19 GB base every iter was pure waste of
-disk and CPU time.
+  ``ppo_epochs``. Outputs a PEFT adapter folder.
+* ``rl.export`` — merge LoRA adapter into the base model; produce
+  a full HF folder that the next iter's vLLM loads directly. Hot-
+  swap (``/v1/load_lora_adapter``) was tried but vLLM 0.19.1 LoRA
+  decode is ~5-10× slower than merged base on long context, so
+  merge+reload is the canonical path (see ``scripts/iterate.py``).
 """

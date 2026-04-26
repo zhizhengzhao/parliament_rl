@@ -80,10 +80,11 @@ dependencies = [
     "peft>=0.19",             # known-good: 0.19.1
     "safetensors>=0.7",       # known-good: 0.7.0
 
-    # Inference (in-process vLLM AsyncLLM driven by harness/llm_engine.py;
-    # no HTTP server in the loop anymore — the engine is co-located with
-    # iterate.py's asyncio loop and adapters are hot-swapped via add_lora).
-    "vllm>=0.17",             # known-good: 0.17.1 (A100), 0.19.1 (KS)
+    # Inference (vLLM HTTP fleet, DP=N + TP=1 — one server per GPU.
+    # Per-iter cycle is kill+restart + LoRA-merge into base + reload
+    # from disk; see scripts/iterate.py:36 for why merge+reload beats
+    # LoRA hot-swap on vLLM 0.19.1 long-context decode.)
+    "vllm>=0.19",             # known-good: 0.19.1 (Qwen3.5 LoRA cudagraph fix)
 ]
 
 [project.optional-dependencies]

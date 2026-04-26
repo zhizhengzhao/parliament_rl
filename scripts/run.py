@@ -275,10 +275,11 @@ def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH,
         subprocess.run(["tmux", "kill-session", "-t", session_name],
                        capture_output=True)
         # LoRA flags are additive: ``enable_lora=False`` keeps the
-        # cmdline minimal for pods that only need plain inference
-        # (e.g. eval). iterate.py always passes ``True`` because it
-        # uses ``/v1/load_lora_adapter`` to hot-swap adapters between
-        # training iters.
+        # cmdline minimal — and that's the default everywhere because
+        # iterate.py uses the merge+reload pipeline (rl.export merges
+        # LoRA into the base each iter, vLLM is restarted from the
+        # fresh merged folder with no ``--enable-lora`` flag). Pass
+        # ``enable_lora=True`` only for explicit hot-swap experiments.
         #
         # ``--max-model-len 32768`` controls both KV cache budget AND
         # cudagraph capture window: vLLM 0.19+ removed the separate

@@ -1,11 +1,15 @@
 #!/bin/bash
 # scripts/launch_cell.sh — one-click launch of one 2x2 cell on a single pod.
 #
-# Architecture: iterate.py orchestrates a fleet of 8 vLLM HTTP servers
-# (one per GPU, TP=1 each) plus a Parliament HTTP server, both as
-# subprocesses.  vLLMs stay alive across all training iters; LoRA
-# adapters hot-swap via /v1/load_lora_adapter and KV cache is freed
-# during training via /sleep + /wake_up.
+# Architecture: iterate.py runs a per-iter cycle of
+#   1. boot N vLLM HTTP servers (one per GPU, DP=N + TP=1)
+#   2. rollout via Parliament + harness
+#   3. kill vLLM to free GPU memory
+#   4. DDP train (LoRA on top of base)
+#   5. merge LoRA into base via rl.export
+#   6. reboot vLLM from the fresh merged folder for next iter
+# (Hot-swap via /v1/load_lora_adapter was tried; merge+reload is faster
+# on vLLM 0.19.1 long-context decode — see scripts/iterate.py:36.)
 #
 # Usage:
 #   bash scripts/launch_cell.sh <CELL> <PROJECT_DIR> <PYTHON> <MODEL_PATH> [iterate.py extra args...]
@@ -19,8 +23,8 @@
 # What it does:
 #   1. Pre-flight: kill leftover iterate / parliament / vllm processes
 #      and tmux sessions, including any vllm-gpuN tmux sessions from
-#      a previous run (iterate.py's run.ensure_vllm() launches one
-#      tmux per GPU as 'vllm-gpu{N}').
+#      a previous run (run.ensure_vllm launches one tmux per GPU
+#      named 'vllm-gpu{N}').
 #   2. Launch iterate.py in tmux 'parliament-iterate' (detached).
 #   3. Launch a 'keepalive-watcher' tmux that takes over the pod
 #      with gpu_keepalive.py once the training run finishes.
@@ -34,10 +38,17 @@ if [[ $# -lt 4 ]]; then
   echo "Usage: $0 <A|B|C|D> <PROJECT_DIR> <PYTHON> <MODEL_PATH> [iterate.py extra args...]"
   echo "Example:"
   echo "  $0 A /path/to/parliament_rl /path/to/python_env/bin/python /path/to/Qwen3.5-9B \\"
-  echo "    --name smokeA --pool datasets/sciencepedia_train_part1.json \\"
-  echo "    --total-questions 200 --sampling-batch-size 200 --total-epochs 8 --seed 42 \\"
+  echo "    --name main_A --pool datasets/sciencepedia_train.json \\"
+  echo "    --total-questions 400 --sampling-batch-size 200 --total-epochs 3 --seed 42 \\"
   echo "    --gpus 0,1,2,3,4,5,6,7 --sessions-per-gpu 4 \\"
-  echo "    --max-concurrent-sessions 16 --actors 3 --judges 3 --max-turns 30"
+  echo "    --actors 3 --judges 3 --max-turns 30"
+  echo
+  echo "Notes:"
+  echo "  --pool concatenates every listed JSON (so foo.json,bar.json is one"
+  echo "    pool of all questions, not per-cell shards). iterate.py samples"
+  echo "    --total-questions q from the pool once at iter 0 (using --seed)"
+  echo "    and runs --total-epochs full passes over those frozen q. To make"
+  echo "    4 cells fairly comparable, give all 4 the SAME pool + SAME seed."
   exit 1
 fi
 

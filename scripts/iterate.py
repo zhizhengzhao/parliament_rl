@@ -64,13 +64,20 @@ already exists) so partial crashes don't redo expensive work.
 Usage:
     python scripts/iterate.py \\
         --name main_A \\
-        --pool datasets/sciencepedia_train_part1.json \\
-        --total-questions 1000 \\
+        --pool datasets/sciencepedia_train.json \\
+        --total-questions 400 \\
         --sampling-batch-size 200 \\
-        --total-epochs 2 \\
+        --total-epochs 3 \\
         --seed 42 \\
         --train-extra "--ppo-epochs 2 --clip-ratio-high 0.25 --beta-kl 0.005" \\
         --gpus 0,1,2,3,4,5,6,7
+
+``--pool`` accepts a single JSON or a comma-separated list; all files
+are concatenated into one pool, then ``--total-questions`` are drawn
+once at iter 0 (``--seed`` controls which) and frozen for the whole
+run. To make 4 cells fairly comparable, pass them all the SAME pool +
+SAME seed — the only thing that should differ between cells is
+``PRL_CONTEXT`` and ``PRL_JUDGE_VOTES_VISIBLE``.
 
 Stop: tmux kill-session -t parliament-iterate
 """
@@ -96,10 +103,10 @@ sys.path.insert(0, str(PROJECT_DIR))
 
 from _common import Tee, env_prefix  # noqa: E402
 
-# Reuse the vLLM lifecycle helpers + control-plane API wrappers from
-# scripts/run.py — that file is the single source of truth for "how
-# to bring up / tear down / sleep / wake / hot-swap-LoRA on a vLLM
-# fleet".  Anything iterate.py needs about vLLM goes through it.
+# Reuse the vLLM lifecycle helpers from scripts/run.py — that file is
+# the single source of truth for "how to boot / wait_ready / kill a
+# DP=N TP=1 vLLM fleet". Anything iterate.py needs about vLLM goes
+# through it.
 import scripts.run as run  # noqa: E402
 
 BASE_MODEL = os.environ.get("PRL_MODEL_PATH", "Qwen/Qwen3.5-9B")
@@ -267,19 +274,17 @@ def build_schedule(pool_paths: list[str], total_questions: int,
 
 def rollout_step(shard_path: Path, model_name: str, run_name: str,
                  cfg: dict, gpu_endpoints: list[str]) -> Path:
-    """Start Parliament, load the shard, run harness against existing vLLMs.
+    """Start Parliament, load the shard, run harness against current vLLM fleet.
 
-    Differs from the legacy ``sample_step`` (which forked
-    ``scripts/run.py`` and made it bring up vLLMs from scratch) in two
-    ways:
+    The vLLM fleet is brought up *before* this function (by the iter
+    setup in ``run_one_iteration``), pointing at the merged HF folder
+    of the most recent successful train step (or the base model on
+    iter 0). This function only manages the Parliament server + the
+    dataset shard + the harness; it does not touch vLLM at all.
 
-    1. ``vLLM is already up`` — iterate.py owns its lifecycle for the
-       whole training run, so this function only manages Parliament +
-       the dataset + harness.  No vLLM cleanup, no vLLM startup.
-    2. ``model_name`` is the *vLLM-side LoRA name*, not the file path.
-       At iter 0 we pass the base model id; at iter k>0 we pass
-       ``LORA_NAME`` and the request gets routed to whichever LoRA was
-       most recently ``/v1/load_lora_adapter``-ed in.
+    ``model_name`` is the HF model id / path that vLLM is currently
+    serving — at iter 0 that's the base, at iter k>0 it's
+    ``run_dir/iter_(k-1)/merged``.
     """
     run_dir = (PROJECT_DIR / "data"
                / f"{run_name}_{time.strftime('%m%d_%H%M%S')}")
@@ -774,7 +779,7 @@ def main() -> None:
         "initial_model": args.initial_model,
         "train_extra": args.train_extra,
         "started_at": datetime.now().isoformat(),
-        "architecture": "http_dp8_lora_hot_swap",
+        "architecture": "http_dpN_merge_reload",
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     (backup_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))

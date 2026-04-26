@@ -1,17 +1,16 @@
 """Tests for scripts/iterate.py idempotent-step validators.
 
-The two functions tested (`_train_jsonl_complete`, `_adapter_complete`)
+The functions tested (`_train_jsonl_complete`, `_adapter_complete`)
 are pure I/O sniffers — they decide whether a previously-written
 artifact is structurally complete enough to skip re-running its step.
 False-positive (claim complete when it's not) is the dangerous failure
 mode (corrupt artifact gets fed to the next step); false-negative
 (claim incomplete when it actually is) is harmless (just re-runs).
 
-Stage 2 (in-process vLLM): the legacy ``_merged_complete`` checker
-is gone — there's no ``merged/`` folder anymore because vLLM
-``add_lora`` accepts the trainer's PEFT adapter directly.  The new
-``_adapter_complete`` validates the PEFT adapter folder shape
-(``adapter_config.json`` + ``adapter_model.safetensors``).
+iterate.py also has ``_merged_complete`` for the merged HF folder
+that follows ``rl.export``; it's not tested here because it just
+sniffs for ``config.json`` + at least one ``*.safetensors`` shard
+(same shape pytorch / vLLM enforce themselves at load time).
 """
 
 from __future__ import annotations
@@ -96,7 +95,7 @@ def test_train_jsonl_complete_single_valid_long_line(tmp_path):
     assert _train_jsonl_complete(tmp_path / "train.jsonl")
 
 
-# ── _adapter_complete (PEFT adapter folder for vLLM hot-swap) ──
+# ── _adapter_complete (PEFT adapter folder produced by rl.train) ──
 
 
 def _make_adapter(tmp: Path, *,

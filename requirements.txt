@@ -21,18 +21,17 @@ uvicorn>=0.41
 aiohttp>=3.13
 pydantic>=2.0
 
-# RL training (rl/train.py — outputs PEFT LoRA adapter directly,
-# vLLM hot-swaps via /v1/load_lora_adapter so no separate merge step)
+# RL training (rl/train.py outputs PEFT LoRA adapter; rl/export.py
+# merges adapter into base for the next iter's vLLM to load directly.)
 torch>=2.10
 transformers>=5.5
 accelerate>=1.13
 peft>=0.19
 safetensors>=0.7
 
-# Inference (vLLM HTTP server with --enable-lora + --enable-sleep-mode;
-# DP=8 + TP=1 across all 8 GPUs is the canonical RLHF rollout config —
-# see OpenRLHF / verl docs)
-vllm>=0.17
+# Inference (vLLM HTTP fleet, DP=8 + TP=1, kill+merge+reload between
+# iters — DP > TP for ≤13B models per OpenRLHF / verl docs.)
+vllm>=0.19
 
 # Optional fused kernels (~2-3x vLLM speedup on Qwen3.5 hybrid attention).
 # Comment these out if your platform lacks pre-built wheels.

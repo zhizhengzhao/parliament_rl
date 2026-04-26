@@ -65,15 +65,18 @@ pytest                        # 89 pure-Python tests, ~10 s
 ```bash
 prl-iterate \
   --name nrun_v1 \
-  --pool datasets/sciencepedia_train_part1.json,\
-datasets/sciencepedia_train_part2.json,\
-datasets/sciencepedia_train_part3.json,\
-datasets/sciencepedia_train_part4.json \
-  --total-questions 1000 --sampling-batch-size 200 \
-  --total-epochs 2 --seed 42 \
-  --gpus 0,1,2,3,4,5,6,7 --sessions-per-gpu 2 \
+  --pool datasets/sciencepedia_train.json \
+  --total-questions 400 --sampling-batch-size 200 \
+  --total-epochs 3 --seed 42 \
+  --gpus 0,1,2,3,4,5,6,7 --sessions-per-gpu 4 \
   --train-extra "--ppo-epochs 2 --clip-ratio-high 0.25 --beta-kl 0.005"
 ```
+
+`--pool` accepts a single JSON or a comma-separated list of JSONs
+(all concatenated into one pool); ``--total-questions`` are drawn
+from the pool once at iter 0 (controlled by ``--seed``) and frozen
+for the entire run. To compare 2x2 cells fairly, pass all 4 cells
+the SAME pool + SAME seed.
 
 `prl-iterate` self-launches into a `parliament-iterate` tmux
 session, survives SSH disconnect, and auto-resumes on re-invocation
