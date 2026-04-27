@@ -29,15 +29,12 @@ same deterministic question schedule and the same training
 hyperparameters.  The only flags that vary are the two env vars:
 
 ```bash
-COMMON='--pool datasets/sciencepedia_train_part1.json,\
-datasets/sciencepedia_train_part2.json,\
-datasets/sciencepedia_train_part3.json,\
-datasets/sciencepedia_train_part4.json \
-  --total-questions 1000 --sampling-batch-size 200 \
-  --total-epochs 2 --seed 42 \
+COMMON='--pool datasets/sciencepedia_train.json \
+  --total-questions 400 --sampling-batch-size 200 \
+  --total-epochs 3 --seed 42 \
   --train-extra "--ppo-epochs 2 --clip-ratio-high 0.25 --beta-kl 0.005 \
                  --lora-r 64 --lora-alpha 128" \
-  --gpus 0,1,2,3,4,5,6,7'
+  --gpus 0,1,2,3,4,5,6,7 --sessions-per-gpu 4'
 
 # A — Parliament (defaults: coupled, judge-visible)
 python scripts/iterate.py --name mainA $COMMON

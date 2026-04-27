@@ -33,24 +33,22 @@ to anyone already familiar with the standard RLHF infra.
 
 ## Examples
 
-**Default 4-cell main experiment** (1000 q × 2 total_epochs × 2 ppo_epochs = 10 iters):
+**Default 4-cell main experiment** (400 q × 3 total_epochs × 2 ppo_epochs = 6 iters):
 
 ```bash
 python scripts/iterate.py \
     --name main_A \
-    --pool datasets/sciencepedia_train_part1.json,\
-datasets/sciencepedia_train_part2.json,\
-datasets/sciencepedia_train_part3.json,\
-datasets/sciencepedia_train_part4.json \
-    --total-questions 1000 \
+    --pool datasets/sciencepedia_train.json \
+    --total-questions 400 \
     --sampling-batch-size 200 \
-    --total-epochs 2 \
+    --total-epochs 3 \
     --seed 42 \
     --train-extra "--ppo-epochs 2 --clip-ratio-high 0.25 --beta-kl 0.005" \
-    --gpus 0,1,2,3,4,5,6,7
-# schedule = 1000 q / 200 = 5 rounds per epoch × 2 epochs = 10 iters
-# ep1.round1…5: policy evolves π_0 → π_5
-# ep2.round1…5: same 5 batches but starting from π_5, ending at π_10
+    --gpus 0,1,2,3,4,5,6,7 --sessions-per-gpu 4
+# schedule = 400 q / 200 = 2 rounds per epoch × 3 epochs = 6 iters
+# ep1.round1,2: policy evolves π_0 → π_2
+# ep2.round1,2: same 2 batches starting from π_2, ending at π_4
+# ep3.round1,2: same 2 batches starting from π_4, ending at π_6
 ```
 
 **Light smoke test** (50 q × 1 epoch × 1 ppo_epoch = 5 iters):

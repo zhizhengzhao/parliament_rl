@@ -7,10 +7,18 @@ longer tracked here.
 ## Open
 
 ### Experiments to run
-- [ ] **Main 2×2 ablation** on the 1000-question pool draw
-      (Parliament / BlindParliament / Solo / BlindSolo) — see
-      [`docs/04_2x2_design.md`](docs/04_2x2_design.md) for the launch
-      template.  Pre-flight: mini40 smoke on each cell first.
+- [x] **Main 2×2 ablation** — first full run launched 2026-04-26 with
+      `--total-questions 400 --total-epochs 3` (= 6 iters / cell)
+      on the `sciencepedia_train.json` pool.  All 4 cells use SAME
+      pool + SAME `--seed 42` so they sample identical 400 q.  Cells
+      A and D finished cleanly the first time; B and C hit transient
+      DDP-port and vLLM-warm-start failures and were resumed after
+      the fixes in commit `7766ad4`.  Use `prl-status` for live
+      summary.  Next experiment iteration should bump to ~1000 q if
+      the 400-q signal is too noisy.
+- [ ] **Larger pool sweep** — once the 400-q main run is analysed,
+      consider 1000 q × 3 epoch on the same pool, same seed, for
+      tighter advantage statistics.
 - [ ] **Held-out eval sweep** on every iter's `merged/`:
       - zero-shot: `eval/gpqa_sweep.sh` + `eval/sciencepedia_mc.py`;
       - **in-frame**: `eval/frame_sweep.sh` (see
