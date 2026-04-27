@@ -60,35 +60,67 @@ def _format_iso(stamp: str | None) -> str:
 
 
 def summarise_run(run_dir: Path) -> dict:
-    """Build a single-row summary dict for one run directory."""
+    """Build a single-row summary dict for one run directory.
+
+    Status ladder (highest priority first):
+      * DONE.txt exists       → "completed"
+      * FAILED.txt exists     → "failed@<iter>"
+      * state.json status=…   → that label (running / failed / completed)
+      * stale (no run-dir mtime change in > 24 h, no sentinel) → "stale"
+      * else                  → "unknown"
+    """
     manifest = _read_json(run_dir / "manifest.json") or {}
     state = _read_json(run_dir / "state.json") or {}
     failed_info = _parse_failed_txt(run_dir / "FAILED.txt")
     done_path = run_dir / "DONE.txt"
     failed_path = run_dir / "FAILED.txt"
+    now_ts = datetime.now().timestamp()
 
     total = manifest.get("total_iters") or 0
     completed = state.get("completed") or 0
     name = manifest.get("name") or run_dir.name
 
+    # ``last_started_at`` is set on every iterate.py boot; ``started_at``
+    # is the original launch time. For wall-time math while running we
+    # prefer last_started_at so a resume after a crash doesn't make wall
+    # appear negative; for the human-facing "STARTED" column we still
+    # show the original launch time.
+    started_iso = manifest.get("started_at")
+    last_started_iso = manifest.get("last_started_at") or started_iso
+
     if done_path.exists():
         status = "completed"
-        finished = done_path.stat().st_mtime
+        finished_ts = done_path.stat().st_mtime
     elif failed_path.exists():
         attempt_iter = failed_info.get("failed_iter", "").split("/")[0]
         status = f"failed@{attempt_iter}" if attempt_iter else "failed"
-        finished = failed_path.stat().st_mtime
+        finished_ts = failed_path.stat().st_mtime
     else:
-        status = state.get("status", "running")
-        finished = run_dir.stat().st_mtime    # latest mtime under run_dir
+        explicit_status = state.get("status")
+        # If no explicit status and no recent activity, mark stale so
+        # ancient half-finished runs don't masquerade as "running".
+        run_mtime = run_dir.stat().st_mtime
+        idle_hours = (now_ts - run_mtime) / 3600
+        if explicit_status:
+            status = explicit_status
+        elif idle_hours > 24:
+            status = "stale"
+        else:
+            status = "running"
+        finished_ts = run_mtime if status != "running" else None
 
-    # Wall time = finished_at - started_at, rounded to minutes.
-    started_iso = manifest.get("started_at")
+    # Wall time = finished - last_started (or now - last_started for running)
     wall_min = "—"
-    if started_iso:
+    if last_started_iso:
         try:
-            started_ts = datetime.fromisoformat(started_iso).timestamp()
-            wall_min = f"{(finished - started_ts) / 60:.0f}m"
+            ref_started_ts = datetime.fromisoformat(
+                last_started_iso).timestamp()
+            ref_end_ts = finished_ts if finished_ts is not None else now_ts
+            mins = (ref_end_ts - ref_started_ts) / 60
+            # Negative wall time can only happen on data corruption
+            # (e.g. sentinel mtime older than last_started_at because of
+            # NTP jump); show "—" rather than nonsense.
+            wall_min = f"{mins:.0f}m" if mins >= 0 else "—"
         except (ValueError, TypeError):
             pass
 
@@ -99,8 +131,8 @@ def summarise_run(run_dir: Path) -> dict:
         "wall": wall_min,
         "started": _format_iso(started_iso),
         "finished": _format_iso(
-            datetime.fromtimestamp(finished).isoformat()
-            if finished else None),
+            datetime.fromtimestamp(finished_ts).isoformat()
+            if finished_ts is not None else None),
     }
 
 

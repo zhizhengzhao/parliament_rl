@@ -879,7 +879,22 @@ def main() -> None:
                               args.sampling_batch_size, args.seed)
     assert len(schedule) == rounds_per_epoch
 
-    manifest = {
+    # Manifest is partially immutable (config) + partially mutable
+    # (timestamps).  ``started_at`` is the original launch time of
+    # this run dir; ``last_started_at`` is updated every time
+    # iterate.py boots, so resumes don't make the wall-time math
+    # negative in `prl-status`.  Existing manifests on resume keep
+    # ``started_at`` and only refresh ``last_started_at``.
+    now_iso = datetime.now().isoformat()
+    manifest_path = out_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except json.JSONDecodeError:
+            manifest = {}
+    else:
+        manifest = {}
+    manifest.update({
         "name": args.name,
         "pool": pool_paths,
         "total_questions": args.total_questions,
@@ -890,10 +905,11 @@ def main() -> None:
         "seed": args.seed,
         "initial_model": args.initial_model,
         "train_extra": args.train_extra,
-        "started_at": datetime.now().isoformat(),
         "architecture": "http_dpN_merge_reload",
-    }
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        "last_started_at": now_iso,
+    })
+    manifest.setdefault("started_at", now_iso)         # only on first launch
+    manifest_path.write_text(json.dumps(manifest, indent=2))
     (backup_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     print(f"\n{'=' * 72}")
