@@ -142,15 +142,24 @@ def kill_port(port: int) -> None:
 def stop_vllm() -> None:
     """Tear down every vLLM instance launched by `ensure_vllm`.
 
-    Three layers of belt-and-braces, because vLLM forks a small
-    process tree (entrypoint + EngineCore_DP* + Worker_TP* +
-    multiprocessing.spawn pool) and only the entrypoint cmdline
-    matches "vllm.entrypoints".  An earlier version killed only the
-    tmux session and pkill'd "vllm.entrypoints", which left orphan
-    workers holding `:7999..:8006` open.  When the next iter's vLLM
-    tried to bind the same port it crashed with `[Errno 98]
-    Address already in use`.  We now also `fuser -k -9` every vLLM
-    port (7999..8006).
+    Five-layer belt-and-braces because vLLM forks a small process
+    tree (entrypoint + EngineCore_DP* + Worker_TP* +
+    multiprocessing.spawn pool + flashinfer-cubin worker), and only
+    the entrypoint cmdline matches "vllm.entrypoints".  An earlier
+    3-layer version left orphan workers holding 7999..8006 open;
+    the next iter's vLLM bind() then crashed with EADDRINUSE.
+
+    Why each layer is needed (in order of cleanup completeness):
+      1. tmux kill-session — drop the controlling terminal so the
+         entrypoint receives SIGHUP.
+      2. pkill vllm.entrypoints — kill the main API server process.
+      3. pkill VLLM::EngineCore  — kill v1's engine core daemon
+         (named ``VLLM::EngineCore_DP*`` in ps).
+      4. pkill multiprocessing.spawn workers / fork  — kill the
+         per-GPU worker pool that mp.spawn forks (these match
+         ``--multiprocessing-fork`` in cmdline).
+      5. fuser -k each vLLM port — final port-level kill for any
+         straggler still holding the listen socket.
     """
     out = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
                          capture_output=True, text=True).stdout
@@ -162,15 +171,21 @@ def stop_vllm() -> None:
             killed += 1
     if killed:
         print(f"  Killed {killed} vLLM tmux session(s)")
-    # Layer 2: pkill by name (catches main entrypoint process).
-    subprocess.run(["pkill", "-9", "-f", "vllm.entrypoints"],
-                   capture_output=True)
-    # Layer 3: fuser-kill every vLLM port (catches orphan workers
-    # whose cmdline doesn't match "vllm.entrypoints" but still hold
-    # the listening socket).  Wrapped in FileNotFoundError because
-    # minimal containers (e.g. our k8s-launched A100 pod) ship without
-    # ``psmisc`` and ``fuser`` is missing — we don't want a missing
-    # binary to crash the entire iter.
+    # Layers 2-4: pkill by cmdline pattern.  Each pattern targets
+    # one part of the vLLM process tree that survives the previous
+    # layer.  ``check=False`` so missing patterns are silent (pkill
+    # exits 1 when nothing matched).
+    for pattern in (
+        "vllm.entrypoints",       # main API server
+        "VLLM::EngineCore",       # v1 engine core daemon
+        "multiprocessing-fork",   # mp.spawn worker children
+    ):
+        subprocess.run(["pkill", "-9", "-f", pattern],
+                       capture_output=True, check=False)
+    # Layer 5: fuser-kill every vLLM port — last-resort port-level kill.
+    # Wrapped in FileNotFoundError because minimal containers ship
+    # without ``psmisc`` (no ``fuser``); we don't want a missing
+    # binary to crash the iter.
     for port in range(7999, 8007):  # 7999..8006 inclusive (8 GPUs)
         try:
             subprocess.run(
@@ -180,6 +195,39 @@ def stop_vllm() -> None:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
     time.sleep(3)
+
+
+def wait_gpu_idle(timeout_s: int = 60,
+                  idle_threshold_mib: int = 1024) -> bool:
+    """Poll nvidia-smi until every GPU's used memory drops below
+    ``idle_threshold_mib`` (1 GB by default).  Returns True if all
+    GPUs go idle within ``timeout_s`` seconds, False otherwise.
+
+    Why we need this on top of ``stop_vllm``: a SIGKILL'd vLLM
+    typically releases its 73 GB of GPU memory within ~5 s (CUDA
+    runtime tears down the context on process exit), but on rare
+    occasions — under heavy NCCL contention or when the kernel is
+    swapped — the cleanup can take 30 s+.  Starting a DDP trainer
+    while a vLLM is still letting go of memory triggers OOM at
+    weight load time.  Calling ``wait_gpu_idle`` before the
+    trainer starts converts that silent OOM into a clean wait.
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return True              # no nvidia-smi → assume non-GPU host, OK
+        busy = [int(line.strip()) for line in out.strip().split("\n")
+                if line.strip().isdigit()]
+        if all(m < idle_threshold_mib for m in busy):
+            return True
+        time.sleep(2)
+    return False
 
 
 def cleanup_all(gpus: list[int], port: int) -> None:
@@ -222,114 +270,137 @@ def gpu_to_port(gpu: int) -> int:
     return 7999 + gpu
 
 
-def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH,
-                enable_lora: bool = False) -> list[int]:
-    """Bring up one vLLM API per GPU in this pod, *sequentially*.
+def _vllm_cmd(gpu: int, port: int, model_path: str,
+              enable_lora: bool) -> str:
+    """Build the shell command line for one vLLM API server instance.
 
-    Within a single pod the 8 vLLM processes all read the same 19 GB
-    Qwen3.5-9B safetensors.  If we launch them concurrently they all
-    issue NFS reads against the same file before the OS page cache
-    has had time to fill — every vLLM ends up waiting on its own
-    disk traffic and a 4-pod parallel launch can blow past the
-    wait-ready timeout.
+    Pulled out of ``ensure_vllm`` so we can re-use it from the
+    per-GPU retry loop without copy-pasting (and risking divergence).
 
-    Sequential launch fixes this almost for free: the first vLLM
-    pays the full NFS cost (5-15 min on a contended `/ytech_m2v5_hdd/`
-    mount); once its weights are resident in the kernel page cache,
-    every subsequent vLLM on the same pod hits warm cache and its
-    own torch-compile cache, so it boots in well under a minute.
-
-    First-vLLM timeout: ``wait_ready`` default (1800 s) — covers slow
-    NFS + first-boot ``torch.compile``.
-    Later-vLLMs timeout: also 1800 s.  We originally tried 600 s on the
-    assumption that warm OS-page-cache hits make subsequent boots fast,
-    but observed that when several smoke runs share the same NFS
-    backend (e.g. /pfs being hammered by parallel cells in the 2x2
-    ablation) even later instances can stall well past 600 s.  Using
-    1800 s for everything is harmless when the load is light (the
-    poller still returns as soon as the server is up) and prevents
-    spurious cascading failures under heavy NFS pressure.
-
-    LoRA-runtime support (``enable_lora=True``, off by default):
-      Adds ``--enable-lora`` and exports ``VLLM_ALLOW_RUNTIME_LORA_UPDATING=True``.
-      In principle this lets iterate.py hot-swap PEFT adapters via
-      ``/v1/load_lora_adapter`` without ever restarting vLLM, saving
-      ~30 s of merge time per iter.
-
-      In practice we keep this **off** because vLLM 0.19.1 LoRA
-      inference is ~5-10× slower than the base model on long contexts
-      (multi-turn sessions hit ~2.4 tokens/s decode under LoRA vs
-      40+ tokens/s on the merged base).  The merged base path also
-      keeps prefix caching effective; LoRA scope shows 0% prefix-cache
-      hit rate.  iterate.py therefore uses the legacy merge+reload
-      pipeline (``rl.export`` produces a vLLM-loadable HF folder per
-      iter, vLLM is restarted with that folder as ``--model``).
-      Set ``enable_lora=True`` only for experiments that explicitly
-      want the hot-swap path.
+    Layout knobs explained inline.  See ``ensure_vllm`` for the
+    cluster-level rationale (sequential launch, retry-on-fail, etc).
     """
-    ports: list[int] = []
-    for i, gpu in enumerate(gpus):
-        port = gpu_to_port(gpu)
-        ports.append(port)
-        session_name = f"{TMUX_PREFIX}{gpu}"
-        subprocess.run(["tmux", "kill-session", "-t", session_name],
-                       capture_output=True)
-        # LoRA flags are additive: ``enable_lora=False`` keeps the
-        # cmdline minimal — and that's the default everywhere because
-        # iterate.py uses the merge+reload pipeline (rl.export merges
-        # LoRA into the base each iter, vLLM is restarted from the
-        # fresh merged folder with no ``--enable-lora`` flag). Pass
-        # ``enable_lora=True`` only for explicit hot-swap experiments.
-        #
+    if enable_lora:
+        lora_args = "--enable-lora --max-loras 4 --max-lora-rank 64 "
+        env_prefix = "VLLM_ALLOW_RUNTIME_LORA_UPDATING=True "
+    else:
+        lora_args = ""
+        env_prefix = ""
+    return (
+        f"CUDA_VISIBLE_DEVICES={gpu} {env_prefix}{VLLM_PYTHON} "
+        f"-m vllm.entrypoints.openai.api_server "
+        f"--model {model_path} --port {port} "
         # ``--max-model-len 32768`` controls both KV cache budget AND
         # cudagraph capture window: vLLM 0.19+ removed the separate
         # ``--max-seq-len-to-capture`` flag (PR #25543) and now uses
         # ``max_model_len`` directly.  Our multi-turn sessions hit
         # 15-23K tokens of accumulated context, so 32768 keeps every
         # sequence inside cudagraph mode (else throughput drops 5-10×).
-        #
-        # ``--gpu-memory-utilization 0.90`` reserves ~80 GB / A100 for
-        # this vLLM (model weights ~18 GB + ~60 GB KV cache + small
-        # buffers), so we can batch many concurrent long-context
-        # rollout requests.
-        #
-        # cudagraphs and prefix caching are default-on in vLLM 0.19+
-        # — both critical for multi-turn rollout speed (system prompt
-        # of ~2 KB is shared across every actor turn within a session).
-        #
-        # vLLM 0.19.1 LoRA + cudagraph + long context has a decode
-        # throughput cliff (~2 tokens/s vs 40+ on merged base).  We
-        # therefore default ``enable_lora=False`` and merge the LoRA
-        # into the base on every iter (see ``rl.export``).  Set
-        # ``enable_lora=True`` only for experiments that explicitly
-        # want LoRA hot-swap.
-        if enable_lora:
-            lora_args = "--enable-lora --max-loras 4 --max-lora-rank 64 "
-            env_prefix = "VLLM_ALLOW_RUNTIME_LORA_UPDATING=True "
-        else:
-            lora_args = ""
-            env_prefix = ""
-        cmd = (
-            f"CUDA_VISIBLE_DEVICES={gpu} {env_prefix}{VLLM_PYTHON} "
-            f"-m vllm.entrypoints.openai.api_server "
-            f"--model {model_path} --port {port} "
-            f"--max-model-len 32768 --gpu-memory-utilization 0.90 "
-            f"--enable-auto-tool-choice --tool-call-parser hermes "
-            f"{lora_args}"
-            f"--dtype auto 2>&1 | tee /tmp/vllm_gpu{gpu}.log"
-        )
-        subprocess.run(["tmux", "new-session", "-d", "-s", session_name, cmd],
-                       capture_output=True)
-        timeout = 1800                        # uniform; see wait_ready docstring
-        print(f"  GPU {gpu} → :{port} launching"
-              f" ({'cold' if i == 0 else 'warm'}, timeout={timeout}s)...",
-              flush=True)
-        if not wait_ready(f"http://127.0.0.1:{port}/v1/models",
-                          timeout=timeout):
-            print(f"  GPU {gpu} → :{port} FAILED after {timeout}s")
-            stop_vllm()
-            sys.exit(1)
-        print(f"  GPU {gpu} → :{port} ready", flush=True)
+        f"--max-model-len 32768 --gpu-memory-utilization 0.90 "
+        # ``prefetch`` mmaps the whole safetensors into RAM up-front,
+        # turning many small NFS reads into one big sequential read.
+        # vLLM 0.19+ does this automatically on NFS (PR #37673) but
+        # NOT on GPFS (auto-detect only matches `nfs`/`nfs4` mounts),
+        # so we set it explicitly — it's a free 30-50% cold-start
+        # speedup on shared filesystems.
+        f"--safetensors-load-strategy prefetch "
+        f"--enable-auto-tool-choice --tool-call-parser hermes "
+        f"{lora_args}"
+        f"--dtype auto 2>&1 | tee /tmp/vllm_gpu{gpu}.log"
+    )
+
+
+def _start_one_vllm(gpu: int, model_path: str,
+                    enable_lora: bool) -> int:
+    """Start one vLLM tmux session.  Returns its port (idempotent)."""
+    port = gpu_to_port(gpu)
+    session_name = f"{TMUX_PREFIX}{gpu}"
+    subprocess.run(["tmux", "kill-session", "-t", session_name],
+                   capture_output=True)
+    # Make sure the tmux's vLLM gets a clean port too (the previous
+    # vLLM on this GPU may still be in TIME_WAIT briefly).
+    kill_port(port)
+    cmd = _vllm_cmd(gpu, port, model_path, enable_lora)
+    subprocess.run(["tmux", "new-session", "-d", "-s", session_name, cmd],
+                   capture_output=True)
+    return port
+
+
+def ensure_vllm(gpus: list[int], model_path: str = MODEL_PATH,
+                enable_lora: bool = False,
+                per_gpu_timeout_s: int = 1800,
+                per_gpu_retries: int = 2) -> list[int]:
+    """Bring up one vLLM API per GPU in this pod, *sequentially with retry*.
+
+    Layout = sequential within a pod
+    --------------------------------
+    All 8 vLLM processes in one pod read the same 19 GB Qwen3.5-9B
+    safetensors. Launching concurrently makes 8 vLLMs all hit the
+    NFS / GPFS at once before the OS page cache fills — every vLLM
+    ends up waiting on its own disk traffic and a 4-pod parallel
+    launch can blow past the wait-ready timeout.
+
+    Sequential fixes this almost for free: GPU 0 pays the full
+    cold cost (~30-90 s on /pfs/ GPFS now that prefetch is on, see
+    ``_vllm_cmd``); once its weights are in the kernel page cache,
+    GPUs 1-7 hit warm cache + their own torch-compile cache and
+    boot in well under a minute each.
+
+    Why retry per GPU
+    -----------------
+    The 2026-04-26 main run hit a single GPU 1 cold-start hang on
+    one pod (vLLM never came up within 1800 s on that one card,
+    likely a transient GPU driver / GPFS hiccup).  The old code
+    treated this as fatal and tore down the whole experiment — six
+    iters of work lost to a 30-min flake.  Following the pattern
+    used by vLLM's own ``multi-node-serving.sh`` and Ray actor
+    fault-tolerance in OpenRLHF/verl, we now retry the failing
+    GPU up to ``per_gpu_retries`` times before giving up.  Each
+    retry kills that single card's tmux + frees its port + starts
+    a fresh vLLM there, so the rest of the fleet stays alive.
+
+    LoRA-runtime support (``enable_lora=True``, off by default):
+    See ``_vllm_cmd``. iterate.py uses the merge+reload pipeline
+    (``rl.export`` produces a vLLM-loadable HF folder per iter,
+    vLLM is restarted with that folder as ``--model``).
+    """
+    ports: list[int] = []
+    for i, gpu in enumerate(gpus):
+        port = gpu_to_port(gpu)
+        ports.append(port)
+        url = f"http://127.0.0.1:{port}/v1/models"
+        kind = "cold" if i == 0 else "warm"
+
+        for attempt in range(per_gpu_retries + 1):  # initial + retries
+            attempt_label = (
+                f"attempt {attempt + 1}/{per_gpu_retries + 1}"
+                if per_gpu_retries > 0 else "single attempt"
+            )
+            _start_one_vllm(gpu, model_path, enable_lora)
+            print(f"  GPU {gpu} → :{port} launching"
+                  f" ({kind}, timeout={per_gpu_timeout_s}s, {attempt_label})...",
+                  flush=True)
+
+            if wait_ready(url, timeout=per_gpu_timeout_s):
+                print(f"  GPU {gpu} → :{port} ready", flush=True)
+                break
+
+            print(f"  GPU {gpu} → :{port} FAILED at {attempt_label} "
+                  f"(after {per_gpu_timeout_s}s wait)")
+            # Tear down just this one card and let the loop retry.
+            session_name = f"{TMUX_PREFIX}{gpu}"
+            subprocess.run(["tmux", "kill-session", "-t", session_name],
+                           capture_output=True)
+            kill_port(port)
+            if attempt >= per_gpu_retries:
+                # Out of retries → fail the whole fleet.
+                print(f"  GPU {gpu} exhausted retries; tearing down "
+                      f"every other vLLM and aborting.")
+                stop_vllm()
+                sys.exit(1)
+            print(f"  GPU {gpu} retrying in 5 s...", flush=True)
+            time.sleep(5)
+
     print(f"  All {len(ports)} vLLM instances ready"
           f"{' (with LoRA + sleep mode)' if enable_lora else ''}")
     return ports

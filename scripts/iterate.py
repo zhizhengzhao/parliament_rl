@@ -91,6 +91,7 @@ import os
 import random
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -336,6 +337,56 @@ def extract_step(run_dir: Path) -> Path:
     return train_jsonl
 
 
+def _find_free_port(start: int = 29500, end: int = 29600) -> int:
+    """Find a free local TCP port in [start, end) for DDP rendezvous.
+
+    Default ``accelerate launch`` uses ``29500`` — when iter K-1's
+    train socket is still in TIME_WAIT or its rendezvous TCPStore has
+    not yet released the port, iter K's bind() fails with EADDRINUSE
+    and the whole experiment dies.  Picking a fresh port per iter
+    sidesteps the race entirely (only the rare case where every port
+    in the range is held would still fail, which is observable and
+    fixable; TIME_WAIT contention is silent and devastating).
+    """
+    for port in range(start, end):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(
+        f"No free DDP port in [{start}, {end}) — clean up "
+        f"orphan rl.train processes (pkill -9 -f rl.train) "
+        f"and retry"
+    )
+
+
+def _kill_orphan_train_workers() -> None:
+    """SIGKILL any leftover ``rl.train`` / ``accelerate launch`` workers.
+
+    DDP failures (NCCL hang, cudaError, EADDRINUSE) often leave the
+    elastic-agent main process dead but its 8 children still attached
+    to the GPU.  These zombies hold port 29500-29599, hold GPU memory,
+    and refuse to die from a normal SIGTERM.  We pkill -9 anything
+    matching ``rl.train`` or ``accelerate launch ... rl.train``
+    cmdlines as a belt-and-braces cleanup before each train_step.
+
+    Idempotent — does nothing if there are no orphans.
+    """
+    for pat in ("rl\\.train", "accelerate.*rl\\.train",
+                "torch.distributed.elastic"):
+        subprocess.run(
+            ["pkill", "-9", "-f", pat],
+            capture_output=True, check=False,
+        )
+    # Linux holds DDP ports in TIME_WAIT for ~60-120 s after the
+    # listener exits; a brief sleep gives the kernel a chance to
+    # actually release them before _find_free_port runs.
+    time.sleep(2)
+
+
 def train_step(train_jsonl: Path, base_model: str, run_dir: Path,
                num_gpus: int, extra: list[str]) -> Path:
     """``accelerate launch rl.train`` (DDP + LoRA + PPO clip + KL anchor).
@@ -343,12 +394,24 @@ def train_step(train_jsonl: Path, base_model: str, run_dir: Path,
     Returns the path to the produced ``adapter/`` folder.  The actual
     HF-format ``merged/`` folder we hand to vLLM is produced by
     ``export_step`` running afterwards.
+
+    Port hygiene:
+      * Orphan ``rl.train`` workers from a previous iter are killed
+        before launch (NCCL hangs leave zombies behind).
+      * The DDP rendezvous port is chosen dynamically from
+        ``[29500, 29600)`` — default-port reuse triggered an EADDRINUSE
+        crash mid-experiment in the 2026-04-26 main run.
     """
+    _kill_orphan_train_workers()
+    ddp_port = _find_free_port(29500, 29600)
+    print(f"  [train] DDP main_process_port = {ddp_port}", flush=True)
+
     ckpt_dir = run_dir / "ckpt"
     shell_run([
         ACCELERATE, "launch",
         "--config_file", "rl/accelerate_ddp.yaml",
         "--num_processes", str(num_gpus),
+        "--main_process_port", str(ddp_port),
         "-m", "rl.train",
         "--data", str(train_jsonl),
         "--output", str(ckpt_dir),
@@ -588,7 +651,14 @@ def run_one_iteration(iter_n: int, total: int, shard_path: Path,
     else:
         print("  [vllm] stopping fleet to free GPU memory for trainer…")
         run.stop_vllm()
-        time.sleep(3)
+        # Block until every GPU is back below 1 GB used — a SIGKILL'd
+        # vLLM normally releases memory in ~5 s but can take 30 s+
+        # under contention; starting the DDP trainer too early gives
+        # a silent OOM at weight load.  Hard 60 s cap then warn.
+        if not run.wait_gpu_idle(timeout_s=60):
+            print("  [vllm] WARN: some GPUs still > 1 GB after 60 s "
+                  "stop — proceeding anyway, may OOM at trainer init",
+                  flush=True)
         extra = list(train_extra)
         if last is not None:
             print(f"  [resume] train — from {last.name}")
@@ -630,6 +700,48 @@ def load_state(path: Path, initial_model: str) -> dict:
 
 def save_state(path: Path, state: dict) -> None:
     path.write_text(json.dumps(state, indent=2))
+
+
+def write_done_sentinel(out_dir: Path, total_iters: int,
+                        wall_minutes: float,
+                        final_model: str) -> None:
+    """Write ``DONE.txt`` so external watchers (`prl-status`, the
+    keepalive watcher in launch_cell.sh, manual ssh) can confirm
+    the cell finished without scraping the iterate.log tail.
+
+    Idempotent — overwrites any stale FAILED.txt left from a
+    previous attempt that ended up succeeding on retry.
+    """
+    (out_dir / "FAILED.txt").unlink(missing_ok=True)
+    (out_dir / "DONE.txt").write_text(
+        f"status: completed\n"
+        f"total_iters: {total_iters}\n"
+        f"wall_minutes: {wall_minutes:.1f}\n"
+        f"final_model: {final_model}\n"
+        f"finished_at: {datetime.now().isoformat()}\n"
+    )
+
+
+def write_failed_sentinel(out_dir: Path, iter_n: int, total_iters: int,
+                          attempts: int, exception: BaseException) -> None:
+    """Write ``FAILED.txt`` with the iter that died + exception type.
+
+    Status sentinels (DONE.txt / FAILED.txt) are intentionally tiny
+    plaintext files so a human attaching tmux at 3 AM can ``cat`` them
+    without spinning up Python — useful when the issue itself is that
+    Python is broken.
+    """
+    (out_dir / "DONE.txt").unlink(missing_ok=True)
+    (out_dir / "FAILED.txt").write_text(
+        f"status: failed\n"
+        f"failed_iter: {iter_n}/{total_iters}\n"
+        f"attempts: {attempts}\n"
+        f"exception_type: {type(exception).__name__}\n"
+        f"exception_msg: {str(exception)[:500]}\n"
+        f"failed_at: {datetime.now().isoformat()}\n"
+        f"\n"
+        f"Look at iterate.log around this timestamp for full traceback.\n"
+    )
 
 
 # ── tmux self-launch ─────────────────────────────────────
@@ -816,6 +928,14 @@ def main() -> None:
     # must serve a different merged checkpoint as ``--model``.
     run.cleanup_all(gpus, PARLIAMENT_PORT)
 
+    # Per-iter retry budget — protects 6h experiments from being
+    # killed by transient KML / NCCL / GPFS hiccups (cell B/C of the
+    # 2026-04-26 main run died this way). Idempotency in
+    # ``run_one_iteration`` (rollout / extract / train / export each
+    # skip if their output already exists) means a retry from the
+    # same iter is essentially free of redundant compute.
+    max_iter_retries = 1                         # initial + 1 retry = 2 tries
+
     try:
         t_start = time.time()
         for total_epoch in range(1, args.total_epochs + 1):
@@ -831,15 +951,46 @@ def main() -> None:
                     shard_path.write_text(
                         json.dumps(schedule[round_idx], ensure_ascii=False))
 
-                new_merged, summary = run_one_iteration(
-                    iter_n, total_iters, shard_path,
-                    actor_model=state["current_model"],
-                    train_anchor_model=state["base_model"],
-                    name_prefix=args.name, cfg=cfg,
-                    train_extra=train_extra,
-                    rounds_per_epoch=rounds_per_epoch,
-                    gpus=gpus,
-                )
+                # Retry the whole iter on failure: cleanup → wait → retry.
+                # Cleanup tears down anything the failed attempt left
+                # behind (vLLM tmux, parliament.server, train workers
+                # stuck on GPU, DDP TCPStore in TIME_WAIT) so the next
+                # attempt starts from a clean slate.
+                last_exc: BaseException | None = None
+                for attempt in range(max_iter_retries + 1):
+                    try:
+                        new_merged, summary = run_one_iteration(
+                            iter_n, total_iters, shard_path,
+                            actor_model=state["current_model"],
+                            train_anchor_model=state["base_model"],
+                            name_prefix=args.name, cfg=cfg,
+                            train_extra=train_extra,
+                            rounds_per_epoch=rounds_per_epoch,
+                            gpus=gpus,
+                        )
+                        last_exc = None
+                        break
+                    except BaseException as e:
+                        last_exc = e
+                        print(f"\n[iter {iter_n}] attempt "
+                              f"{attempt + 1}/{max_iter_retries + 1} FAILED: "
+                              f"{type(e).__name__}: {str(e)[:200]}",
+                              flush=True)
+                        # Belt-and-braces cleanup before retry.
+                        try:
+                            run.stop_vllm()
+                        except Exception:
+                            pass
+                        _kill_orphan_train_workers()
+                        run.cleanup_all(gpus, PARLIAMENT_PORT)
+                        if attempt < max_iter_retries:
+                            print(f"[iter {iter_n}] retrying in 10 s...",
+                                  flush=True)
+                            time.sleep(10)
+                if last_exc is not None:
+                    write_failed_sentinel(out_dir, iter_n, total_iters,
+                                          max_iter_retries + 1, last_exc)
+                    raise last_exc                # propagate to outer try/finally
 
                 run_dir = _find_run_dir(f"{args.name}_iter{iter_n:02d}")
                 if run_dir is not None:
@@ -850,6 +1001,7 @@ def main() -> None:
                     **state,
                     "completed": iter_n,
                     "current_model": new_merged,
+                    "status": "running",
                     "history": state["history"] + [{
                         "iter": iter_n,
                         "total_epoch": total_epoch,
@@ -865,12 +1017,29 @@ def main() -> None:
                 shutil.copy(state_file, backup_dir / "state.json")
 
         total_min = (time.time() - t_start) / 60
+        # Mark cell complete: status sentinel + state.json status.
+        state = {**state, "status": "completed"}
+        save_state(state_file, state)
+        shutil.copy(state_file, backup_dir / "state.json")
+        write_done_sentinel(out_dir, total_iters, total_min,
+                            state["current_model"])
         print(f"\n{'=' * 72}")
         print(f"All {total_iters} iters done in {total_min:.0f} min "
               f"({args.total_epochs} epoch × {rounds_per_epoch} rounds).")
         print(f"Final policy: {state['current_model']}")
         print(f"Backups:      {backup_dir}")
         print(f"{'=' * 72}\n")
+    except BaseException:
+        # Status sentinel was already written by the inner retry block;
+        # here we just make sure state.json reflects the failure so
+        # `prl-status` shows the right label.
+        try:
+            state = {**state, "status": "failed"}
+            save_state(state_file, state)
+            shutil.copy(state_file, backup_dir / "state.json")
+        except Exception:
+            pass
+        raise
     finally:
         print("\n[shutdown] tearing down vLLM fleet…", flush=True)
         run.stop_vllm()

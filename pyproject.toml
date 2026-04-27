@@ -116,6 +116,8 @@ prl-sample-dataset  = "scripts.sample_dataset:main"
 prl-extract         = "rl.extract:main"
 prl-train           = "rl.train:main"
 prl-export          = "rl.export:main"
+# Operations
+prl-status          = "scripts.status:main"
 # Evaluations
 prl-eval-gpqa       = "eval.gpqa:main"
 prl-eval-mc         = "eval.sciencepedia_mc:main"
